@@ -101,6 +101,7 @@ mod storage_remote_tests {
                     Duration::from_secs(30),
                     None,
                     Default::default(),
+                    None,
                 )
                 .with_jwt_verifier(None)
                 .unwrap()

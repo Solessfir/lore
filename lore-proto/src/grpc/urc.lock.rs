@@ -209,6 +209,37 @@ impl ::prost::Name for AdminLockResponse {
         "/urc.lock.AdminLockResponse".into()
     }
 }
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AdminUnlockRequest {
+    #[prost(message, repeated, tag = "1")]
+    pub resources: ::prost::alloc::vec::Vec<Resource>,
+}
+impl ::prost::Name for AdminUnlockRequest {
+    const NAME: &'static str = "AdminUnlockRequest";
+    const PACKAGE: &'static str = "urc.lock";
+    fn full_name() -> ::prost::alloc::string::String {
+        "urc.lock.AdminUnlockRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/urc.lock.AdminUnlockRequest".into()
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AdminUnlockResponse {
+    /// List of resources unlocked
+    #[prost(message, repeated, tag = "1")]
+    pub resources: ::prost::alloc::vec::Vec<Resource>,
+}
+impl ::prost::Name for AdminUnlockResponse {
+    const NAME: &'static str = "AdminUnlockResponse";
+    const PACKAGE: &'static str = "urc.lock";
+    fn full_name() -> ::prost::alloc::string::String {
+        "urc.lock.AdminUnlockResponse".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/urc.lock.AdminUnlockResponse".into()
+    }
+}
 /// Generated client implementations.
 pub mod lock_service_client {
     #![allow(
@@ -412,6 +443,31 @@ pub mod lock_service_client {
                 .insert(GrpcMethod::new("urc.lock.LockService", "AdminLock"));
             self.inner.unary(req, path, codec).await
         }
+        /// Unlocks resources regardless of current owner, no-ops if no lock exists
+        pub async fn admin_unlock(
+            &mut self,
+            request: impl tonic::IntoRequest<super::AdminUnlockRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::AdminUnlockResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/urc.lock.LockService/AdminUnlock",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("urc.lock.LockService", "AdminUnlock"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -453,6 +509,14 @@ pub mod lock_service_server {
             request: tonic::Request<super::AdminLockRequest>,
         ) -> std::result::Result<
             tonic::Response<super::AdminLockResponse>,
+            tonic::Status,
+        >;
+        /// Unlocks resources regardless of current owner, no-ops if no lock exists
+        async fn admin_unlock(
+            &self,
+            request: tonic::Request<super::AdminUnlockRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::AdminUnlockResponse>,
             tonic::Status,
         >;
     }
@@ -738,6 +802,51 @@ pub mod lock_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = AdminLockSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/urc.lock.LockService/AdminUnlock" => {
+                    #[allow(non_camel_case_types)]
+                    struct AdminUnlockSvc<T: LockService>(pub Arc<T>);
+                    impl<
+                        T: LockService,
+                    > tonic::server::UnaryService<super::AdminUnlockRequest>
+                    for AdminUnlockSvc<T> {
+                        type Response = super::AdminUnlockResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::AdminUnlockRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as LockService>::admin_unlock(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = AdminUnlockSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

@@ -274,7 +274,7 @@ pub async fn release(
                 .forward_with::<ReleaseError, _>(|| {
                     format!("Failed to connect to remote {}", remote.remote_url())
                 })?
-                .unlock(&batch_resources)
+                .unlock(&batch_resources, force)
                 .await
                 .forward::<ReleaseError>("Failed to release the lock")?;
 

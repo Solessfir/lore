@@ -1742,10 +1742,14 @@ impl Lock for GRPCLock {
         .await
     }
 
-    async fn unlock(&self, resources: &[LockResource]) -> Result<Vec<LockResource>, ProtocolError> {
+    async fn unlock(
+        &self,
+        resources: &[LockResource],
+        admin: bool,
+    ) -> Result<Vec<LockResource>, ProtocolError> {
         with_reconnect(
             &self.connection,
-            || async { self.client.read().await.unlock(resources).await },
+            || async { self.client.read().await.unlock(resources, admin).await },
             |reconnect_id| self.reconnect(reconnect_id),
         )
         .await

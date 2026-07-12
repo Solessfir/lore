@@ -9,6 +9,8 @@ use lore_base::types::LockResource;
 use lore_proto::LockService;
 use lore_proto::lock::AdminLockRequest;
 use lore_proto::lock::AdminLockResponse;
+use lore_proto::lock::AdminUnlockRequest;
+use lore_proto::lock::AdminUnlockResponse;
 use lore_proto::lock::LockRequest;
 use lore_proto::lock::LockResponse;
 use lore_proto::lock::QueryRequest;
@@ -377,6 +379,63 @@ impl LoreLockService {
             })
             .await
     }
+
+    async fn handle_admin_unlock(
+        &self,
+        request: Request<AdminUnlockRequest>,
+    ) -> Result<Response<AdminUnlockResponse>, Status> {
+        let correlation_id = extract_correlation_id(&request).unwrap_or_default();
+        let repository = get_repository(request.metadata())?;
+        let extensions = request.extensions().clone();
+
+        let user_id = get_user_id(request.extensions());
+        let unlock_request = request.into_inner();
+
+        self.locking_histogram.record(
+            unlock_request.resources.len() as u64,
+            &self
+                .instrument_provider
+                .get_labels_for_operation_context("admin_unlock"),
+        );
+
+        if unlock_request.resources.is_empty() {
+            return Ok(Response::new(AdminUnlockResponse { resources: vec![] }));
+        }
+
+        let resources: Vec<LockResource> =
+            unlock_request.resources.iter().map(Into::into).collect();
+
+        let execution = setup_execution(module_path!(), correlation_id, user_id.clone());
+
+        LORE_CONTEXT
+            .scope(execution, async move {
+                if !can_admin_lock(&extensions, repository, self.auth_enabled) {
+                    warn!("Attempt to apply admin unlock, but user does not have the correct permissions");
+                    return Err(Status::permission_denied("Permission denied"));
+                }
+
+                // validate_user = false: admin unlock releases regardless of
+                // the lock's current owner - that's the entire point of this
+                // RPC (see can_admin_lock's doc comment for when it's
+                // actually reachable).
+                let resources = self
+                    .lock_store
+                    .unlock_resources(user_id.as_str(), false, repository, &resources)
+                    .await
+                    .map_err(handle_lock_error)?;
+
+                if !resources.is_empty() {
+                    self.notification
+                        .resource_unlocked(repository, resources[0].branch, &user_id, &resources)
+                        .await;
+                }
+
+                Ok(Response::new(AdminUnlockResponse {
+                    resources: resources.into_iter().map(Into::into).collect(),
+                }))
+            })
+            .await
+    }
 }
 
 #[tonic::async_trait]
@@ -416,6 +475,14 @@ impl LockService for LoreLockService {
         request: Request<AdminLockRequest>,
     ) -> Result<Response<AdminLockResponse>, Status> {
         timeout_grpc(self.rpc_timeout, self.handle_admin_lock(request)).await
+    }
+
+    #[tracing::instrument(name = "LoreLockService::admin_unlock", skip_all)]
+    async fn admin_unlock(
+        &self,
+        request: Request<AdminUnlockRequest>,
+    ) -> Result<Response<AdminUnlockResponse>, Status> {
+        timeout_grpc(self.rpc_timeout, self.handle_admin_unlock(request)).await
     }
 }
 

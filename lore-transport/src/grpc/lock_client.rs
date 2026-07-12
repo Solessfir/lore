@@ -9,6 +9,7 @@ use lore_base::types::LockData;
 use lore_base::types::LockResource;
 use lore_base::types::RepositoryId;
 use lore_proto::lock::AdminLockRequest;
+use lore_proto::lock::AdminUnlockRequest;
 use lore_proto::lock::LockRequest;
 use lore_proto::lock::QueryRequest;
 use lore_proto::lock::StatusRequest;
@@ -142,6 +143,7 @@ impl LockService {
     pub async fn unlock(
         &self,
         resources: &[LockResource],
+        admin: bool,
     ) -> Result<Vec<LockResource>, ProtocolError> {
         lore_debug!("Releasing resources");
 
@@ -149,16 +151,22 @@ impl LockService {
 
         let mut retry = grpc_retry();
         let resources = loop {
-            let request = UnlockRequest {
-                resources: resources.iter().map(Into::into).collect(),
-            };
-
             let mut client = self.client.clone();
 
-            match client.unlock(request).await {
-                Ok(response) => {
-                    break response.into_inner().resources;
-                }
+            let result = if admin {
+                let request = AdminUnlockRequest {
+                    resources: resources.iter().map(Into::into).collect(),
+                };
+                client.admin_unlock(request).await.map(|res| res.into_inner().resources)
+            } else {
+                let request = UnlockRequest {
+                    resources: resources.iter().map(Into::into).collect(),
+                };
+                client.unlock(request).await.map(|res| res.into_inner().resources)
+            };
+
+            match result {
+                Ok(resources) => break resources,
                 Err(status) => {
                     if status.code() == Code::NotFound {
                         return Ok(vec![]);

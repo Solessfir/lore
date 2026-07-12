@@ -320,8 +320,14 @@ pub trait Lock: Send + Sync {
     /// Get the locking status of the resource(s)
     async fn status(&self, resources: &[LockResource]) -> Result<Vec<LockData>, ProtocolError>;
 
-    /// Remove the lock over the resource(s)
-    async fn unlock(&self, resources: &[LockResource]) -> Result<Vec<LockResource>, ProtocolError>;
+    /// Remove the lock over the resource(s). `admin`, when true, releases
+    /// regardless of current owner (server-side AdminUnlock, gated the same
+    /// way as AdminLock - see lore-server's can_admin_lock).
+    async fn unlock(
+        &self,
+        resources: &[LockResource],
+        admin: bool,
+    ) -> Result<Vec<LockResource>, ProtocolError>;
 }
 
 /// Environment protocol

@@ -7,6 +7,7 @@ use lore_revision::lock::file::acquire::AcquireOptions;
 use lore_revision::lock::file::query::QueryOptions;
 use lore_revision::lock::file::release::ReleaseOptions;
 use lore_revision::lock::file::status::StatusOptions;
+use lore_revision::lore::execution_context;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -65,14 +66,22 @@ async fn file_acquire_local(
         callback,
         args,
         file_acquire,
-        move |repository, args| {
+        move |repository, args| async move {
+            // Whatever identity repository::open already resolved for this
+            // repo (config.toml's `identity`, --identity, or a cached auth
+            // identity - see open()'s identity-resolution chain) and stored
+            // on the execution context. Empty when nothing's configured,
+            // same as before this patch - the server then falls back to
+            // its own auth-derived owner (see get_user_id_from_token_ref).
+            let owner = execution_context().user_id().await;
+
             let options: AcquireOptions = AcquireOptions {
                 paths: args.paths,
                 branch: args.branch.to_string(),
-                owner: String::default(),
+                owner,
             };
 
-            lore_revision::lock::file::acquire::acquire(repository, options)
+            lore_revision::lock::file::acquire::acquire(repository, options).await
         },
     )
     .await

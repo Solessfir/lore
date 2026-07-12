@@ -291,8 +291,18 @@ pub fn can_obliterate(extensions: &Extensions, repository: RepositoryId) -> bool
     user_permissions(extensions, repository).contains(&"obliterate".to_string())
 }
 
-pub fn can_admin_lock(extensions: &Extensions, repository: RepositoryId) -> bool {
-    has_required_permission(extensions, repository, "migrate")
+/// `auth_enabled` reflects whether this server has `[server.auth]`
+/// configured at all (see `LoreLockService::new`'s caller in
+/// `grpc/server.rs`), not whether this particular request happens to carry
+/// a token - a server with auth configured still enforces the permission
+/// check even if some request is missing a token, rather than silently
+/// treating a missing token as a bypass. On a server with no auth
+/// configured (nothing to check against - see the `[server.auth]` docs),
+/// every caller is trusted at the network layer already, so admin lock
+/// operations are allowed unconditionally rather than being permanently
+/// unreachable.
+pub fn can_admin_lock(extensions: &Extensions, repository: RepositoryId, auth_enabled: bool) -> bool {
+    !auth_enabled || has_required_permission(extensions, repository, "migrate")
 }
 
 pub fn get_matching_permissions(
@@ -714,13 +724,35 @@ mod tests {
                 .into();
 
         // as user has "migrate" permission for a given repo, they CAN admin lock that repo
-        assert!(can_admin_lock(&extensions, test_repository_context));
+        assert!(can_admin_lock(&extensions, test_repository_context, true));
 
         // as user doesn't have "migrate" permission for an unrelated repo, they CAN'T admin lock that repo
         assert!(!can_admin_lock(
             &extensions,
-            test_unrelated_repository_context
+            test_unrelated_repository_context,
+            true
         ));
+    }
+
+    #[test]
+    fn can_admin_lock_allows_everyone_when_server_has_no_auth_configured() {
+        // No token at all, and no permissions to check against - matches a
+        // server with [server.auth] entirely absent. auth_enabled = false
+        // must bypass the permission check rather than leaving admin lock
+        // permanently unreachable on a server that never has a token to
+        // grant "migrate" with in the first place.
+        let extensions = Extensions::new();
+        let test_repository_context: RepositoryId =
+            Context::from_str("0194b726b34e72b0b45550b88a967076")
+                .unwrap()
+                .into();
+
+        assert!(can_admin_lock(&extensions, test_repository_context, false));
+        // Same empty extensions, but auth_enabled = true (a real auth
+        // server the request simply forgot to attach a token for) must
+        // still be rejected - the bypass only applies when the server has
+        // no auth configured at all, not to any request missing a token.
+        assert!(!can_admin_lock(&extensions, test_repository_context, true));
     }
 
     #[test]
@@ -759,13 +791,14 @@ mod tests {
                 .into();
 
         // as user has "migrate" permission for a given repo, they CAN admin lock that repo
-        assert!(can_admin_lock(&extensions, test_repository_context));
+        assert!(can_admin_lock(&extensions, test_repository_context, true));
 
         // user doesn't have direct "migrate" permission for an unrelated repo
         // but they have a wildcard token with "migrate", so they should be able to admin lock arbitrary repo
         assert!(can_admin_lock(
             &extensions,
-            test_unrelated_repository_context
+            test_unrelated_repository_context,
+            true
         ));
     }
 

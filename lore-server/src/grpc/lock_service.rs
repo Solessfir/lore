@@ -91,6 +91,11 @@ pub struct LoreLockService {
     lock_store: Arc<dyn LockStore>,
     notification: Arc<dyn NotificationSender>,
     rpc_timeout: Duration,
+    // Whether this server has [server.auth] configured at all - see
+    // can_admin_lock's doc comment (grpc/mod.rs) for why admin lock bypasses
+    // the permission check entirely when this is false, rather than being
+    // permanently unreachable on a server with no auth to check against.
+    auth_enabled: bool,
 
     instrument_provider: LoreLockServiceInstrumentProvider,
     locking_histogram: Histogram<u64>,
@@ -102,6 +107,7 @@ impl LoreLockService {
         lock_store: Arc<dyn LockStore>,
         notification: Arc<dyn NotificationSender>,
         rpc_timeout: Duration,
+        auth_enabled: bool,
     ) -> Self {
         let instrument_provider = LoreLockServiceInstrumentProvider {};
 
@@ -109,6 +115,7 @@ impl LoreLockService {
             lock_store,
             notification,
             rpc_timeout,
+            auth_enabled,
             locking_histogram: instrument_provider.length_histogram(
                 "locking.request.resources.length",
                 vec![1., 5., 10., 25., 50., 75., 100., 200.],
@@ -359,7 +366,7 @@ impl LoreLockService {
 
         LORE_CONTEXT
             .scope(execution, async move {
-                if !can_admin_lock(&extensions, repository) {
+                if !can_admin_lock(&extensions, repository, self.auth_enabled) {
                     warn!("Attempt to apply admin locks, but user does not have the correct permissions");
                     return Err(Status::permission_denied("Permission denied"));
                 }
@@ -484,6 +491,7 @@ mod test {
                 Arc::new(lock_store),
                 notification_sender,
                 Duration::from_secs(60),
+                true,
             );
 
             let resources: Vec<Resource> = (0..101)
@@ -521,6 +529,7 @@ mod test {
                 Arc::new(lock_store),
                 notification_sender,
                 Duration::from_secs(60),
+                true,
             );
 
             let resources: Vec<Resource> = (0..100)
@@ -564,6 +573,7 @@ mod test {
                 Arc::new(lock_store),
                 notification_sender,
                 Duration::from_secs(60),
+                true,
             );
 
             let mut request = Request::new(LockRequest { resources: vec![] });
@@ -588,6 +598,7 @@ mod test {
                 Arc::new(lock_store),
                 notification_sender,
                 Duration::from_secs(60),
+                true,
             );
 
             let mut request = Request::new(UnlockRequest { resources: vec![] });
@@ -612,6 +623,7 @@ mod test {
                 Arc::new(lock_store),
                 notification_sender,
                 Duration::from_secs(60),
+                true,
             );
 
             let mut request = Request::new(StatusRequest { resources: vec![] });
@@ -636,6 +648,7 @@ mod test {
                 Arc::new(lock_store),
                 notification_sender,
                 Duration::from_secs(60),
+                true,
             );
 
             let mut request = Request::new(AdminLockRequest {
@@ -666,6 +679,7 @@ mod test {
                 Arc::new(lock_store),
                 notification_sender,
                 Duration::from_secs(60),
+                true,
             );
 
             let mut request = Request::new(UnlockRequest {

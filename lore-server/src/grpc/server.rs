@@ -567,6 +567,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
                     lock_store.clone(),
                     self.0.notification_sender.clone(),
                     rpc_timeout,
+                    jwt_verifier.is_some(),
                 ))
             }
             None => None,

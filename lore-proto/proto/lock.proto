@@ -49,6 +49,9 @@ service LockService {
 
   // Locks resources for another user
   rpc AdminLock(AdminLockRequest) returns (AdminLockResponse);
+
+  // Unlocks resources regardless of current owner, no-ops if no lock exists
+  rpc AdminUnlock(AdminUnlockRequest) returns (AdminUnlockResponse);
 }
 
 // A service to receive requests forwarded on from another Lore Server,
@@ -96,4 +99,11 @@ message AdminLockRequest {
 message AdminLockResponse {
   // List of created locks
   repeated Lock locks = 1;
+}
+
+message AdminUnlockRequest { repeated Resource resources = 1; }
+
+message AdminUnlockResponse {
+  // List of resources unlocked
+  repeated Resource resources = 1;
 }

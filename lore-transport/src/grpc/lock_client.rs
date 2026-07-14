@@ -144,6 +144,7 @@ impl LockService {
         &self,
         resources: &[LockResource],
         admin: bool,
+        owner: &str,
     ) -> Result<Vec<LockResource>, ProtocolError> {
         lore_debug!("Releasing resources");
 
@@ -157,12 +158,19 @@ impl LockService {
                 let request = AdminUnlockRequest {
                     resources: resources.iter().map(Into::into).collect(),
                 };
-                client.admin_unlock(request).await.map(|res| res.into_inner().resources)
+                client
+                    .admin_unlock(request)
+                    .await
+                    .map(|res| res.into_inner().resources)
             } else {
                 let request = UnlockRequest {
                     resources: resources.iter().map(Into::into).collect(),
+                    owner: owner.to_string(),
                 };
-                client.unlock(request).await.map(|res| res.into_inner().resources)
+                client
+                    .unlock(request)
+                    .await
+                    .map(|res| res.into_inner().resources)
             };
 
             match result {

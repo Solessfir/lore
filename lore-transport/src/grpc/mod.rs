@@ -1535,7 +1535,12 @@ impl Lock for GRPCLock {
     ) -> Result<Vec<LockResource>, ProtocolError> {
         let reconnect_id = self.connection.reconnect.load(Ordering::Relaxed);
         loop {
-            let result = self.client.read().await.unlock(resources, admin).await;
+            let result = self
+                .client
+                .read()
+                .await
+                .unlock(resources, admin, self.identity.as_str())
+                .await;
             match result {
                 Err(ProtocolError::Disconnected(_)) => {
                     self.reconnect(reconnect_id).await?;

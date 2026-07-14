@@ -148,6 +148,8 @@ impl ::prost::Name for StatusResponse {
 pub struct UnlockRequest {
     #[prost(message, repeated, tag = "1")]
     pub resources: ::prost::alloc::vec::Vec<Resource>,
+    #[prost(string, tag = "2")]
+    pub owner: ::prost::alloc::string::String,
 }
 impl ::prost::Name for UnlockRequest {
     const NAME: &'static str = "UnlockRequest";

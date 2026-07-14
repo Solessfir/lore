@@ -77,7 +77,15 @@ message StatusResponse {
   repeated Lock locks = 1;
 }
 
-message UnlockRequest { repeated Resource resources = 1; }
+message UnlockRequest {
+  repeated Resource resources = 1;
+  // Client-resolved identity to check ownership against on a server with
+  // no auth configured (where the server has no other way to know who's
+  // asking) - ignored in favor of the request's real auth token whenever
+  // one is present, so this can't be used to spoof identity on a server
+  // that actually has auth configured.
+  string owner = 2;
+}
 
 message UnlockResponse {
   // List of resources unlocked

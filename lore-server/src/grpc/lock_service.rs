@@ -294,7 +294,7 @@ impl LoreLockService {
         &self,
         request: Request<UnlockRequest>,
     ) -> Result<Response<UnlockResponse>, Status> {
-        let user_id = get_user_id(request.extensions());
+        let auth_user_id = get_user_id(request.extensions());
         let correlation_id = extract_correlation_id(&request).unwrap_or_default();
         let repository = get_repository(request.metadata())?;
         let validate_user = !is_owner_or_admin(request.extensions(), repository);
@@ -310,6 +310,20 @@ impl LoreLockService {
         if unlock_request.resources.is_empty() {
             return Ok(Response::new(UnlockResponse { resources: vec![] }));
         }
+
+        // get_user_id always resolves to the literal "<unknown>" placeholder
+        // on a server with no auth configured (no token to derive an
+        // identity from) - trust the caller's own resolved identity in that
+        // case instead, the same one lock acquire now uses as owner (see
+        // can_admin_lock's doc comment for the same no-auth-trust
+        // principle). A server with auth configured always uses its own
+        // verified identity, ignoring this field entirely, so a client
+        // can't use it to spoof identity there.
+        let user_id = if !self.auth_enabled && !unlock_request.owner.is_empty() {
+            unlock_request.owner.clone()
+        } else {
+            auth_user_id
+        };
 
         let resources: Vec<LockResource> =
             unlock_request.resources.iter().map(Into::into).collect();
@@ -668,7 +682,10 @@ mod test {
                 true,
             );
 
-            let mut request = Request::new(UnlockRequest { resources: vec![] });
+            let mut request = Request::new(UnlockRequest {
+                resources: vec![],
+                owner: "".to_string(),
+            });
             let repository = random::<RepositoryId>();
             request.metadata_mut().insert_bin(
                 REPOSITORY_ID_KEY,
@@ -755,6 +772,7 @@ mod test {
                     hash: Default::default(),
                     description: "".to_string(),
                 }],
+                owner: "".to_string(),
             });
             let repository = random::<RepositoryId>();
             request.metadata_mut().insert_bin(

@@ -301,7 +301,11 @@ pub fn can_obliterate(extensions: &Extensions, repository: RepositoryId) -> bool
 /// every caller is trusted at the network layer already, so admin lock
 /// operations are allowed unconditionally rather than being permanently
 /// unreachable.
-pub fn can_admin_lock(extensions: &Extensions, repository: RepositoryId, auth_enabled: bool) -> bool {
+pub fn can_admin_lock(
+    extensions: &Extensions,
+    repository: RepositoryId,
+    auth_enabled: bool,
+) -> bool {
     !auth_enabled || has_required_permission(extensions, repository, "migrate")
 }
 

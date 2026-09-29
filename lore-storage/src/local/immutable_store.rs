@@ -1,5 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+
+mod info;
+#[cfg(feature = "oodle")]
+mod oodle_migration;
 use std::backtrace::Backtrace;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -19,6 +23,7 @@ use std::sync::Weak;
 use std::sync::atomic;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
+use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 use std::time::SystemTime;
 
@@ -66,6 +71,12 @@ use crate::fs_util;
 use crate::hash;
 use crate::immutable_store::StoreError;
 use crate::immutable_store::sanitise_fragment_behavior_flags;
+use crate::local::fan_out::GroupLevel;
+use crate::local::immutable_store::info::ImmutableStoreInfo;
+use crate::local::immutable_store::info::get_or_init_disk_info;
+use crate::local::immutable_store::info::info_path_for_store_root;
+use crate::local::immutable_store::info::write_info_file;
+use crate::store_types::PayloadRead;
 use crate::store_types::StoreGetData;
 use crate::store_types::StoreMatch;
 use crate::store_types::StoreMatchResult;
@@ -229,6 +240,25 @@ pub struct ImmutableStoreGroup {
     /// two-phase commit (`level.pending` deleted), so a mismatch with `bucket_count` indicates a
     /// pending level transition that needs the two-phase commit on the next flush.
     pub committed_level: std::sync::atomic::AtomicUsize,
+    /// Forces the bucket-file writes for this group to be serial.
+    ///
+    /// `flush_all` holds it for a whole group flush so that the fan-out check, the
+    /// `committed_level` read that selects the commit path, and the writes are one
+    /// atomic unit. Every other writer (the delayed flush, the evictor, the
+    /// compactor, the packfile upgrade) takes it only around its own bucket write.
+    ///
+    /// Without it, an overlapping flush can observe a half-finished level transition
+    /// and take the regular in-place path while a two-phase commit is still pending.
+    /// The commit's later `rename` of `index_<bb>.new` then publishes its older
+    /// snapshot over the newer in-place write, discarding it. The losing write still
+    /// returns `Ok`, and the clobbered file inherits the `.new` file's older mtime.
+    /// Locking the rename alone would not help: the snapshot it publishes is taken
+    /// before the rename, so the two paths must not interleave at all.
+    ///
+    /// Scope is deliberately narrow outside `flush_all` because
+    /// `compact_group_packfiles` calls `evict_group_sized`, and a `tokio::sync::Mutex`
+    /// is not reentrant - a per-function guard would self-deadlock.
+    pub flush_lock: Arc<Mutex<()>>,
     pub packstore: crate::PackStore,
     pub flush: Mutex<JoinSet<()>>,
 }
@@ -255,15 +285,43 @@ pub struct LocalImmutableStoreFailureGenerator {
     miss_fragment_writes: HashSet<Hash>,
 }
 
+/// Holds a store's garbage collection stop raised while it lives. A terminating request
+/// stays raised once dropped; any other lowers, so a drain that is cancelled rather than
+/// completed — a shutdown timing out, say — cannot leave collection stopped by accident.
+struct GcStopRequest<'a> {
+    requests: &'a AtomicUsize,
+    terminate: bool,
+}
+
+impl<'a> GcStopRequest<'a> {
+    fn raise(requests: &'a AtomicUsize, terminate: bool) -> Self {
+        requests.fetch_add(1, atomic::Ordering::Relaxed);
+        Self {
+            requests,
+            terminate,
+        }
+    }
+}
+
+impl Drop for GcStopRequest<'_> {
+    fn drop(&mut self) {
+        if !self.terminate {
+            self.requests.fetch_sub(1, atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 pub struct LocalImmutableStore {
+    info: RwLock<ImmutableStoreInfo>,
     path: Option<Arc<PathBuf>>,
     pub group: Vec<Arc<ImmutableStoreGroup>>,
     eviction: Semaphore,
     compaction: Semaphore,
-    stop_gc: AtomicBool,
-    /// Bytes reclaimed by the current compaction pass, accumulated across its
-    /// stepped `compact` calls and reset at the start of each pass. Reported in
-    /// the compaction-end progress callback.
+    /// Stop requests outstanding; callers overlap, so the stop stays raised until the last
+    /// of them has drained.
+    stop_requests: AtomicUsize,
+    /// Bytes reclaimed by the compaction step in progress, accumulated across its groups
+    /// and reset as the step starts. Reported in the compaction-end callback.
     compaction_reclaimed: AtomicU64,
     deserialize_all: Semaphore,
     deserialized_all: AtomicBool,
@@ -282,9 +340,10 @@ pub struct LocalImmutableStore {
     lock: Option<FSLock>,
 }
 
+/// How far a last-access stamp has to move before the bucket holding it is marked for rewrite.
+const ATIME_GRANULARITY_SECONDS: u64 = 60 * 60;
+
 pub struct ImmutableStoreSettings {
-    /// Allow partial fragments (true for clients, false for server)
-    pub allow_partial_fragment: bool,
     /// Protect local fragments during eviction/compaction (true for clients, false for server)
     pub protect_local_fragment: bool,
     /// Consider all fragments durably stored (false for clients, generally true for server)
@@ -305,7 +364,8 @@ pub struct ImmutableStoreSettings {
     pub compaction_parallel_groups: usize,
     /// Verify writes by read back and rehash data
     pub verify_write: bool,
-    /// Update last access timestamps on reads
+    /// Record the last access time of an entry on reads. Eviction and compaction rank by that
+    /// time, so a store that reclaims needs it on.
     pub atime: bool,
     /// Number of buckets per group at store creation. Must be a value from
     /// `lore_storage::local::fan_out::LEVEL_LADDER`. Defaults to `1` (client). Server processes
@@ -319,7 +379,6 @@ pub struct ImmutableStoreSettings {
 impl Default for ImmutableStoreSettings {
     fn default() -> Self {
         Self {
-            allow_partial_fragment: true,
             protect_local_fragment: true,
             implicit_durable_stored: false,
             isolate_partitions: false,
@@ -329,7 +388,7 @@ impl Default for ImmutableStoreSettings {
             target_size_percentage: 70,
             compaction_parallel_groups: 8,
             verify_write: false,
-            atime: false,
+            atime: true,
             initial_fan_out_level: 1,
             fan_out_threshold: crate::local::fan_out::FAN_OUT_THRESHOLD_DEFAULT,
         }
@@ -368,22 +427,17 @@ struct ImmutableStoreHeader {
 }
 
 pub fn format_bucket_path(path: &Path, group_index: usize, bucket_index: usize) -> PathBuf {
-    use std::io;
-    use std::io::Write;
+    use crate::local::fan_out::BUCKET_FILENAME_PREFIX as PREFIX;
+    use crate::local::fan_out::write_hex_byte;
     let mut path = path.to_path_buf();
     path.reserve(20);
     path.push("index");
-    let mut hexstring: [u8; 8] = Default::default();
-    {
-        let mut cursor = io::Cursor::new(&mut hexstring[..]);
-        let _ = write!(&mut cursor, "{:02x}", group_index as u8);
-        path.push(std::str::from_utf8(&hexstring[..2]).unwrap_or_default());
-    }
-    {
-        let mut cursor = io::Cursor::new(&mut hexstring[..]);
-        let _ = write!(&mut cursor, "index_{:02x}", bucket_index as u8);
-        path.push(std::str::from_utf8(&hexstring).unwrap_or_default());
-    }
+    let mut name = [0u8; PREFIX.len() + 2];
+    write_hex_byte(&mut name, group_index as u8);
+    path.push(std::str::from_utf8(&name[..2]).unwrap_or_default());
+    name[..PREFIX.len()].copy_from_slice(PREFIX.as_bytes());
+    write_hex_byte(&mut name[PREFIX.len()..], bucket_index as u8);
+    path.push(std::str::from_utf8(&name).unwrap_or_default());
     path
 }
 
@@ -408,7 +462,9 @@ fn detect_any_older_immutable_bucket(index_path: &Path) -> bool {
         for file in files.flatten() {
             let name = file.file_name();
             let name_str = name.to_str().unwrap_or("");
-            if !name_str.starts_with("index_") || name_str.ends_with(".new") {
+            if !name_str.starts_with(crate::local::fan_out::BUCKET_FILENAME_PREFIX)
+                || name_str.ends_with(crate::local::fan_out::BUCKET_NEW_SUFFIX)
+            {
                 continue;
             }
             if let Ok(mut f) = std::fs::File::open(file.path()) {
@@ -601,14 +657,14 @@ impl ImmutableStoreBucket {
                 || x == ImmutableStoreVersion::LastAccessInEntry as u32 =>
             {
                 size_of::<u32>() /* sorted index */
-                    + size_of::<ImmutableStoreEntry>() /* entry */
+                        + size_of::<ImmutableStoreEntry>() /* entry */
             }
             x if (x == ImmutableStoreVersion::PackfilePerGroup as u32)
                 || (x == ImmutableStoreVersion::LastAccessTimestamps as u32) =>
             {
                 size_of::<u32>() /* sorted index */
-                    + size_of::<ImmutableStoreEntryBeforeLastAccess>() /* entry */
-                    + size_of::<u32>() /* last access timestamp */
+                        + size_of::<ImmutableStoreEntryBeforeLastAccess>() /* entry */
+                        + size_of::<u32>() /* last access timestamp */
             }
             x if x == ImmutableStoreVersion::Initial as u32 => {
                 size_of::<u32>() /* sorted index */ + size_of::<ImmutableStoreEntry>() /* entry */
@@ -854,17 +910,15 @@ impl ImmutableStoreBucket {
         bucket_index: usize,
         sync_data: bool,
     ) -> Result<(), LocalImmutableStoreError> {
-        let count = bucket.entry.len();
-        if count == 0 {
-            return Ok(());
-        }
-
+        // An emptied bucket is written out like any other. Skipping it would leave the file it
+        // was last written to on disk, and reopening the store would load the entries back.
+        //
         // Ensure only one serialization/deserialization of this bucket is happening at any given time
         let _lock = bucket.serialize_lock.clone().lock_owned().await;
 
         // Atomically flip dirty from true to false; if it was already false another flush
         // task has already claimed this bucket.
-        if !group.dirty[bucket_index].swap(false, atomic::Ordering::Relaxed) {
+        if !group.dirty[bucket_index].swap(false, atomic::Ordering::Acquire) {
             return Ok(());
         }
 
@@ -878,13 +932,13 @@ impl ImmutableStoreBucket {
     }
 
     /// Serialize the bucket to its `.new` twin during a fan-out commit. Differs from the regular
-    /// `serialize` path in two ways: (1) bypasses the `count == 0` early-exit and the
-    /// `dirty.swap(false) → skip-if-was-false` short-circuit, because every `[0..committed_level]`
-    /// bucket must be rewritten at the new layout to overwrite stale level-N files even if it's
-    /// empty post-redistribute; (2) always clears dirty after claiming ownership. The clear is
-    /// safe because the caller holds the bucket's read lock — no concurrent writer can set
-    /// dirty=true while we hold it, so any post-release write will correctly re-set dirty and
-    /// be picked up by the next flush, matching the regular `serialize` path's semantics.
+    /// `serialize` path in two ways: (1) bypasses the `dirty.swap(false) → skip-if-was-false`
+    /// short-circuit, because every `[0..committed_level]` bucket must be rewritten at the new
+    /// layout to overwrite stale level-N files even if it is clean; (2) always clears dirty
+    /// after claiming ownership. A write to the bucket takes its write lock, which the caller's
+    /// read lock excludes, so such a write lands after the release, re-sets dirty and is picked
+    /// up by the next flush — matching the regular `serialize` path's semantics. A last-access
+    /// stamp is the exception, written under the read lock, which is why the claim acquires.
     pub async fn serialize_to_new(
         bucket: OwnedRwLockReadGuard<ImmutableStoreBucket, ImmutableStoreBucket>,
         group: Arc<ImmutableStoreGroup>,
@@ -895,8 +949,7 @@ impl ImmutableStoreBucket {
     ) -> Result<(), LocalImmutableStoreError> {
         let _lock = bucket.serialize_lock.clone().lock_owned().await;
 
-        // Claim ownership of the bucket's current content. We hold the bucket's read lock so no concurrent writer can have set dirty between the time we decided to serialize and now.
-        group.dirty[bucket_index].swap(false, atomic::Ordering::Relaxed);
+        group.dirty[bucket_index].swap(false, atomic::Ordering::Acquire);
 
         let final_path = format_bucket_path(path, group_index, bucket_index);
         let new_path = {
@@ -929,6 +982,18 @@ impl ImmutableStoreGroup {
                 let Some(bucket) = group.try_bucket(bucket_index).cloned() else {
                     continue;
                 };
+                // Guard this bucket write against a concurrent two-phase commit's
+                // rename. Taken before the bucket guard to keep the lock order
+                // flush_lock -> bucket RwLock -> serialize_lock uniform with `flush_all`.
+                let _flush_guard = group.flush_lock.clone().lock_owned().await;
+
+                // Re-check under the lock: a flush that ran while we waited may already
+                // have written this bucket. The dirty read above happened before the
+                // lock, so it is stale.
+                if !group.dirty[bucket_index].load(atomic::Ordering::Relaxed) {
+                    continue;
+                }
+
                 let bucket = bucket.read_owned().await;
                 let _ = ImmutableStoreBucket::serialize(
                     bucket,
@@ -940,6 +1005,17 @@ impl ImmutableStoreGroup {
                 )
                 .await;
             }
+
+            let flush_guard = group.flush_lock.clone().lock_owned().await;
+            crate::local::fan_out::commit_if_initial_level(
+                &flush_guard,
+                &group.committed_level,
+                &group.bucket_count,
+                path,
+                group_index,
+                false,
+            )
+            .await;
         }
     }
 }
@@ -1012,13 +1088,14 @@ impl LocalImmutableStore {
         };
 
         let mut store = LocalImmutableStore {
+            info: Default::default(),
             path: immutable_path.clone(),
             lock,
             group: Vec::with_capacity(GROUP_COUNT),
             settings,
             eviction: Semaphore::new(1),
             compaction: Semaphore::new(1),
-            stop_gc: AtomicBool::new(false),
+            stop_requests: AtomicUsize::new(0),
             compaction_reclaimed: AtomicU64::new(0),
             deserialize_all: Semaphore::new(1),
             deserialized_all: AtomicBool::new(false),
@@ -1032,11 +1109,8 @@ impl LocalImmutableStore {
         // can be set to 1 - and will then grow dynamically as needed
         const MIN_PACKFILE_COUNT: usize = 1;
 
-        // Per-group level marker detection. For each group dir (if present on disk), first run
-        // T10 recovery to roll forward any interrupted fan-out commit, then read the marker; if
-        // the marker is missing, fall back to `settings.initial_fan_out_level` for fresh stores
-        // or 256 for existing legacy stores (the pre-fan-out 256-bucket layout). `committed_level`
-        // tracks the on-disk marker value (0 if absent) for the flush path's two-phase decision.
+        // Groups are surveyed before their levels are decided: the decision needs the store's
+        // serialize version, which is only known once every marker has been read.
         let index_existed_on_disk = immutable_path
             .as_ref()
             .is_some_and(|p| p.join("index").exists());
@@ -1046,19 +1120,19 @@ impl LocalImmutableStore {
         // groups are independent directories, so the reads overlap and the engine's thread budget
         // is what paces them. Completions arrive in whatever order the reads finish, so each task
         // carries the group it answers for.
-        let initial_fan_out_level = store.settings.initial_fan_out_level;
-        let mut levels = vec![(initial_fan_out_level, 0usize, false); GROUP_COUNT];
+        let mut group_levels = vec![GroupLevel::Unwritten; GROUP_COUNT];
         if let Some(path) = immutable_path.as_deref() {
             let index_path = path.as_path().join("index");
             let mut tasks = JoinSet::new();
             for group_index in 0..GROUP_COUNT {
-                let group_path = index_path.join(format!("{:02x}", group_index as u8));
+                let group_path = crate::local::fan_out::group_dir_path(&index_path, group_index);
                 lore_base::lore_spawn!(tasks, async move {
+                    if !group_path.exists() {
+                        return (group_index, Ok(GroupLevel::Unwritten));
+                    }
                     // Roll forward any pending fan-out commit before reading the marker. After this returns the marker reflects the post-recovery state.
-                    if group_path.exists()
-                        && let Err(err) =
-                            crate::local::fan_out::recover_level_transition(&group_path, false)
-                                .await
+                    if let Err(err) =
+                        crate::local::fan_out::recover_level_transition(&group_path, false).await
                     {
                         return (
                             group_index,
@@ -1069,15 +1143,14 @@ impl LocalImmutableStore {
                         );
                     }
 
-                    let level = match crate::local::fan_out::read_level_marker(&group_path).await {
-                        Ok(Some(level)) => Ok((level, level, true)),
-                        Ok(None) if index_existed_on_disk => Ok((BUCKET_COUNT, 0, false)),
-                        Ok(None) => Ok((initial_fan_out_level, 0, false)),
-                        Err(err) => Err(LocalImmutableStoreError::internal_with_context(
-                            err,
-                            "Failed to read level marker for group",
-                        )),
-                    };
+                    let level = crate::local::fan_out::read_group_level(&group_path)
+                        .await
+                        .map_err(|err| {
+                            LocalImmutableStoreError::internal_with_context(
+                                err,
+                                "Failed to read level marker for group",
+                            )
+                        });
                     (group_index, level)
                 });
             }
@@ -1086,18 +1159,13 @@ impl LocalImmutableStore {
                 let (group_index, level) = joined.map_err(|err| {
                     LocalImmutableStoreError::internal_with_context(err, "level marker task")
                 })?;
-                levels[group_index] = level?;
+                group_levels[group_index] = level?;
             }
         }
 
-        let mut bucket_counts: Vec<usize> = Vec::with_capacity(GROUP_COUNT);
-        let mut committed_levels: Vec<usize> = Vec::with_capacity(GROUP_COUNT);
-        let mut any_marker_seen = false;
-        for (initial, committed, marker_seen) in levels {
-            bucket_counts.push(initial);
-            committed_levels.push(committed);
-            any_marker_seen |= marker_seen;
-        }
+        let any_marker_seen = group_levels
+            .iter()
+            .any(|level| matches!(level, GroupLevel::Marked(_)));
 
         // Determine serialize_version per Decision 8. Fresh stores, stores with markers, and
         // existing stores with bucket files at any older version (v1-v3) all go to LazyFanOut.
@@ -1120,18 +1188,29 @@ impl LocalImmutableStore {
                 ImmutableStoreVersion::LastAccessInEntry as u32
             };
 
-        for (group_index, &count) in bucket_counts.iter().enumerate() {
+        let unwritten_level = crate::local::fan_out::unwritten_group_level(
+            serialize_version == ImmutableStoreVersion::LazyFanOut as u32,
+            store.settings.initial_fan_out_level,
+        );
+
+        let mut _highest_materialized_group = -1;
+        for (group_index, level) in group_levels.into_iter().enumerate() {
+            let (count, committed) = match level {
+                GroupLevel::Marked(level) => {
+                    _highest_materialized_group = group_index as i32;
+                    (level, level)
+                }
+                GroupLevel::PreFanOut => {
+                    _highest_materialized_group = group_index as i32;
+                    (BUCKET_COUNT, 0)
+                }
+                GroupLevel::Unwritten => (unwritten_level, 0),
+            };
             let packpath = immutable_path.as_deref().map(|path| {
                 let mut path = path.clone();
                 path.reserve(16);
                 path.push("index");
-                {
-                    use std::io::Write;
-                    let mut hexstring: [u8; 2] = Default::default();
-                    let mut cursor = io::Cursor::new(&mut hexstring[..]);
-                    let _ = write!(&mut cursor, "{:02x}", group_index as u8);
-                    path.push(std::str::from_utf8(&hexstring).unwrap_or_default());
-                }
+                crate::local::fan_out::push_group_dir(&mut path, group_index);
                 path
             });
             store.group.push(Arc::new(ImmutableStoreGroup {
@@ -1140,7 +1219,8 @@ impl LocalImmutableStore {
                 bucket_count: std::sync::atomic::AtomicUsize::new(count),
                 serialize_version: std::sync::atomic::AtomicU32::new(serialize_version),
                 fan_out_threshold: store.settings.fan_out_threshold,
-                committed_level: std::sync::atomic::AtomicUsize::new(committed_levels[group_index]),
+                committed_level: std::sync::atomic::AtomicUsize::new(committed),
+                flush_lock: Arc::new(Mutex::new(())),
                 packstore: crate::PackStore::new(
                     packpath,
                     MIN_PACKFILE_COUNT,
@@ -1150,7 +1230,25 @@ impl LocalImmutableStore {
             }));
         }
 
+        if let Some(path) = immutable_path.as_deref() {
+            let index_to_oodle_migrate = {
+                // Assume that any store with groups that exist on disk were made by another
+                // Oodle-enabled binary before this one, and therefore may have data to migrate
+                #[cfg(feature = "oodle")]
+                {
+                    _highest_materialized_group
+                }
+                #[cfg(not(feature = "oodle"))]
+                {
+                    -1
+                }
+            };
+            let info = get_or_init_disk_info(path, index_to_oodle_migrate).await?;
+            store.info = info.into();
+        }
+
         let store = Arc::new(store);
+
         // The `Arc` only exists now (not when the groups were built above), so back-fill
         // the weak self-ref the load hooks need to fire a pass.
         let dyn_store: Arc<dyn crate::immutable_store::ImmutableStore> = store.clone();
@@ -1173,6 +1271,56 @@ impl LocalImmutableStore {
 
     pub fn packstore(&self, group_index: usize) -> &crate::PackStore {
         &self.group[group_index].packstore
+    }
+
+    pub async fn run_migrations(self: &Arc<Self>) -> Result<(), LocalImmutableStoreError> {
+        if let Some(_path) = self.path.as_ref() {
+            let oodle_group_to_migrate = self.info.read().await.next_group_index_to_migrate_oodle;
+            if oodle_group_to_migrate != -1 {
+                #[cfg(feature = "oodle")]
+                {
+                    let opted_out = std::env::var("LORE_IMMUTABLE_NO_OODLE_MIGRATION")
+                        .is_ok_and(|var| var == "1" || var.to_lowercase() == "true");
+                    if !opted_out {
+                        oodle_migration::migrate_groups(
+                            self.clone(),
+                            _path,
+                            oodle_group_to_migrate,
+                        )
+                        .await?;
+                    }
+                }
+                #[cfg(not(feature = "oodle"))]
+                {
+                    lore_base::lore_warn!(
+                        "Local Store Oodle migration needs to run, but this binary does not support Oodle. Eventually, Oodle support will be dropped and your local Oodle data will be irretrievable"
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn update_store_info<F>(&self, accessor: F) -> Result<(), LocalImmutableStoreError>
+    where
+        F: FnOnce(&mut ImmutableStoreInfo),
+    {
+        let mut store = self.info.write().await;
+        accessor(&mut store);
+
+        if let Some(path) = self.path.as_deref() {
+            write_info_file(&store, &info_path_for_store_root(path))
+                .await
+                .map_err(|err| {
+                    LocalImmutableStoreError::internal_with_context(
+                        err,
+                        "Failed to store updated info file",
+                    )
+                })?;
+        }
+
+        Ok(())
     }
 
     async fn upgrade_global_packfiles(
@@ -1268,6 +1416,7 @@ impl LocalImmutableStore {
                     group.dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
                     drop(bucket);
 
+                    let _flush_guard = group.flush_lock.clone().lock_owned().await;
                     let bucket = bucket_ref.read_owned().await;
                     let _ = ImmutableStoreBucket::serialize(
                         bucket,
@@ -1686,12 +1835,6 @@ impl LocalImmutableStore {
                     pack_offset = packref.offset;
                 }
             } else {
-                if !self.settings.allow_partial_fragment {
-                    lore_base::lore_error!(
-                        "Partial deduplication not allowed without payload proof for {address}"
-                    );
-                    return Err(LocalImmutableStoreError::internal("Payload is required"));
-                }
                 lore_base::lore_trace!("Storing partial fragment {address}");
             }
         }
@@ -1914,15 +2057,8 @@ impl LocalImmutableStore {
                     ..Default::default()
                 }
             } else {
-                // Record the last access timestamp unless disabled
                 if self.settings.atime {
-                    // SAFETY: Treat the u64 as an atomic, it is guaranteed to exist from the read lock
-                    // and stomping the value is safe and expected (contention is irrelevant)
-                    unsafe {
-                        AtomicU64::from_ptr(&data.last_access as *const u64 as *mut u64)
-                            .store(Self::last_access(), atomic::Ordering::Release);
-                    }
-                    group.dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
+                    Self::stamp_last_access(data, &group.dirty[bucket_index]);
                 }
 
                 *data
@@ -1936,6 +2072,125 @@ impl LocalImmutableStore {
                 context: matched_context,
             })
         }
+    }
+
+    /// Tombstone one address and release the payload it holds, if nothing else
+    /// refers to that payload.
+    ///
+    /// Whatever the address itself references is the caller's to have dealt with
+    /// first; see [`ImmutableStore::obliterate`].
+    async fn obliterate_one(
+        self: Arc<Self>,
+        partition: Partition,
+        address: Address,
+        stats: Arc<StoreObliterateStats>,
+    ) -> Result<(), StoreError> {
+        let group_index = address.hash.data()[0] as usize;
+        let group = &self.group[group_index];
+        let (bucket_index, mut bucket) = loop {
+            let n = group.bucket_count.load(atomic::Ordering::Relaxed);
+            let idx = crate::local::fan_out::bucket_index_for(&address.hash, n);
+            let lock = group.bucket(idx).clone().write_owned().await;
+            if group.bucket_count.load(atomic::Ordering::Relaxed) == n {
+                break (idx, lock);
+            }
+            drop(lock);
+        };
+
+        if !bucket.deserialized && self.path.is_some() {
+            Box::pin(bucket.deserialize(
+                &group.dirty[bucket_index],
+                self.path.clone().unwrap().as_ref(),
+                group_index,
+                bucket_index,
+                Some(&self.gc_counters),
+            ))
+            .await
+            .forward::<StoreError>("Failed to deserialize store data.")?;
+        }
+
+        let (match_slot, _, match_made) =
+            Self::lookup(&bucket, partition, address, StoreMatch::MatchFull);
+
+        if match_made != StoreMatch::MatchFull {
+            return Err(StoreError::from(AddressNotFound::from(address)));
+        }
+
+        let index = bucket.sorted_index[match_slot] as usize;
+        let entry = &bucket.entry[index];
+
+        let is_last_fragment = {
+            let previous_match = (0..match_slot)
+                .rev()
+                .map(|idx| bucket.sorted_index[idx] as usize)
+                .map(|idx| &bucket.entry[idx])
+                .take_while(|entry| entry.address.hash == address.hash)
+                .any(|entry| entry.data.flags != FragmentFlags::PayloadObliterated.bits());
+
+            let next_match = ((match_slot + 1)..bucket.sorted_index.len())
+                .map(|idx| bucket.sorted_index[idx] as usize)
+                .map(|idx| &bucket.entry[idx])
+                .take_while(|entry| entry.address.hash == address.hash)
+                .any(|entry| entry.data.flags != FragmentFlags::PayloadObliterated.bits());
+
+            !previous_match && !next_match
+        };
+
+        if entry.data.flags & FragmentFlags::PayloadObliterated.bits()
+            == FragmentFlags::PayloadObliterated
+        {
+            lore_base::lore_warn!("Address {address} already obliterated");
+            return Ok(());
+        }
+
+        if is_last_fragment && entry.data.pack_file != 0 {
+            lore_base::lore_debug!(
+                "Fragment payload has no other references, obliterating from packstore"
+            );
+
+            stats.num_payloads.fetch_add(1, atomic::Ordering::Relaxed);
+
+            group
+                .packstore
+                .obliterate(
+                    entry.data.pack_file,
+                    entry.data.pack_offset,
+                    entry.data.size_payload,
+                )
+                .await
+                .forward::<StoreError>("Failed to obliterate payload from pack store.")?;
+        }
+
+        stats.num_fragments.fetch_add(1, atomic::Ordering::Relaxed);
+
+        bucket.entry[index].data = ImmutableData {
+            flags: FragmentFlags::PayloadObliterated.bits(),
+            size_payload: 0,
+            size_content: 0,
+            pack_file: 0,
+            pack_offset: 0,
+            last_access: 0,
+        };
+
+        group.dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
+        drop(bucket);
+
+        let mut flush = group.flush.lock().await;
+        let _ = flush.try_join_next();
+
+        if flush.is_empty() {
+            let weak_self = Arc::downgrade(&self);
+            lore_base::lore_spawn!(
+                flush,
+                ImmutableStoreGroup::flush_delayed(
+                    weak_self,
+                    group_index,
+                    self.settings.flush_delay_seconds,
+                )
+            );
+        }
+
+        Ok(())
     }
 
     pub async fn load(
@@ -1956,6 +2211,22 @@ impl LocalImmutableStore {
         Ok(data)
     }
 
+    /// Whether garbage collection has been asked to stop. Eviction and compaction check
+    /// this inside their group work, so a stop lands within one packfile sweep.
+    #[inline]
+    fn gc_stop_requested(&self) -> bool {
+        self.stop_requests.load(atomic::Ordering::Relaxed) > 0
+    }
+
+    /// Report the end of a compaction pass and what it reclaimed. Called from every exit
+    /// past the `compaction_begin`, including the stopped and failed ones, so a sink that
+    /// saw a pass start always sees it finish.
+    fn report_compaction_end(&self, sink: Option<&crate::gc_event::GcEventSinkRef>) {
+        if let Some(sink) = sink {
+            sink.compaction_end(self.compaction_reclaimed.load(atomic::Ordering::Relaxed));
+        }
+    }
+
     async fn evict_group_sized(
         self: Arc<Self>,
         group_index: usize,
@@ -1971,6 +2242,9 @@ impl LocalImmutableStore {
         let bucket_count = group.bucket_count.load(atomic::Ordering::Relaxed);
         let mut bucket_stored_size = Vec::with_capacity(bucket_count);
         for bucket_index in 0..bucket_count {
+            if self.gc_stop_requested() {
+                return (0, 0);
+            }
             // Uninit slot is empty: push 0 to keep `bucket_stored_size` indexed by
             // bucket_index for the second pass below.
             let Some(bucket_ref) = group.try_bucket(bucket_index) else {
@@ -2030,6 +2304,13 @@ impl LocalImmutableStore {
         for bucket_index in 0..bucket_count {
             while serialize_tasks.try_join_next().is_some() {}
 
+            if self.gc_stop_requested() {
+                lore_base::lore_debug!(
+                    "Size eviction for group {group_index} stopping at bucket {bucket_index}"
+                );
+                break;
+            }
+
             let Some(bucket) = group.try_bucket(bucket_index).cloned() else {
                 continue;
             };
@@ -2054,10 +2335,11 @@ impl LocalImmutableStore {
                     }
 
                     let key = (entry.data.pack_file, entry.data.pack_offset);
+                    let last_access = Self::load_last_access(&entry.data);
                     stored_payloads
                         .entry(key)
-                        .and_modify(|item: &mut (u32, u64)| item.1 = entry.data.last_access)
-                        .or_insert((entry.data.size_payload, entry.data.last_access));
+                        .and_modify(|item: &mut (u32, u64)| item.1 = last_access)
+                        .or_insert((entry.data.size_payload, last_access));
                 }
                 stored_payloads.drain().collect()
             };
@@ -2136,11 +2418,12 @@ impl LocalImmutableStore {
             total_evicted_count += evicted_payload_count;
 
             if let Some(path) = path.as_ref() {
-                let path = Arc::new(path.as_ref().clone());
+                let path = path.clone();
                 let store = self.clone();
                 lore_base::lore_spawn!(serialize_tasks, async move {
                     let group = store.group[group_index].clone();
                     let bucket = group.bucket(bucket_index).clone();
+                    let _flush_guard = group.flush_lock.clone().lock_owned().await;
                     let bucket = bucket.read_owned().await;
                     let _ = ImmutableStoreBucket::serialize(
                         bucket,
@@ -2157,6 +2440,19 @@ impl LocalImmutableStore {
 
         // Await all serialization
         while serialize_tasks.join_next().await.is_some() {}
+
+        if let Some(path) = path.as_ref() {
+            let flush_guard = group.flush_lock.clone().lock_owned().await;
+            crate::local::fan_out::commit_if_initial_level(
+                &flush_guard,
+                &group.committed_level,
+                &group.bucket_count,
+                path.as_ref(),
+                group_index,
+                sync_data,
+            )
+            .await;
+        }
 
         if total_evicted_count > 0 {
             lore_base::lore_debug!(
@@ -2177,14 +2473,14 @@ impl LocalImmutableStore {
         let mut evict_count = 0;
         let mut began = false;
 
-        if self.stop_gc.load(atomic::Ordering::Relaxed) {
+        if self.gc_stop_requested() {
             return 0;
         }
         let Ok(_permit) = self.eviction.acquire().await else {
             lore_base::lore_warn!("Evict oldest failed to get permit");
             return 0;
         };
-        if self.stop_gc.load(atomic::Ordering::Relaxed) {
+        if self.gc_stop_requested() {
             return 0;
         }
 
@@ -2201,6 +2497,10 @@ impl LocalImmutableStore {
         let mut group_count = 0;
         let mut bucket_count = 0;
         for group in self.group.iter() {
+            if self.gc_stop_requested() {
+                break;
+            }
+
             buckets.clear();
             let active_buckets = group.bucket_count.load(atomic::Ordering::Relaxed);
             // Per-group target divides by this group's bucket_count, not the constant 256, so groups at level 1 still get a meaningful target rather than max_capacity / 65536.
@@ -2311,7 +2611,7 @@ impl LocalImmutableStore {
                 {
                     continue;
                 }
-                let key = entry.data.last_access;
+                let key = Self::load_last_access(&entry.data);
                 if heap.len() < to_evict {
                     heap.push(key);
                 } else if key < *heap.peek().unwrap() {
@@ -2370,7 +2670,8 @@ impl LocalImmutableStore {
             .record(target_size as u64, &[]);
 
         let mut group_index = at.unwrap_or(GROUP_COUNT);
-        if group_index >= GROUP_COUNT {
+        let starting_pass = group_index >= GROUP_COUNT;
+        if starting_pass {
             let total_size = self.clone().packstore_total_size().await;
             self.instruments
                 .compaction
@@ -2385,16 +2686,11 @@ impl LocalImmutableStore {
             lore_base::lore_debug!(
                 "Packstore compactor running, current size {total_size} is above threshold {max_size} - targeting {target_size} bytes ({target_percentage}% of max size)"
             );
-            self.compaction_reclaimed
-                .store(0, atomic::Ordering::Relaxed);
-            if let Some(sink) = &sink {
-                sink.compaction_begin(max_size as u64);
-            }
         }
 
         let _ = self.deserialize_all_buckets().await;
 
-        if self.stop_gc.load(atomic::Ordering::Relaxed) {
+        if self.gc_stop_requested() {
             return Ok(None);
         }
         let Ok(_permit) = self.compaction.acquire().await else {
@@ -2402,7 +2698,11 @@ impl LocalImmutableStore {
             return Ok(None);
         };
 
-        if group_index >= GROUP_COUNT {
+        if self.gc_stop_requested() {
+            return Ok(None);
+        }
+
+        if starting_pass {
             lore_base::lore_debug!("Packstore compactor starting fresh");
 
             group_index = 0;
@@ -2412,8 +2712,12 @@ impl LocalImmutableStore {
             );
         }
 
-        if self.stop_gc.load(atomic::Ordering::Relaxed) {
-            return Ok(None);
+        // Committed to a step from here, so the begin is owed exactly one end on every exit
+        // below, carrying what this step reclaimed.
+        self.compaction_reclaimed
+            .store(0, atomic::Ordering::Relaxed);
+        if let Some(sink) = &sink {
+            sink.compaction_begin(max_size as u64);
         }
 
         let target_size = target_size / GROUP_COUNT;
@@ -2450,13 +2754,27 @@ impl LocalImmutableStore {
         }
 
         let mut final_result = Ok(());
+        let mut completed = true;
         while let Some(result) = tasks.join_next().await {
-            final_result = final_result.and(
-                result
-                    .map_err(|_err| Internal::msg("Task failure"))
-                    .map_err(StoreError::from)
-                    .flatten(),
+            let group_result = result
+                .map_err(|_err| Internal::msg("Task failure"))
+                .map_err(StoreError::from)
+                .flatten();
+            if let Ok(group_completed) = &group_result {
+                completed &= *group_completed;
+            }
+            final_result = final_result.and(group_result.map(|_| ()));
+        }
+
+        // A group that stopped still has packfiles to rewrite, so `group_index` is where a
+        // later pass picks up rather than what this step reached.
+        if !completed {
+            lore_base::lore_debug!(
+                "Packstore compactor stopped during group {group_index}, leaving resume point"
             );
+            self.report_compaction_end(sink.as_ref());
+            final_result?;
+            return Ok(Some(group_index));
         }
 
         group_index += parallel_group_count;
@@ -2477,7 +2795,9 @@ impl LocalImmutableStore {
         }
 
         // Error out if any operation failed
-        final_result?;
+        final_result.inspect_err(|_| self.report_compaction_end(sink.as_ref()))?;
+
+        self.report_compaction_end(sink.as_ref());
 
         if group_index < GROUP_COUNT {
             let total_size = self.packstore_total_size().await;
@@ -2488,13 +2808,15 @@ impl LocalImmutableStore {
                 .record(total_size as u64, &[]);
             Ok(Some(group_index))
         } else {
-            if let Some(sink) = &sink {
-                sink.compaction_end(self.compaction_reclaimed.load(atomic::Ordering::Relaxed));
-            }
             Ok(None)
         }
     }
 
+    /// Rewrite the group's packfiles into fewer, denser ones, one packfile at a time.
+    ///
+    /// Returns whether the group was left complete. `false` means a stop request ended
+    /// the pass with packfiles still to rewrite, and the caller must hold the compaction
+    /// resume point so a later pass repeats this group.
     #[allow(clippy::too_many_arguments)]
     async fn compact_group_packfiles(
         self: Arc<Self>,
@@ -2505,7 +2827,7 @@ impl LocalImmutableStore {
         sync_data: bool,
         instruments: CompactionInstruments,
         sink: Option<crate::gc_event::GcEventSinkRef>,
-    ) -> Result<(), StoreError> {
+    ) -> Result<bool, StoreError> {
         let (evicted_count, evicted_size) = self
             .clone()
             .evict_group_sized(
@@ -2536,7 +2858,20 @@ impl LocalImmutableStore {
 
         let mut packfile = 1;
         let mut group_reclaimed: u64 = 0;
+        let mut completed = true;
         loop {
+            // A packfile is the unit of compaction work. Its bucket sweep must reach the
+            // truncate below: buckets already rewritten point at the new packfile while
+            // the rest still point at this one, so abandoning a sweep part way would
+            // leave payloads that are still referenced in a packfile about to be dropped.
+            if self.gc_stop_requested() {
+                lore_base::lore_debug!(
+                    "Packstore compactor stopping group {group_index} before packfile {packfile}"
+                );
+                completed = false;
+                break;
+            }
+
             let group = &self.group[group_index];
             if let Ok(current_size) = group.packstore.total_size().await
                 && current_size < target_size
@@ -2574,8 +2909,10 @@ impl LocalImmutableStore {
                     lore_base::lore_trace!(
                         "Packstore compactor serializing group {group_index} bucket {bucket_index}"
                     );
-                    let path = Arc::new(path.as_ref().clone());
                     let bucket = group.bucket(bucket_index).clone();
+                    // Narrow scope on purpose: this fn already called
+                    // evict_group_sized above, which takes the same lock.
+                    let _flush_guard = group.flush_lock.clone().lock_owned().await;
                     let bucket = bucket.read_owned().await;
                     let _ = ImmutableStoreBucket::serialize(
                         bucket,
@@ -2597,6 +2934,19 @@ impl LocalImmutableStore {
                         "Packstore compactor verification failed after a bucket pass: {err}"
                     );
                 }
+            }
+
+            if let Some(path) = path.as_ref() {
+                let flush_guard = group.flush_lock.clone().lock_owned().await;
+                crate::local::fan_out::commit_if_initial_level(
+                    &flush_guard,
+                    &group.committed_level,
+                    &group.bucket_count,
+                    path.as_ref(),
+                    group_index,
+                    sync_data,
+                )
+                .await;
             }
 
             lore_base::lore_debug!(
@@ -2623,7 +2973,7 @@ impl LocalImmutableStore {
                 .fetch_add(group_reclaimed, atomic::Ordering::Relaxed);
         }
 
-        Ok(())
+        Ok(completed)
     }
 
     pub async fn group_verify_store(
@@ -2928,6 +3278,45 @@ impl LocalImmutableStore {
             .as_secs()
     }
 
+    /// Read an entry's last-access stamp.
+    ///
+    /// This is the only field written while its bucket is read-locked, so a read of it alone goes
+    /// through the atomic. A bulk copy of the entry takes it with the rest and may see the
+    /// previous stamp; both are times the entry was read.
+    fn load_last_access(data: &ImmutableData) -> u64 {
+        // SAFETY: the entry outlives the bucket lock its reader holds, and every write to this
+        // field is an atomic store through the same cast.
+        unsafe { AtomicU64::from_ptr(&data.last_access as *const u64 as *mut u64) }
+            .load(atomic::Ordering::Relaxed)
+    }
+
+    /// Move an entry's last-access stamp to now, marking `dirty` only when the move reaches
+    /// [`ATIME_GRANULARITY_SECONDS`].
+    ///
+    /// An entry serializes inside its whole bucket, so dirtying on every read would have each
+    /// read rewrite the bucket it touched. The stamp advances regardless, so a bucket written for
+    /// any other reason carries the current time.
+    ///
+    /// Dirtying here schedules no flush of its own.
+    ///
+    /// The stamp is swapped rather than loaded and stored, so that two resolves racing cannot both
+    /// read the old stamp and both dirty the bucket. It carries no ordering of its own; `dirty` is
+    /// released, and claimed with an acquire in [`ImmutableStoreBucket::serialize`] and
+    /// [`ImmutableStoreBucket::serialize_to_new`], which is what orders the stamp before the bytes
+    /// a flusher writes. Every other mutation of an entry takes the bucket write lock, whose
+    /// release a flusher's read lock already synchronizes with; this one holds a read lock, so the
+    /// flag has to carry the edge.
+    fn stamp_last_access(data: &ImmutableData, dirty: &AtomicBool) {
+        // SAFETY: as `load_last_access`.
+        let stamp = unsafe { AtomicU64::from_ptr(&data.last_access as *const u64 as *mut u64) };
+        let now = Self::last_access();
+
+        let previous = stamp.swap(now, atomic::Ordering::Relaxed);
+        if now.saturating_sub(previous) >= ATIME_GRANULARITY_SECONDS {
+            dirty.store(true, atomic::Ordering::Release);
+        }
+    }
+
     /// Immediate flush of all dirty buckets. Parallel across groups, sequential within a group.
     async fn flush_all(
         self: Arc<Self>,
@@ -2943,7 +3332,10 @@ impl LocalImmutableStore {
         for group_index in 0..self.group.len() {
             let group = self.group[group_index].clone();
 
-            // Lock-free scan: skip the group entirely when no bucket is dirty. No dirty bucket means no put/store operation has touched this group since the last flush, so the packstore has no new content to flush AND no marker write is needed (an empty group with no marker defaults to bucket_count = 256 on reload, which is fine — empty groups have no entries to interpret at any level, and the first write to such a group will fire the two-phase commit at that point). This restores ~zero per-group overhead for empty groups in fresh-store flushes, matching pre-fan-out behaviour.
+            // Lock-free scan: a group with no dirty bucket has taken no write since the last
+            // flush, so it has nothing to serialize and owes no marker. A marker-less group
+            // reloads at bucket_count = 256, correct for an empty group at any level, and its
+            // first write fires the two-phase commit. Empty groups cost ~nothing per flush.
             let any_dirty = group
                 .dirty
                 .iter()
@@ -2954,214 +3346,12 @@ impl LocalImmutableStore {
 
             let path = path.clone();
             lore_base::lore_spawn!(tasks, async move {
-                let mut first_err: Option<LocalImmutableStoreError> = None;
+                // One flusher per group at a time, held for the whole group flush so an
+                // overlapping flush cannot observe a half-finished level transition and
+                // take the other commit path. See `ImmutableStoreGroup::flush_lock`.
+                let _flush_guard = group.flush_lock.clone().lock_owned().await;
 
-                // Fan-out trigger: if any dirty bucket exceeds threshold and we're below max level, redistribute entries before serializing.
-                if let Err(err) =
-                    maybe_fan_out_immutable_group(&group, path.as_ref(), group_index).await
-                {
-                    first_err = Some(err);
-                }
-
-                let active_buckets = group.bucket_count.load(atomic::Ordering::Relaxed);
-                let committed_level = group.committed_level.load(atomic::Ordering::Relaxed);
-                let group_path = {
-                    let mut p = path.as_path().to_path_buf();
-                    p.push("index");
-                    p.push(format!("{:02x}", group_index as u8));
-                    p
-                };
-                let fan_out_aware = group.serialize_version.load(atomic::Ordering::Relaxed)
-                    == ImmutableStoreVersion::LazyFanOut as u32;
-                let needs_two_phase_commit = fan_out_aware && committed_level != active_buckets;
-
-                // Always flush the packstore once per group when sync_data is set, regardless of which serialize path runs below.
-                if sync_data {
-                    group.flush_packstore(sync_data).await;
-                }
-
-                if needs_two_phase_commit && first_err.is_none() {
-                    // T10 two-phase commit. Every [0..active_buckets] bucket gets a .new file (skipping empties at index >= committed_level since no old file exists there to overwrite). After all .new files are durable, write level.pending as the commit point. Then rename .new -> final, write the level marker, delete level.pending. Recovery on the next store open rolls forward from any pending state.
-                    if let Err(e) = lore_io::IoDriver::global()
-                        .create_dir_all(&group_path)
-                        .await
-                        .map_err(|e| {
-                            LocalImmutableStoreError::internal_with_context(
-                                e,
-                                "Failed to create group directory for fan-out commit",
-                            )
-                        })
-                    {
-                        first_err = Some(e);
-                    }
-
-                    let mut wrote_new: Vec<usize> = Vec::new();
-                    if first_err.is_none() {
-                        for bucket_index in 0..active_buckets {
-                            // Fast path: skip the bucket entirely (no lock acquire) when it's neither dirty nor an old-level slot we need to overwrite. The dirty flag is the cheap proxy for "this bucket has data to flush"; combined with the index < committed_level check (which forces an empty .new to overwrite stale level-N files), this avoids 256× read-lock acquires per group on the common server-fresh-store first flush where most buckets are empty and committed_level == 0.
-                            let must_overwrite_old = bucket_index < committed_level;
-                            let dirty = group.dirty[bucket_index].load(atomic::Ordering::Relaxed);
-                            if !must_overwrite_old && !dirty {
-                                continue;
-                            }
-                            let bucket = group.bucket(bucket_index).clone().read_owned().await;
-                            // Re-check after lock acquire — concurrent paths may have just dirtied or undirtied this bucket.
-                            if bucket.entry.is_empty() && !must_overwrite_old {
-                                continue;
-                            }
-                            let res = ImmutableStoreBucket::serialize_to_new(
-                                bucket,
-                                group.clone(),
-                                path.as_ref(),
-                                group_index,
-                                bucket_index,
-                                sync_data,
-                            )
-                            .await;
-                            match res {
-                                Ok(()) => wrote_new.push(bucket_index),
-                                Err(err) => {
-                                    if first_err.is_none() {
-                                        first_err = Some(err);
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    if wrote_new.is_empty() {
-                        // No .new files written for this group — skip the level.pending sentinel entirely. The sentinel exists to drive roll-forward recovery of a partially-completed transition; with no .new files there is no in-progress state to recover, so a direct marker write is sufficient. Restores ~3x throughput on fresh-store-first-flush-with-sync_data when most groups are empty (the common shape on `lore repository create`).
-                        if first_err.is_none()
-                            && let Err(err) = crate::local::fan_out::write_level_marker(
-                                &group_path,
-                                active_buckets,
-                                sync_data,
-                            )
-                            .await
-                            .map_err(|e| {
-                                LocalImmutableStoreError::internal_with_context(
-                                    e,
-                                    "Failed to write level marker for empty group",
-                                )
-                            })
-                        {
-                            first_err = Some(err);
-                        }
-                        if first_err.is_none() {
-                            group
-                                .committed_level
-                                .store(active_buckets, atomic::Ordering::Relaxed);
-                        }
-                    } else {
-                        // Full two-phase commit: pending → renames → marker → delete pending.
-                        if first_err.is_none()
-                            && let Err(err) = crate::local::fan_out::write_level_pending(
-                                &group_path,
-                                active_buckets,
-                                sync_data,
-                            )
-                            .await
-                            .map_err(|e| {
-                                LocalImmutableStoreError::internal_with_context(
-                                    e,
-                                    "Failed to write level.pending",
-                                )
-                            })
-                        {
-                            first_err = Some(err);
-                        }
-
-                        if first_err.is_none() {
-                            for &bucket_index in &wrote_new {
-                                let new_path = crate::local::fan_out::bucket_new_path(
-                                    &group_path,
-                                    bucket_index,
-                                );
-                                let final_path =
-                                    crate::local::fan_out::bucket_path(&group_path, bucket_index);
-                                if let Err(err) = lore_io::IoDriver::global()
-                                    .rename(&new_path, &final_path)
-                                    .await
-                                    && first_err.is_none()
-                                {
-                                    first_err = Some(
-                                        LocalImmutableStoreError::internal_with_context(
-                                            err,
-                                            "Failed to rename .new bucket file during fan-out commit",
-                                        ),
-                                    );
-                                }
-                            }
-                        }
-
-                        if first_err.is_none()
-                            && let Err(err) = crate::local::fan_out::write_level_marker(
-                                &group_path,
-                                active_buckets,
-                                sync_data,
-                            )
-                            .await
-                            .map_err(|e| {
-                                LocalImmutableStoreError::internal_with_context(
-                                    e,
-                                    "Failed to write level marker",
-                                )
-                            })
-                        {
-                            first_err = Some(err);
-                        }
-
-                        if first_err.is_none()
-                            && let Err(err) =
-                                crate::local::fan_out::delete_level_pending(&group_path)
-                                    .await
-                                    .map_err(|e| {
-                                        LocalImmutableStoreError::internal_with_context(
-                                            e,
-                                            "Failed to delete level.pending",
-                                        )
-                                    })
-                        {
-                            first_err = Some(err);
-                        }
-
-                        if first_err.is_none() {
-                            group
-                                .committed_level
-                                .store(active_buckets, atomic::Ordering::Relaxed);
-                        }
-                    }
-                } else if first_err.is_none() {
-                    // Regular flush at unchanged level: per-file .tmp + atomic rename for dirty buckets only. No marker write — marker already reflects the current level.
-                    for bucket_index in 0..active_buckets {
-                        if !group.dirty[bucket_index].load(atomic::Ordering::Relaxed) {
-                            continue;
-                        }
-                        let Some(bucket) = group.try_bucket(bucket_index).cloned() else {
-                            continue;
-                        };
-                        let bucket = bucket.read_owned().await;
-                        let res = ImmutableStoreBucket::serialize(
-                            bucket,
-                            group.clone(),
-                            path.as_ref(),
-                            group_index,
-                            bucket_index,
-                            sync_data,
-                        )
-                        .await;
-                        if let Err(err) = res
-                            && first_err.is_none()
-                        {
-                            first_err = Some(err);
-                        }
-                    }
-                }
-
-                match first_err {
-                    Some(err) => Err(err),
-                    None => Ok(()),
-                }
+                flush_locked_group(group, group_index, path, sync_data).await
             });
         }
 
@@ -3191,7 +3381,7 @@ impl LocalImmutableStore {
                     if address.hash.cmp(&previous_address.hash).is_lt() {
                         panic!("Immutable store integrity failed, entries not sorted");
                     }
-                    let last_access = bucket.entry[*index as usize].data.last_access;
+                    let last_access = Self::load_last_access(&bucket.entry[*index as usize].data);
                     if last_access > current_time {
                         panic!("Immutable store entry has last access in the future");
                     }
@@ -3438,6 +3628,74 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
         })
     }
 
+    /// One index lookup settles where the payload belongs and reads it there. A payload that is the
+    /// content scatters straight into `dst` and allocates nothing; any other is read into its own
+    /// buffer, which the reader needs to expand or walk it. Applies the same gating as `get`.
+    async fn get_into(
+        self: Arc<Self>,
+        partition: Partition,
+        address: Address,
+        dst: &mut crate::CallerBuffer,
+    ) -> Result<(Fragment, PayloadRead), StoreError> {
+        let find = self
+            .find(partition, address)
+            .await
+            .forward_with::<StoreError, _>(|| {
+                format!(
+                    "Failed to query immutable store for get_into {}.",
+                    address.hash
+                )
+            })?;
+
+        let obliterated = find.data.flags & FragmentFlags::PayloadObliterated.bits() != 0;
+        if obliterated || find.matching < self.read_scope() {
+            return Err(StoreError::from(AddressNotFound::from(address)));
+        }
+
+        let mut local_flags = 0;
+        if self.settings.implicit_durable_stored {
+            local_flags |= FragmentFlags::PayloadStoredDurable.bits();
+        }
+
+        let fragment = Fragment {
+            flags: find.data.flags | local_flags,
+            size_payload: find.data.size_payload,
+            size_content: find.data.size_content,
+        };
+
+        crate::validate_fragment_size(&fragment)?;
+
+        if find.data.pack_file == 0 {
+            return Err(StoreError::from(PayloadNotFound::from(address.hash)));
+        }
+
+        if !crate::payload_is_content(&fragment) {
+            let payload = Self::load(&self.group[find.group].packstore, find.data)
+                .await
+                .forward::<StoreError>("Failed to load payload from local storage.")?;
+            crate::validate_fragment_payload(&fragment, payload.len())?;
+            return Ok((fragment, PayloadRead::Returned(payload)));
+        }
+
+        let size_payload = find.data.size_payload as usize;
+        crate::validate_buffer_capacity(size_payload, dst.len())?;
+
+        self.group[find.group]
+            .packstore
+            .load_into(
+                find.data.pack_file,
+                find.data.pack_offset,
+                find.data.size_payload,
+                dst,
+            )
+            .await
+            .forward::<StoreError>(
+                "Failed to load payload into caller buffer from local storage.",
+            )?;
+
+        Ok((fragment, PayloadRead::IntoBuffer))
+    }
+
     async fn put(
         self: Arc<Self>,
         partition: Partition,
@@ -3575,51 +3833,38 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
     ) -> Result<(), StoreError> {
         timed!(
             self.instruments.operation_latency,
-            &self.instruments.get_labels_for_operation_context("obliterate"),
+            &self
+                .instruments
+                .get_labels_for_operation_context("obliterate"),
             {
-                let group_index = address.hash.data()[0] as usize;
                 lore_base::lore_debug!("Obliterating address {address}");
 
-                let group = &self.group[group_index];
-                let (bucket_index, mut bucket) = loop {
-                    let n = group.bucket_count.load(atomic::Ordering::Relaxed);
-                    let idx = crate::local::fan_out::bucket_index_for(&address.hash, n);
-                    let lock = group.bucket(idx).clone().write_owned().await;
-                    if group.bucket_count.load(atomic::Ordering::Relaxed) == n {
-                        break (idx, lock);
-                    }
-                    drop(lock);
-                };
+                // `find` reads the entry and releases the bucket, which is what
+                // this needs: the sub-fragments below each choose their own group
+                // and bucket from their own hash, and one in `bucket_count` of
+                // them chooses the bucket this address lives in.
+                // `tokio::sync::RwLock` is not reentrant, so descending into them
+                // while holding that lock waits on a lock this task already owns.
+                // The fan-out level sets the odds: one child in 65,536 at 256
+                // buckets to a group, one in 256 at one bucket, where every child
+                // in the parent's group collides.
+                let found = self
+                    .find(partition, address)
+                    .await
+                    .forward::<StoreError>("Failed to deserialize store data.")?;
 
-                if !bucket.deserialized && self.path.is_some() {
-                    Box::pin(bucket
-                        .deserialize(
-                            &group.dirty[bucket_index],
-                            self.path.clone().unwrap().as_ref(),
-                            group_index,
-                            bucket_index,
-                            Some(&self.gc_counters),
-                        ))
-                        .await
-                        .forward::<StoreError>("Failed to deserialize store data.")?;
-                }
+                lore_base::lore_debug!("Lookup match for {address}: {:?}", found.matching);
 
-                let (match_slot, _, match_made) =
-                    Self::lookup(&bucket, partition, address, StoreMatch::MatchFull);
-
-                lore_base::lore_debug!("Lookup match for {address}: {match_made:?}");
-
-                if match_made != StoreMatch::MatchFull {
+                if found.matching != StoreMatch::MatchFull {
                     return Err(StoreError::from(AddressNotFound::from(address)));
                 }
+                let data = found.data;
 
-                let index = bucket.sorted_index[match_slot] as usize;
-                let entry = &bucket.entry[index];
-
-                if (entry.data.flags & FragmentFlags::PayloadFragmented) != 0 {
+                if (data.flags & FragmentFlags::PayloadFragmented) != 0 {
                     lore_base::lore_debug!("Payload fragmented, obliterating subfragments");
 
-                    if let Ok(payload) = Self::load(&group.packstore, entry.data).await.inspect_err(|e| {
+                    let group = &self.group[address.hash.data()[0] as usize];
+                    if let Ok(payload) = Self::load(&group.packstore, data).await.inspect_err(|e| {
                         lore_base::lore_warn!(
                             "Failed to load fragment while obliterating address {address}: {e:?}"
                         );
@@ -3643,83 +3888,14 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
                     }
                 }
 
-                let is_last_fragment = {
-                    let previous_match = (0..match_slot)
-                        .rev()
-                        .map(|idx| bucket.sorted_index[idx] as usize)
-                        .map(|idx| &bucket.entry[idx])
-                        .take_while(|entry| entry.address.hash == address.hash)
-                        .any(|entry| entry.data.flags != FragmentFlags::PayloadObliterated.bits());
-
-                    let next_match = ((match_slot + 1)..bucket.sorted_index.len())
-                        .map(|idx| bucket.sorted_index[idx] as usize)
-                        .map(|idx| &bucket.entry[idx])
-                        .take_while(|entry| entry.address.hash == address.hash)
-                        .any(|entry| entry.data.flags != FragmentFlags::PayloadObliterated.bits());
-
-                    !previous_match && !next_match
-                };
-
-                if entry.data.flags & FragmentFlags::PayloadObliterated.bits() == FragmentFlags::PayloadObliterated {
-                    lore_base::lore_warn!("Address {address} already obliterated");
-                    return Ok(());
-                }
-
-                if is_last_fragment && entry.data.pack_file != 0 {
-                    lore_base::lore_debug!(
-                        "Fragment payload has no other references, obliterating from packstore"
-                    );
-
-                    stats
-                        .num_payloads
-                        .fetch_add(1, atomic::Ordering::Relaxed);
-
-                    group.packstore
-                        .obliterate(
-                            entry.data.pack_file,
-                            entry.data.pack_offset,
-                            entry.data.size_payload,
-                        )
-                        .await
-                        .forward::<StoreError>(
-                            "Failed to obliterate payload from pack store.",
-                        )?;
-                }
-
-                stats
-                    .num_fragments
-                    .fetch_add(1, atomic::Ordering::Relaxed);
-
-                bucket.entry[index].data = ImmutableData {
-                    flags: FragmentFlags::PayloadObliterated.bits(),
-                    size_payload: 0,
-                    size_content: 0,
-                    pack_file: 0,
-                    pack_offset: 0,
-                    last_access: 0
-                };
-
-                group.dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
-                drop(bucket);
-
-                let mut flush = group.flush.lock().await;
-                let _ = flush.try_join_next();
-
-                if flush.is_empty() {
-                    let weak_self = Arc::downgrade(&self);
-                    lore_base::lore_spawn!(
-                        flush,
-                        ImmutableStoreGroup::flush_delayed(
-                            weak_self,
-                            group_index,
-                            self.settings.flush_delay_seconds,
-                        )
-                    );
-                }
-
-                Ok(())
+                // Everything this address referenced is gone, so the address
+                // itself can go. The lock is taken again rather than held
+                // throughout: what it guards is this entry, and none of the walk
+                // above needed it.
+                self.clone().obliterate_one(partition, address, stats).await
             }
-        ).into()
+        )
+        .into()
     }
 
     async fn evict(
@@ -3770,17 +3946,20 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
         }
     }
 
-    async fn compact_stop(self: Arc<Self>) {
-        self.stop_gc.store(true, atomic::Ordering::Relaxed);
-        {
-            let _evict = self.eviction.acquire().await;
-        }
-        {
-            let _compact = self.compaction.acquire().await;
-        }
+    async fn stop_gc(self: Arc<Self>, terminate: bool) {
+        let _request = GcStopRequest::raise(&self.stop_requests, terminate);
+        // Taking both permits is what waits for the passes in flight to give up.
+        let _evict = self.eviction.acquire().await;
+        let _compact = self.compaction.acquire().await;
     }
 
     async fn verify(self: Arc<Self>, heal: bool) -> Result<(), StoreError> {
+        // Held for the whole walk: eviction and compaction rewrite the very entries and
+        // packfiles being read, so a pass running alongside reports failures that are only
+        // the store moving underneath it.
+        let evict_permit = self.eviction.acquire().await;
+        let compact_permit = self.compaction.acquire().await;
+
         let _ = self.deserialize_all_buckets().await;
 
         let mut failed = vec![];
@@ -3976,6 +4155,8 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
             }
 
             if heal {
+                drop(evict_permit);
+                drop(compact_permit);
                 let _ = crate::immutable_store::ImmutableStore::flush(self, false).await;
 
                 lore_base::lore_debug!("Store healing complete");
@@ -4270,9 +4451,18 @@ impl LocalImmutableStore {
         result.packfile_entry_count = entries.len();
 
         let mut failed_data: Vec<ImmutableData> = Vec::new();
+        let mut missing_payload = false;
 
         for data in entries {
+            // A tombstone holds no payload by design, so it is neither missing one nor healed.
+            if data.flags & FragmentFlags::PayloadObliterated.bits() != 0 {
+                continue;
+            }
+
             if data.pack_file == 0 {
+                missing_payload = true;
+                result.verification_result =
+                    Err(VerifyFragmentError::internal("no payload stored"));
                 continue;
             }
 
@@ -4325,20 +4515,40 @@ impl LocalImmutableStore {
             }
         }
 
-        if heal && !failed_data.is_empty() {
+        if heal && (!failed_data.is_empty() || missing_payload) {
+            // An entry left behind without a payload still answers a full match, so it has to go
+            // rather than be cleared. Obliterated entries are tombstones and stay.
             let mut bucket = bucket_ref.write().await;
 
-            for entry in bucket.entry.iter_mut() {
-                if entry.address.hash == address.hash
-                    && failed_data.iter().any(|f| {
-                        entry.data.pack_file == f.pack_file
-                            && entry.data.pack_offset == f.pack_offset
-                    })
-                {
-                    entry.data.pack_file = 0;
-                    entry.data.pack_offset = 0;
+            let mut sorted_index = GrowVec::new();
+            let mut entry = GrowVec::new();
+            let mut dropped = 0;
+            for index in bucket.sorted_index.iter() {
+                let index = *index as usize;
+                let candidate = &bucket.entry[index];
+                let obliterated =
+                    candidate.data.flags & FragmentFlags::PayloadObliterated.bits() != 0;
+                let unserviceable = candidate.data.pack_file == 0
+                    || failed_data.iter().any(|failed| {
+                        candidate.data.pack_file == failed.pack_file
+                            && candidate.data.pack_offset == failed.pack_offset
+                    });
+                if candidate.address.hash == address.hash && unserviceable && !obliterated {
+                    dropped += 1;
+                    continue;
                 }
+
+                let new_index = entry.len() as u32;
+                sorted_index.push(new_index);
+                entry.push(bucket.entry[index]);
             }
+
+            bucket.sorted_index = sorted_index;
+            bucket.entry = entry;
+
+            lore_base::lore_warn!(
+                "Verify dropped {dropped} unserviceable association(s) for {address}, across every partition that held one. The payload has to be stored again"
+            );
 
             self.group[group_index].dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
             drop(bucket);
@@ -4493,6 +4703,235 @@ impl ImmutableStoreCreateOptions {
     }
 }
 
+pub(crate) async fn flush_locked_group(
+    group: Arc<ImmutableStoreGroup>,
+    group_index: usize,
+    path: Arc<PathBuf>,
+    sync_data: bool,
+) -> Result<(), LocalImmutableStoreError> {
+    let mut first_err: Option<LocalImmutableStoreError> = None;
+
+    // Re-check under the lock: another flusher may have drained this group
+    // while we waited. The scan that got us here is lock-free and stale by
+    // now, so skip the redundant fan-out check, path selection and - in the
+    // two-phase branch - the needless level-marker write. A pending level
+    // transition (`committed_level != active_buckets`) still has to be
+    // completed even with no dirty bucket, so it is never skipped.
+    if !group
+        .dirty
+        .iter()
+        .any(|flag| flag.load(atomic::Ordering::Relaxed))
+        && group.committed_level.load(atomic::Ordering::Relaxed)
+            == group.bucket_count.load(atomic::Ordering::Relaxed)
+    {
+        // The packstore flush below is unconditional for `sync_data`, so it
+        // still has to run on this path.
+        if sync_data {
+            group.flush_packstore(sync_data).await;
+        }
+        return Ok(());
+    }
+
+    // Fan-out trigger: if any dirty bucket exceeds threshold and we're below max level, redistribute entries before serializing.
+    if let Err(err) = maybe_fan_out_immutable_group(&group, path.as_ref(), group_index).await {
+        first_err = Some(err);
+    }
+
+    let active_buckets = group.bucket_count.load(atomic::Ordering::Relaxed);
+    let committed_level = group.committed_level.load(atomic::Ordering::Relaxed);
+    let group_path = {
+        let mut p = path.as_path().to_path_buf();
+        p.push("index");
+        crate::local::fan_out::push_group_dir(&mut p, group_index);
+        p
+    };
+    let fan_out_aware = group.serialize_version.load(atomic::Ordering::Relaxed)
+        == ImmutableStoreVersion::LazyFanOut as u32;
+    let needs_two_phase_commit = fan_out_aware && committed_level != active_buckets;
+
+    // Always flush the packstore once per group when sync_data is set, regardless of which serialize path runs below.
+    if sync_data {
+        group.flush_packstore(sync_data).await;
+    }
+
+    if needs_two_phase_commit && first_err.is_none() {
+        // T10 two-phase commit. Every [0..active_buckets] bucket gets a .new file (skipping empties at index >= committed_level since no old file exists there to overwrite). After all .new files are durable, write level.pending as the commit point. Then rename .new -> final, write the level marker, delete level.pending. Recovery on the next store open rolls forward from any pending state.
+        if let Err(e) = lore_io::IoDriver::global()
+            .create_dir_all(&group_path)
+            .await
+            .map_err(|e| {
+                LocalImmutableStoreError::internal_with_context(
+                    e,
+                    "Failed to create group directory for fan-out commit",
+                )
+            })
+        {
+            first_err = Some(e);
+        }
+
+        let mut wrote_new: Vec<usize> = Vec::new();
+        if first_err.is_none() {
+            for bucket_index in 0..active_buckets {
+                // Fast path: skip the bucket entirely (no lock acquire) when it's neither dirty nor an old-level slot we need to overwrite. The dirty flag is the cheap proxy for "this bucket has data to flush"; combined with the index < committed_level check (which forces an empty .new to overwrite stale level-N files), this avoids 256× read-lock acquires per group on the common server-fresh-store first flush where most buckets are empty and committed_level == 0.
+                let must_overwrite_old = bucket_index < committed_level;
+                let dirty = group.dirty[bucket_index].load(atomic::Ordering::Relaxed);
+                if !must_overwrite_old && !dirty {
+                    continue;
+                }
+                let bucket = group.bucket(bucket_index).clone().read_owned().await;
+                // Re-check after lock acquire — concurrent paths may have just dirtied or undirtied this bucket.
+                if bucket.entry.is_empty() && !must_overwrite_old {
+                    continue;
+                }
+                let res = ImmutableStoreBucket::serialize_to_new(
+                    bucket,
+                    group.clone(),
+                    path.as_ref(),
+                    group_index,
+                    bucket_index,
+                    sync_data,
+                )
+                .await;
+                match res {
+                    Ok(()) => wrote_new.push(bucket_index),
+                    Err(err) => {
+                        if first_err.is_none() {
+                            first_err = Some(err);
+                        }
+                    }
+                }
+            }
+        }
+
+        if wrote_new.is_empty() {
+            // No .new files written for this group — skip the level.pending sentinel entirely. The sentinel exists to drive roll-forward recovery of a partially-completed transition; with no .new files there is no in-progress state to recover, so a direct marker write is sufficient. Restores ~3x throughput on fresh-store-first-flush-with-sync_data when most groups are empty (the common shape on `lore repository create`).
+            if first_err.is_none()
+                && let Err(err) = crate::local::fan_out::write_level_marker(
+                    &group_path,
+                    active_buckets,
+                    sync_data,
+                )
+                .await
+                .map_err(|e| {
+                    LocalImmutableStoreError::internal_with_context(
+                        e,
+                        "Failed to write level marker for empty group",
+                    )
+                })
+            {
+                first_err = Some(err);
+            }
+            if first_err.is_none() {
+                group
+                    .committed_level
+                    .store(active_buckets, atomic::Ordering::Relaxed);
+            }
+        } else {
+            // Full two-phase commit: pending → renames → marker → delete pending.
+            if first_err.is_none()
+                && let Err(err) = crate::local::fan_out::write_level_pending(
+                    &group_path,
+                    active_buckets,
+                    sync_data,
+                )
+                .await
+                .map_err(|e| {
+                    LocalImmutableStoreError::internal_with_context(
+                        e,
+                        "Failed to write level.pending",
+                    )
+                })
+            {
+                first_err = Some(err);
+            }
+
+            if first_err.is_none() {
+                for &bucket_index in &wrote_new {
+                    let new_path =
+                        crate::local::fan_out::bucket_new_path(&group_path, bucket_index);
+                    let final_path = crate::local::fan_out::bucket_path(&group_path, bucket_index);
+                    if let Err(err) = lore_io::IoDriver::global()
+                        .rename(&new_path, &final_path)
+                        .await
+                        && first_err.is_none()
+                    {
+                        first_err = Some(LocalImmutableStoreError::internal_with_context(
+                            err,
+                            "Failed to rename .new bucket file during fan-out commit",
+                        ));
+                    }
+                }
+            }
+
+            if first_err.is_none()
+                && let Err(err) = crate::local::fan_out::write_level_marker(
+                    &group_path,
+                    active_buckets,
+                    sync_data,
+                )
+                .await
+                .map_err(|e| {
+                    LocalImmutableStoreError::internal_with_context(
+                        e,
+                        "Failed to write level marker",
+                    )
+                })
+            {
+                first_err = Some(err);
+            }
+
+            if first_err.is_none()
+                && let Err(err) = crate::local::fan_out::delete_level_pending(&group_path)
+                    .await
+                    .map_err(|e| {
+                        LocalImmutableStoreError::internal_with_context(
+                            e,
+                            "Failed to delete level.pending",
+                        )
+                    })
+            {
+                first_err = Some(err);
+            }
+
+            if first_err.is_none() {
+                group
+                    .committed_level
+                    .store(active_buckets, atomic::Ordering::Relaxed);
+            }
+        }
+    } else if first_err.is_none() {
+        // Regular flush at unchanged level: per-file .tmp + atomic rename for dirty buckets only. No marker write — marker already reflects the current level.
+        for bucket_index in 0..active_buckets {
+            if !group.dirty[bucket_index].load(atomic::Ordering::Relaxed) {
+                continue;
+            }
+            let Some(bucket) = group.try_bucket(bucket_index).cloned() else {
+                continue;
+            };
+            let bucket = bucket.read_owned().await;
+            let res = ImmutableStoreBucket::serialize(
+                bucket,
+                group.clone(),
+                path.as_ref(),
+                group_index,
+                bucket_index,
+                sync_data,
+            )
+            .await;
+            if let Err(err) = res
+                && first_err.is_none()
+            {
+                first_err = Some(err);
+            }
+        }
+    }
+
+    match first_err {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
 /// Inspect dirty buckets in `group` and, if any exceeds the per-store fan-out threshold and the
 /// group is not yet at max level, atomically redistribute entries to the next ladder level. Same
 /// shape as `maybe_fan_out_mutable_group` but operating on `ImmutableStoreEntry` (which references
@@ -4569,12 +5008,13 @@ async fn maybe_fan_out_immutable_group(
             bucket.sorted_index.insert(insert_slot, entry_index as u32);
             bucket.entry.push(entry);
         }
+        // The redistribute leaves every `[0..target]` bucket holding exactly the entries it
+        // should, while the layout on disk is still the pre-fan-out one until the flush commits.
+        // A lazy deserialize of any of them would therefore replace live entries with a stale
+        // file, or with nothing for a slot the old layout never wrote.
+        bucket.deserialized = true;
         if count > 0 {
             group.dirty[new_idx].store(true, atomic::Ordering::Relaxed);
-            // Mark deserialized so subsequent operations don't try to re-read from disk.
-            // Note: ImmutableStoreBucket has private `deserialized` and `upgrade_packfile` fields;
-            // the redistribute mutates entry/sorted_index directly while leaving them at their
-            // previous values, which is safe since we hold the write lock.
         }
     }
 
@@ -4685,9 +5125,435 @@ mod tests {
         }
     }
 
+    /// Client-shaped settings: the ones a repository store is opened with.
+    fn client_settings() -> ImmutableStoreSettings {
+        ImmutableStoreSettings {
+            protect_local_fragment: true,
+            implicit_durable_stored: false,
+            ..Default::default()
+        }
+    }
+
+    /// Server-shaped settings: groups start at the full 256 buckets.
+    fn server_settings() -> ImmutableStoreSettings {
+        ImmutableStoreSettings {
+            protect_local_fragment: false,
+            implicit_durable_stored: true,
+            initial_fan_out_level: BUCKET_COUNT,
+            ..Default::default()
+        }
+    }
+
+    /// Store `count` fragments and return their addresses.
+    async fn put_fragments(
+        store: &Arc<LocalImmutableStore>,
+        partition: Partition,
+        count: u16,
+    ) -> Vec<Address> {
+        let dyn_store: Arc<dyn crate::immutable_store::ImmutableStore> = store.clone();
+        let mut addresses = Vec::new();
+        for seed in 0..count {
+            let (address, payload) = payload_off_bucket_zero(seed);
+            let fragment = Fragment {
+                flags: 0,
+                size_payload: payload.len() as u32,
+                size_content: payload.len() as u64,
+            };
+            dyn_store
+                .clone()
+                .put(partition, address, fragment, Some(payload), false)
+                .await
+                .expect("put succeeds");
+            addresses.push(address);
+        }
+        addresses
+    }
+
+    /// Run the background timer's flush for every group, and nothing else.
+    async fn run_delayed_flush(store: &Arc<LocalImmutableStore>) {
+        let weak = Arc::downgrade(store);
+        for group_index in 0..GROUP_COUNT {
+            ImmutableStoreGroup::flush_delayed(weak.clone(), group_index, 0).await;
+        }
+    }
+
+    /// Every `level` marker under a store's index directory.
+    fn level_markers(index_root: &Path) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        let Ok(groups) = std::fs::read_dir(index_root) else {
+            return found;
+        };
+        for group in groups.flatten() {
+            let marker = group.path().join(crate::local::fan_out::MARKER_FILENAME);
+            if marker.exists() {
+                found.push(marker);
+            }
+        }
+        found
+    }
+
+    /// Content whose hash puts it in a bucket other than 0 once a group is at level 256, so a
+    /// group misread as pre-fan-out sends a lookup to a different bucket than the one holding it.
+    fn payload_off_bucket_zero(seed: u16) -> (Address, Bytes) {
+        for salt in 0..1024u16 {
+            let payload = Bytes::from(seed.to_le_bytes().repeat(32 + salt as usize));
+            let hash = hash::hash_slice(payload.as_ref());
+            if hash.data()[1] != 0 {
+                return (
+                    Address {
+                        hash,
+                        context: Context::from([0u8; 16]),
+                    },
+                    payload,
+                );
+            }
+        }
+        panic!("no payload hashed away from bucket 0");
+    }
+
+    /// The delayed background flush writes bucket files without going through the two-phase
+    /// commit, and clears the dirty flags as it goes — so the flush that ends the command finds
+    /// the group clean and skips it. Left like that, the group has committed bucket files and no
+    /// level marker, which [`crate::local::fan_out::read_group_level`] reads back as a legacy
+    /// pre-fan-out layout at 256 buckets. A client group is written at level 1, where everything
+    /// lands in `index_00`; at 256 the hash maps somewhere else entirely and that file is never
+    /// opened again, so the entry is on disk and unreachable — `Address not found` with the
+    /// payload still sitting in the packstore.
+    #[tokio::test]
+    async fn a_group_the_delayed_flush_persisted_reopens_at_its_written_level() {
+        let dir = crate::test_util::TempDir::new("is_delayed_level_");
+        let partition = Partition::from([7u8; 16]);
+
+        let addresses = {
+            let store = LocalImmutableStore::new(Some(dir.path().to_path_buf()), client_settings())
+                .await
+                .expect("store opens");
+            assert_eq!(
+                store.group[0].bucket_count.load(atomic::Ordering::Relaxed),
+                1,
+                "a client store starts its groups at level 1"
+            );
+
+            let addresses = put_fragments(&store, partition, 32).await;
+            // Persist exactly the way the background timer does, and nothing else: no
+            // `flush`, so the two-phase commit that would write the markers never runs.
+            run_delayed_flush(&store).await;
+            addresses
+        };
+
+        let index_root = dir.path().join("immutable").join("index");
+        let mut checked = 0;
+        for group in std::fs::read_dir(&index_root)
+            .expect("index dir exists")
+            .flatten()
+        {
+            let has_bucket = std::fs::read_dir(group.path())
+                .expect("group dir")
+                .flatten()
+                .any(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.starts_with("index_"))
+                });
+            if !has_bucket {
+                continue;
+            }
+            checked += 1;
+            assert_eq!(
+                crate::local::fan_out::read_level_marker(&group.path())
+                    .await
+                    .expect("marker readable"),
+                Some(1),
+                "group {} must record the level its bucket files were written at",
+                group.path().display()
+            );
+        }
+        assert!(
+            checked > 0,
+            "the delayed flush has to have written something"
+        );
+
+        let store = LocalImmutableStore::new(Some(dir.path().to_path_buf()), client_settings())
+            .await
+            .expect("store reopens");
+        let dyn_store: Arc<dyn crate::immutable_store::ImmutableStore> = store.clone();
+        for address in &addresses {
+            let group = &store.group[address.hash.data()[0] as usize];
+            assert_eq!(
+                group.bucket_count.load(atomic::Ordering::Relaxed),
+                1,
+                "group for {address} reopened at the wrong level"
+            );
+            dyn_store
+                .clone()
+                .get(partition, *address)
+                .await
+                .unwrap_or_else(|err| {
+                    panic!("{address} was written and persisted but reads back as {err:?}")
+                });
+        }
+    }
+
+    mod oodle_migration_seed {
+        use super::*;
+
+        /// A store with fragments on disk and no info file, as one written by a binary predating
+        /// the file. Reports the highest group index holding data.
+        async fn store_predating_the_info_file(dir: &crate::test_util::TempDir) -> i32 {
+            let highest = {
+                let store =
+                    LocalImmutableStore::new(Some(dir.path().to_path_buf()), client_settings())
+                        .await
+                        .expect("store opens");
+                let addresses = put_fragments(&store, Partition::from([7u8; 16]), 32).await;
+                let dyn_store: Arc<dyn crate::immutable_store::ImmutableStore> = store.clone();
+                dyn_store.flush(true).await.expect("store flushes");
+                addresses
+                    .iter()
+                    .map(|address| address.hash.data()[0] as i32)
+                    .max()
+                    .expect("fragments were written")
+            };
+            std::fs::remove_file(info_path_for_store_root(&dir.path().join("immutable")))
+                .expect("the info file a newer binary wrote is removed");
+            highest
+        }
+
+        /// A group that was never written holds no payload of any codec, so a store made only of
+        /// them starts with nothing to migrate - and says so rather than sweeping all 256.
+        #[tokio::test]
+        async fn a_store_with_no_written_group_has_nothing_to_migrate() {
+            let dir = crate::test_util::TempDir::new("is_seed_fresh_");
+            let store = LocalImmutableStore::new(Some(dir.path().to_path_buf()), client_settings())
+                .await
+                .expect("store opens");
+
+            assert_eq!(
+                store.info.read().await.next_group_index_to_migrate_oodle,
+                -1
+            );
+        }
+
+        /// A store written before the info file existed is seeded from the groups actually on
+        /// disk, so the pass starts at the highest one holding data.
+        #[cfg(feature = "oodle")]
+        #[tokio::test]
+        async fn a_store_predating_the_info_file_is_seeded_from_its_written_groups() {
+            let dir = crate::test_util::TempDir::new("is_seed_existing_");
+            let highest = store_predating_the_info_file(&dir).await;
+
+            let store = LocalImmutableStore::new(Some(dir.path().to_path_buf()), client_settings())
+                .await
+                .expect("store reopens");
+            assert_eq!(
+                store.info.read().await.next_group_index_to_migrate_oodle,
+                highest
+            );
+        }
+
+        /// A binary that cannot decode Oodle can do nothing about a store that holds it, so it
+        /// records no work rather than a bookmark it could never act on.
+        #[cfg(not(feature = "oodle"))]
+        #[tokio::test]
+        async fn a_binary_without_oodle_records_no_migration() {
+            let dir = crate::test_util::TempDir::new("is_seed_no_oodle_");
+            store_predating_the_info_file(&dir).await;
+
+            let store = LocalImmutableStore::new(Some(dir.path().to_path_buf()), client_settings())
+                .await
+                .expect("store reopens");
+            assert_eq!(
+                store.info.read().await.next_group_index_to_migrate_oodle,
+                -1
+            );
+        }
+    }
+
+    /// A store written before lazy fan-out carries no level markers and a flat 256-bucket
+    /// layout, which `read_group_level` reports as `PreFanOut`. Such a group already reads back
+    /// at the level it was written at, so nothing may start writing markers into it: that would
+    /// change which flush path the next flush takes on a store this version has to leave alone.
+    #[tokio::test]
+    async fn a_pre_fan_out_store_gains_no_level_markers() {
+        let dir = crate::test_util::TempDir::new("is_prefanout_");
+        let partition = Partition::from([3u8; 16]);
+        let index_root = dir.path().join("immutable").join("index");
+
+        // A group as the previous format left it: one bucket file at the pre-fan-out version,
+        // no marker beside it.
+        let legacy_group = index_root.join("2a");
+        std::fs::create_dir_all(&legacy_group).expect("group dir");
+        write_bucket_file(
+            &legacy_group.join("index_10"),
+            ImmutableStoreVersion::LastAccessInEntry as u32,
+        );
+
+        let addresses = {
+            let store = LocalImmutableStore::new(Some(dir.path().to_path_buf()), client_settings())
+                .await
+                .expect("store opens");
+            assert_eq!(
+                store.group[0x2a]
+                    .bucket_count
+                    .load(atomic::Ordering::Relaxed),
+                BUCKET_COUNT,
+                "a marker-less group holding bucket files opens pre-fan-out"
+            );
+            assert_eq!(
+                store.group[0].bucket_count.load(atomic::Ordering::Relaxed),
+                BUCKET_COUNT,
+                "a legacy store keeps even its fresh groups at the flat layout"
+            );
+
+            let addresses = put_fragments(&store, partition, 32).await;
+            run_delayed_flush(&store).await;
+            addresses
+        };
+
+        assert_eq!(
+            level_markers(&index_root),
+            Vec::<PathBuf>::new(),
+            "a pre-fan-out store must come back out with the layout it went in with"
+        );
+
+        let store = LocalImmutableStore::new(Some(dir.path().to_path_buf()), client_settings())
+            .await
+            .expect("store reopens");
+        let dyn_store: Arc<dyn crate::immutable_store::ImmutableStore> = store.clone();
+        for address in &addresses {
+            let group = &store.group[address.hash.data()[0] as usize];
+            assert_eq!(
+                group.bucket_count.load(atomic::Ordering::Relaxed),
+                BUCKET_COUNT,
+                "group for {address} reopened at the wrong level"
+            );
+            dyn_store
+                .clone()
+                .get(partition, *address)
+                .await
+                .unwrap_or_else(|err| panic!("{address} reads back as {err:?}"));
+        }
+    }
+
+    /// A server store starts its groups at the full 256 buckets, where a missing marker is read
+    /// back as exactly that. It gains no markers either, for the same reason.
+    #[tokio::test]
+    async fn a_server_shaped_store_gains_no_level_markers() {
+        let dir = crate::test_util::TempDir::new("is_server_level_");
+        let partition = Partition::from([9u8; 16]);
+        let index_root = dir.path().join("immutable").join("index");
+
+        let addresses = {
+            let store = LocalImmutableStore::new(Some(dir.path().to_path_buf()), server_settings())
+                .await
+                .expect("store opens");
+            assert_eq!(
+                store.group[0].bucket_count.load(atomic::Ordering::Relaxed),
+                BUCKET_COUNT,
+                "a server store starts at the flat layout"
+            );
+
+            let addresses = put_fragments(&store, partition, 32).await;
+            run_delayed_flush(&store).await;
+            addresses
+        };
+
+        assert_eq!(
+            level_markers(&index_root),
+            Vec::<PathBuf>::new(),
+            "a group already at 256 reads back at 256 without a marker"
+        );
+
+        let store = LocalImmutableStore::new(Some(dir.path().to_path_buf()), server_settings())
+            .await
+            .expect("store reopens");
+        let dyn_store: Arc<dyn crate::immutable_store::ImmutableStore> = store.clone();
+        for address in &addresses {
+            let group = &store.group[address.hash.data()[0] as usize];
+            assert_eq!(
+                group.bucket_count.load(atomic::Ordering::Relaxed),
+                BUCKET_COUNT,
+                "group for {address} reopened at the wrong level"
+            );
+            dyn_store
+                .clone()
+                .get(partition, *address)
+                .await
+                .unwrap_or_else(|err| panic!("{address} reads back as {err:?}"));
+        }
+    }
+
+    /// A group that already carries a marker keeps the level it records: the initial-level write
+    /// is for groups that have never had one, and must not overwrite a committed level.
+    #[tokio::test]
+    async fn a_marked_group_keeps_the_level_it_recorded() {
+        let dir = crate::test_util::TempDir::new("is_marked_level_");
+        let partition = Partition::from([5u8; 16]);
+        let index_root = dir.path().join("immutable").join("index");
+
+        {
+            let store = LocalImmutableStore::new(Some(dir.path().to_path_buf()), client_settings())
+                .await
+                .expect("store opens");
+            let dyn_store: Arc<dyn crate::immutable_store::ImmutableStore> = store.clone();
+            let _ = put_fragments(&store, partition, 8).await;
+            // A real flush commits the level through the two-phase path.
+            dyn_store.flush(false).await.expect("flush succeeds");
+        }
+
+        let before: Vec<(PathBuf, Vec<u8>)> = level_markers(&index_root)
+            .into_iter()
+            .map(|path| {
+                let bytes = std::fs::read(&path).expect("marker readable");
+                (path, bytes)
+            })
+            .collect();
+        assert!(
+            !before.is_empty(),
+            "the flush has to have committed a level"
+        );
+
+        {
+            let store = LocalImmutableStore::new(Some(dir.path().to_path_buf()), client_settings())
+                .await
+                .expect("store reopens");
+            let _ = put_fragments(&store, partition, 16).await;
+            run_delayed_flush(&store).await;
+        }
+
+        for (path, bytes) in before {
+            assert_eq!(
+                std::fs::read(&path).expect("marker still readable"),
+                bytes,
+                "marker at {} was rewritten",
+                path.display()
+            );
+        }
+    }
+
     #[test]
     fn lazy_fan_out_version_is_five() {
         assert_eq!(ImmutableStoreVersion::LazyFanOut as u32, 5);
+    }
+
+    #[test]
+    fn format_bucket_path_is_index_group_bucket() {
+        let root = Path::new("/store");
+        for index in [0usize, 0xab, 255] {
+            let byte = index as u8;
+            assert_eq!(
+                format_bucket_path(root, index, index),
+                root.join("index").join(format!("{byte:02x}")).join(format!(
+                    "{}{byte:02x}",
+                    crate::local::fan_out::BUCKET_FILENAME_PREFIX
+                ))
+            );
+        }
+        assert_eq!(
+            format_bucket_path(root, 0x0f, 0xf0),
+            Path::new("/store/index/0f/index_f0")
+        );
     }
 
     #[tokio::test]
@@ -4850,7 +5716,7 @@ mod tests {
                 payload.clone(),
                 WriteOptions::default(),
                 None,
-                None,
+                crate::write_tracker::WriteContext::none(),
                 None,
             )
             .await
@@ -4918,7 +5784,7 @@ mod tests {
             payload.clone(),
             WriteOptions::default(),
             None,
-            None,
+            crate::write_tracker::WriteContext::none(),
             None,
         )
         .await
@@ -4983,6 +5849,395 @@ mod tests {
                 crate::local::fan_out::FAN_OUT_LEVEL_MAX
             );
         }
+    }
+
+    /// The compaction resume point is decided by what the group work reports, not by the
+    /// stop flag read after it: a group that gave up has packfiles left to rewrite, and
+    /// advancing past it would leave them for a pass that never comes. Both answers are
+    /// driven through a real sweep, so a stray report inside the packfile loop is caught.
+    #[tokio::test]
+    async fn group_compaction_reports_whether_it_finished() {
+        use crate::immutable_store::ImmutableStore;
+
+        let dir = crate::test_util::TempDir::new("is_stop_report_");
+        let store =
+            LocalImmutableStore::new(Some(dir.to_path_buf()), ImmutableStoreSettings::default())
+                .await
+                .unwrap();
+
+        let partition = Partition::from([0x0cu8; 16]);
+        for index in 0u8..8 {
+            let payload = vec![index; 4096];
+            let address = Address {
+                hash: crate::hash::hash_slice(&payload),
+                context: Context::from([index; 16]),
+            };
+            let fragment = Fragment {
+                // Non-durable, so eviction is forbidden to reclaim it and the packfile
+                // sweep has payloads to move.
+                flags: 0,
+                size_payload: payload.len() as u32,
+                size_content: payload.len() as u64,
+            };
+            store
+                .clone()
+                .put(
+                    partition,
+                    address,
+                    fragment,
+                    Some(Bytes::from(payload)),
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+        store.clone().flush(true).await.unwrap();
+
+        // Compaction runs per group and the hash decides which one the payloads landed in.
+        let (group_index, _bucket_index) = populated_bucket(&store).await;
+
+        // A target below what the group holds drives the sweep and the truncate, rather
+        // than breaking on the size check before either runs.
+        let completed = store
+            .clone()
+            .compact_group_packfiles(
+                group_index,
+                store.path.clone(),
+                1,
+                true,
+                false,
+                CompactionInstruments::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            completed,
+            "a group that ran to the end must report complete"
+        );
+
+        let _stopped = GcStopRequest::raise(&store.stop_requests, false);
+
+        let completed = store
+            .clone()
+            .compact_group_packfiles(
+                group_index,
+                store.path.clone(),
+                1,
+                true,
+                false,
+                CompactionInstruments::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !completed,
+            "a stopped group must report incomplete so the caller holds the resume point"
+        );
+    }
+
+    /// A step that commits to work reports one begin and owes exactly one end; a call that
+    /// gives up before committing reports neither, and does no work from the resume point.
+    #[tokio::test]
+    async fn compaction_reports_one_end_for_every_begin() {
+        use crate::immutable_store::ImmutableStore;
+
+        #[derive(Default)]
+        struct CountingSink {
+            begins: AtomicUsize,
+            ends: AtomicUsize,
+        }
+
+        impl crate::gc_event::GcEventSink for CountingSink {
+            fn eviction_begin(&self, _target_fragments: u64) {}
+            fn eviction_progress(&self, _evicted: u64) {}
+            fn eviction_end(&self, _total_evicted: u64) {}
+            fn compaction_begin(&self, _target_bytes: u64) {
+                self.begins.fetch_add(1, atomic::Ordering::Relaxed);
+            }
+            fn compaction_progress(&self, _compacted_bytes: u64) {}
+            fn compaction_end(&self, _total_compacted_bytes: u64) {
+                self.ends.fetch_add(1, atomic::Ordering::Relaxed);
+            }
+        }
+
+        let dir = crate::test_util::TempDir::new("is_sink_pairing_");
+        let store =
+            LocalImmutableStore::new(Some(dir.to_path_buf()), ImmutableStoreSettings::default())
+                .await
+                .unwrap();
+
+        // Content, so the pass finds itself above the limit and announces a begin.
+        let payload = vec![0x5au8; 4096];
+        store
+            .clone()
+            .put(
+                Partition::from([0x0du8; 16]),
+                Address {
+                    hash: crate::hash::hash_slice(&payload),
+                    context: Context::default(),
+                },
+                Fragment {
+                    flags: 0,
+                    size_payload: payload.len() as u32,
+                    size_content: payload.len() as u64,
+                },
+                Some(Bytes::from(payload)),
+                false,
+            )
+            .await
+            .unwrap();
+        store.clone().flush(true).await.unwrap();
+
+        let sink = Arc::new(CountingSink::default());
+
+        let resume = store
+            .clone()
+            .compact_packfiles(1, None, false, Some(sink.clone()))
+            .await
+            .unwrap()
+            .expect("a step over a 256 group store leaves groups to come");
+
+        assert_eq!(
+            sink.begins.load(atomic::Ordering::Relaxed),
+            1,
+            "a committed step announces exactly one begin"
+        );
+        assert_eq!(
+            sink.ends.load(atomic::Ordering::Relaxed),
+            1,
+            "a committed step owes an end for the begin it reported"
+        );
+
+        let _stopped = GcStopRequest::raise(&store.stop_requests, false);
+
+        assert_eq!(
+            store
+                .clone()
+                .compact_packfiles(1, Some(resume), false, Some(sink.clone()))
+                .await
+                .unwrap(),
+            None,
+            "a stopped call must not take another round from the resume point"
+        );
+        assert_eq!(
+            sink.begins.load(atomic::Ordering::Relaxed),
+            1,
+            "a call that gives up before committing must not announce a begin"
+        );
+        assert_eq!(
+            sink.ends.load(atomic::Ordering::Relaxed),
+            1,
+            "a call that gives up before committing reports neither begin nor end"
+        );
+    }
+
+    /// A stop asks the passes in flight to give up; it is not a switch that stays off. The
+    /// store is shared by path, so a caller quiescing it leaves the others collecting.
+    #[tokio::test]
+    async fn a_stop_lifts_once_it_has_drained() {
+        use crate::immutable_store::ImmutableStore;
+
+        let store = LocalImmutableStore::new(None, ImmutableStoreSettings::default())
+            .await
+            .unwrap();
+
+        store.clone().stop_gc(false).await;
+
+        assert!(
+            !store.gc_stop_requested(),
+            "a stop that is not terminating must lift so a shared store keeps collecting"
+        );
+    }
+
+    /// Two callers overlap whenever handles closing on one path race each other or a
+    /// shutdown. The first to drain must not lift the second's request, or the second waits
+    /// out a whole pass instead of the pass giving up at its next packfile.
+    #[tokio::test]
+    async fn a_stop_stays_raised_while_another_is_outstanding() {
+        use crate::immutable_store::ImmutableStore;
+
+        let store = LocalImmutableStore::new(None, ImmutableStoreSettings::default())
+            .await
+            .unwrap();
+
+        {
+            let _outstanding = GcStopRequest::raise(&store.stop_requests, false);
+            store.clone().stop_gc(false).await;
+            assert!(
+                store.gc_stop_requested(),
+                "a drain that completes must leave another caller's request raised"
+            );
+        }
+
+        assert!(
+            !store.gc_stop_requested(),
+            "the outstanding request going away leaves the store collecting again"
+        );
+    }
+
+    /// A last-access stamp far enough in the past that a resolve marks the bucket for rewrite.
+    const STALE_ACCESS: u64 = 1;
+
+    /// Answer the group and bucket index of the first bucket in `store` holding an entry. The
+    /// hash decides where a put lands, so a test that has to reach the entry it stored searches
+    /// rather than derives.
+    async fn populated_bucket(store: &Arc<LocalImmutableStore>) -> (usize, usize) {
+        for (group_index, group) in store.group.iter().enumerate() {
+            for (bucket_index, cell) in group.bucket.iter().enumerate() {
+                if let Some(bucket) = cell.get()
+                    && !bucket.read().await.entry.is_empty()
+                {
+                    return (group_index, bucket_index);
+                }
+            }
+        }
+        panic!("a put must populate a bucket");
+    }
+
+    /// Store one fragment in `store`, set its last-access stamp to `stamp`, and clear the dirty
+    /// flag of the bucket it landed in. Answers that bucket and the address naming the entry.
+    async fn backdated_fragment(
+        store: &Arc<LocalImmutableStore>,
+        stamp: u64,
+    ) -> ((usize, usize), Partition, Address) {
+        use crate::immutable_store::ImmutableStore;
+
+        let partition = Partition::from([0x11u8; 16]);
+        let payload = vec![0x22u8; 128];
+        let address = Address {
+            hash: crate::hash::hash_slice(&payload),
+            context: Context::from([0x33u8; 16]),
+        };
+        let fragment = Fragment {
+            flags: 0,
+            size_payload: payload.len() as u32,
+            size_content: payload.len() as u64,
+        };
+        store
+            .clone()
+            .put(
+                partition,
+                address,
+                fragment,
+                Some(Bytes::from(payload)),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let (group_index, bucket_index) = populated_bucket(store).await;
+        let group = &store.group[group_index];
+        group.bucket(bucket_index).write().await.entry[0]
+            .data
+            .last_access = stamp;
+        group.dirty[bucket_index].store(false, atomic::Ordering::Relaxed);
+
+        ((group_index, bucket_index), partition, address)
+    }
+
+    /// Resolve one backdated fragment in an in-memory store. Answers the stamp its entry carries
+    /// afterward and whether the resolve marked the bucket for rewrite.
+    async fn resolve_one_fragment(atime: bool, stamp: u64) -> (u64, bool) {
+        use crate::immutable_store::ImmutableStore;
+
+        let store = LocalImmutableStore::new(
+            None,
+            ImmutableStoreSettings {
+                atime,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let ((group_index, bucket_index), partition, address) =
+            backdated_fragment(&store, stamp).await;
+
+        let mut results = [StoreMatchResult::default(); 1];
+        store
+            .clone()
+            .query(partition, &[address], &mut results)
+            .await
+            .unwrap();
+
+        let group = &store.group[group_index];
+        (
+            group.bucket(bucket_index).read().await.entry[0]
+                .data
+                .last_access,
+            group.dirty[bucket_index].load(atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Eviction and compaction rank entries by last access, so a resolve moves the stamp to now
+    /// whatever its age — ranking by write time reclaims a fragment every command reads ahead of
+    /// one nothing has touched since it landed. A move this small rides along with whatever
+    /// writes the bucket next rather than rewriting it on its own.
+    #[tokio::test]
+    async fn a_small_move_advances_the_stamp_without_dirtying_the_bucket() {
+        let recent = LocalImmutableStore::last_access().saturating_sub(10);
+
+        let (last_access, dirty) = resolve_one_fragment(true, recent).await;
+
+        assert!(last_access > recent, "a resolve always advances the stamp");
+        assert!(!dirty, "a small move must not schedule a rewrite");
+    }
+
+    /// A stamp that moved past the window is worth a bucket rewrite of its own.
+    #[tokio::test]
+    async fn a_stale_stamp_dirties_the_bucket_holding_it() {
+        let (_last_access, dirty) = resolve_one_fragment(true, STALE_ACCESS).await;
+
+        assert!(dirty, "a stamp this far behind has to reach disk");
+    }
+
+    /// A store that never reclaims records no access, so a resolve neither moves the stamp nor
+    /// dirties the bucket holding it.
+    #[tokio::test]
+    async fn a_resolve_records_nothing_without_atime() {
+        let (last_access, dirty) = resolve_one_fragment(false, STALE_ACCESS).await;
+
+        assert_eq!(last_access, STALE_ACCESS);
+        assert!(!dirty);
+    }
+
+    /// Ranking by access is only worth anything if a stamp outlives the process that made it, so
+    /// this reads the bucket back off disk rather than out of the store that wrote it.
+    #[tokio::test]
+    async fn a_stamp_reaches_the_bucket_file() {
+        use crate::immutable_store::ImmutableStore;
+
+        let dir = crate::test_util::TempDir::new("is_atime_persist_");
+        let store =
+            LocalImmutableStore::new(Some(dir.to_path_buf()), ImmutableStoreSettings::default())
+                .await
+                .unwrap();
+
+        let ((group_index, bucket_index), partition, address) =
+            backdated_fragment(&store, STALE_ACCESS).await;
+
+        let mut results = [StoreMatchResult::default(); 1];
+        store
+            .clone()
+            .query(partition, &[address], &mut results)
+            .await
+            .unwrap();
+        store.clone().flush(true).await.unwrap();
+
+        let root = store.path.clone().expect("a disk-backed store has a path");
+        let (_sorted_index, entry, _upgrade, _dirty) = ImmutableStoreBucket::deserialize_files(
+            format_bucket_path(&root, group_index, bucket_index),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(entry.len(), 1, "the stamp must have dirtied the bucket");
+        assert!(
+            entry[0].data.last_access > STALE_ACCESS,
+            "the stamp a resolve made must survive the flush"
+        );
     }
 
     fn payload_data(pack_file: u32, encoding: u32, storage: u32) -> ImmutableData {
@@ -5105,7 +6360,7 @@ mod tests {
             Bytes::from(payload.clone()),
             WriteOptions::default(),
             None,
-            None,
+            crate::write_tracker::WriteContext::none(),
             None,
         )
         .await
@@ -5123,7 +6378,7 @@ mod tests {
             Bytes::from(payload.clone()),
             WriteOptions::default(),
             None,
-            None,
+            crate::write_tracker::WriteContext::none(),
             None,
         )
         .await
@@ -5202,7 +6457,7 @@ mod tests {
             Bytes::from(payload.clone()),
             WriteOptions::default(),
             None,
-            None,
+            crate::write_tracker::WriteContext::none(),
             None,
         )
         .await
@@ -5269,6 +6524,416 @@ mod tests {
             crate::conformance::Capabilities::new("LocalImmutableStore").stores_metadata_only(),
         )
         .await;
+    }
+
+    /// Healing a payload that no longer verifies has to leave the store answering absence, so
+    /// that the content is offered again.
+    ///
+    /// Clearing the payload pointer alone would not: an entry still answers a full match, which
+    /// tells a peer the store holds content it can no longer serve, and a peer told that stops
+    /// offering it. The association the caller asked about and its siblings under other contexts
+    /// go together, since they name the one payload that failed.
+    ///
+    /// A payload is shared by every association that deduplicated onto it, so one proven bad is
+    /// bad in whichever partition names it, and all of them go. Leaving one behind leaves that
+    /// partition being told the content is here until it happens to verify for itself.
+    #[tokio::test]
+    async fn healing_a_corrupt_payload_drops_the_associations_that_named_it() {
+        use crate::immutable_store::ImmutableStore;
+
+        let dir = crate::test_util::TempDir::new("is_heal_drop_");
+        let store = LocalImmutableStore::new(
+            Some(std::path::PathBuf::from(dir.as_ref())),
+            ImmutableStoreSettings {
+                isolate_partitions: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create store");
+
+        let payload = Bytes::from_static(b"a payload that will stop verifying");
+        let hash = crate::hash::hash_slice(payload.as_ref());
+        let fragment = Fragment {
+            flags: FragmentFlags::PayloadStoredLocal.bits(),
+            size_payload: payload.len() as u32,
+            size_content: payload.len() as u64,
+        };
+
+        let partition = Partition::from([0x61u8; 16]);
+        let address = Address {
+            hash,
+            context: Context::from([0x62u8; 16]),
+        };
+        let sibling = Address {
+            hash,
+            context: Context::from([0x63u8; 16]),
+        };
+        let neighbour = Partition::from([0x64u8; 16]);
+
+        for (in_partition, at) in [
+            (partition, address),
+            (partition, sibling),
+            (neighbour, address),
+        ] {
+            store
+                .clone()
+                .put(in_partition, at, fragment, Some(payload.clone()), false)
+                .await
+                .expect("put the payload");
+        }
+
+        // Corrupt the stored bytes in place, which is what verification is there to notice.
+        let group_index = hash.data()[0] as usize;
+        let found = store
+            .clone()
+            .find(partition, address)
+            .await
+            .expect("the entry is there to corrupt");
+        store.group[group_index]
+            .packstore
+            .obliterate(
+                found.data.pack_file,
+                found.data.pack_offset,
+                found.data.size_payload,
+            )
+            .await
+            .expect("overwrite the payload");
+
+        let result = store
+            .clone()
+            .verify_fragment(address, partition, StoreMatch::MatchFull, true)
+            .await
+            .expect("verify answers");
+        assert!(
+            result.healed,
+            "a payload that does not verify was not healed"
+        );
+
+        for gone in [address, sibling] {
+            let resolved = crate::immutable_store::query_one(
+                &(store.clone() as Arc<dyn ImmutableStore>),
+                partition,
+                gone,
+            )
+            .await
+            .expect("query answers");
+            assert_eq!(
+                resolved.match_made,
+                StoreMatch::MatchNone,
+                "a healed association still answers a match, so nothing will offer {gone} again"
+            );
+        }
+
+        let resolved = crate::immutable_store::query_one(
+            &(store.clone() as Arc<dyn ImmutableStore>),
+            neighbour,
+            address,
+        )
+        .await
+        .expect("query answers");
+        assert_eq!(
+            resolved.match_made,
+            StoreMatch::MatchNone,
+            "another partition was left naming the payload this store proved it cannot serve"
+        );
+    }
+
+    /// An entry that names no payload is the wedged state itself, and verifying has to be able
+    /// to undo it.
+    ///
+    /// Nothing failed here - there is no payload to fail - so this is the state left behind by
+    /// whatever dropped one, and left alone it is permanent: the entry answers a full match, the
+    /// store is asked for bytes it does not have, and the peer that holds them is told not to
+    /// send them. Reporting it as verified is what makes it permanent, so it counts as a failure
+    /// and heals the same way.
+    #[tokio::test]
+    async fn verifying_an_entry_with_no_payload_reports_it_and_heals_the_wedge() {
+        use crate::immutable_store::ImmutableStore;
+
+        let dir = crate::test_util::TempDir::new("is_heal_wedge_");
+        let store = LocalImmutableStore::new(
+            Some(std::path::PathBuf::from(dir.as_ref())),
+            ImmutableStoreSettings {
+                isolate_partitions: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create store");
+
+        let payload = Bytes::from_static(b"bytes this store will never hold");
+        let hash = crate::hash::hash_slice(payload.as_ref());
+        let partition = Partition::from([0x71u8; 16]);
+        let address = Address {
+            hash,
+            context: Context::from([0x72u8; 16]),
+        };
+
+        // A header with no payload, which is what an entry left behind by a drop looks like.
+        store
+            .clone()
+            .put(
+                partition,
+                address,
+                Fragment {
+                    flags: 0,
+                    size_payload: payload.len() as u32,
+                    size_content: payload.len() as u64,
+                },
+                None,
+                false,
+            )
+            .await
+            .expect("put the header alone");
+
+        let before = crate::immutable_store::query_one(
+            &(store.clone() as Arc<dyn ImmutableStore>),
+            partition,
+            address,
+        )
+        .await
+        .expect("query answers");
+        assert_eq!(
+            before.match_made,
+            StoreMatch::MatchFull,
+            "the wedge this heals is an entry with no payload answering a full match"
+        );
+
+        let reported = store
+            .clone()
+            .verify_fragment(address, partition, StoreMatch::MatchFull, false)
+            .await
+            .expect("verify answers");
+        assert!(
+            reported.verification_result.is_err(),
+            "an entry the store cannot serve was reported as verified"
+        );
+        assert!(!reported.healed, "verify healed without being asked to");
+
+        let healed = store
+            .clone()
+            .verify_fragment(address, partition, StoreMatch::MatchFull, true)
+            .await
+            .expect("verify answers");
+        assert!(healed.healed, "the wedged entry was not healed");
+
+        let after = crate::immutable_store::query_one(
+            &(store.clone() as Arc<dyn ImmutableStore>),
+            partition,
+            address,
+        )
+        .await
+        .expect("query answers");
+        assert_eq!(
+            after.match_made,
+            StoreMatch::MatchNone,
+            "the entry survived healing, so the address stays wedged"
+        );
+    }
+
+    /// Healing has to survive a reopen, which means the emptied bucket reaching disk.
+    ///
+    /// Dropping the last entry a bucket holds leaves nothing to write, and a flush that treats
+    /// that as nothing to do leaves the file the bucket was last written to in place. The store
+    /// then reports the association again the next time it opens, healed in memory only.
+    #[tokio::test]
+    async fn healing_the_last_entry_in_a_bucket_survives_reopening_the_store() {
+        use crate::immutable_store::ImmutableStore;
+
+        let dir = crate::test_util::TempDir::new("is_heal_reopen_");
+        let path = std::path::PathBuf::from(dir.as_ref());
+
+        let payload = Bytes::from_static(b"a payload that will not survive its own bucket");
+        let hash = crate::hash::hash_slice(payload.as_ref());
+        let partition = Partition::from([0x91u8; 16]);
+        let address = Address {
+            hash,
+            context: Context::from([0x92u8; 16]),
+        };
+
+        {
+            let store = LocalImmutableStore::new(
+                Some(path.clone()),
+                ImmutableStoreSettings {
+                    isolate_partitions: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create store");
+
+            store
+                .clone()
+                .put(
+                    partition,
+                    address,
+                    Fragment {
+                        flags: FragmentFlags::PayloadStoredLocal.bits(),
+                        size_payload: payload.len() as u32,
+                        size_content: payload.len() as u64,
+                    },
+                    Some(payload.clone()),
+                    false,
+                )
+                .await
+                .expect("put the payload");
+
+            // On disk before anything goes wrong, so the file healing has to account for exists.
+            store.clone().flush(true).await.expect("flush the bucket");
+
+            let group_index = hash.data()[0] as usize;
+            let found = store
+                .clone()
+                .find(partition, address)
+                .await
+                .expect("the entry is there to corrupt");
+            store.group[group_index]
+                .packstore
+                .obliterate(
+                    found.data.pack_file,
+                    found.data.pack_offset,
+                    found.data.size_payload,
+                )
+                .await
+                .expect("overwrite the payload");
+
+            let healed = store
+                .clone()
+                .verify_fragment(address, partition, StoreMatch::MatchFull, true)
+                .await
+                .expect("verify answers");
+            assert!(healed.healed, "the corrupt payload was not healed");
+
+            store.clone().flush(true).await.expect("flush the removal");
+        }
+
+        let reopened = LocalImmutableStore::new(
+            Some(path),
+            ImmutableStoreSettings {
+                isolate_partitions: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("reopen store");
+
+        let resolved = crate::immutable_store::query_one(
+            &(reopened as Arc<dyn ImmutableStore>),
+            partition,
+            address,
+        )
+        .await
+        .expect("query answers");
+        assert_eq!(
+            resolved.match_made,
+            StoreMatch::MatchNone,
+            "reopening the store loaded back the association healing removed"
+        );
+    }
+
+    /// An obliterated fragment is meant to hold no payload, so verifying one reports nothing
+    /// wrong and heals nothing.
+    ///
+    /// A tombstone is indistinguishable from a wedged entry by its pack file alone - both name
+    /// none - so what separates them is the flag. Reporting a deletion as corruption would put
+    /// an operator onto a fault that is not there, and healing one would flush the bucket and
+    /// claim a repair having changed nothing.
+    #[tokio::test]
+    async fn verifying_an_obliterated_fragment_reports_nothing_and_heals_nothing() {
+        use crate::immutable_store::ImmutableStore;
+
+        let dir = crate::test_util::TempDir::new("is_heal_tombstone_");
+        let store = LocalImmutableStore::new(
+            Some(std::path::PathBuf::from(dir.as_ref())),
+            ImmutableStoreSettings {
+                isolate_partitions: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create store");
+
+        let payload = Bytes::from_static(b"content that is about to be obliterated");
+        let partition = Partition::from([0x81u8; 16]);
+        let address = Address {
+            hash: crate::hash::hash_slice(payload.as_ref()),
+            context: Context::from([0x82u8; 16]),
+        };
+
+        store
+            .clone()
+            .put(
+                partition,
+                address,
+                Fragment {
+                    flags: FragmentFlags::PayloadStoredLocal.bits(),
+                    size_payload: payload.len() as u32,
+                    size_content: payload.len() as u64,
+                },
+                Some(payload),
+                false,
+            )
+            .await
+            .expect("put the payload");
+
+        store
+            .clone()
+            .obliterate(
+                partition,
+                address,
+                Arc::new(crate::store_types::StoreObliterateStats::default()),
+            )
+            .await
+            .expect("obliterate the fragment");
+
+        let tombstone = store
+            .clone()
+            .find(partition, address)
+            .await
+            .expect("the tombstone is in the index");
+        assert_eq!(tombstone.matching, StoreMatch::MatchFull);
+        assert_ne!(
+            tombstone.data.flags & FragmentFlags::PayloadObliterated.bits(),
+            0,
+            "obliterate did not leave a tombstone to verify against"
+        );
+
+        let reported = store
+            .clone()
+            .verify_fragment(address, partition, StoreMatch::MatchFull, false)
+            .await
+            .expect("verify answers");
+        assert!(
+            reported.verification_result.is_ok(),
+            "an intentional deletion was reported as a fault"
+        );
+
+        let healed = store
+            .clone()
+            .verify_fragment(address, partition, StoreMatch::MatchFull, true)
+            .await
+            .expect("verify answers");
+        assert!(
+            !healed.healed,
+            "healing claimed a repair on a fragment that is meant to hold no payload"
+        );
+
+        let after = store
+            .clone()
+            .find(partition, address)
+            .await
+            .expect("the tombstone is still in the index");
+        assert_eq!(
+            after.matching,
+            StoreMatch::MatchFull,
+            "healing took the tombstone with it"
+        );
+        assert_ne!(
+            after.data.flags & FragmentFlags::PayloadObliterated.bits(),
+            0,
+            "healing cleared the tombstone's flag"
+        );
     }
 
     /// A store that isolates partitions reports further than it reads, and this is the only
@@ -5527,6 +7192,135 @@ mod tests {
                 .await
                 .expect_err("a context the partition does not hold must not resolve to a sibling");
             assert!(matches!(err, StoreError::AddressNotFound(_)));
+        }
+
+        /// Obliterating a fragment tree must terminate when a child shares its
+        /// parent's bucket.
+        ///
+        /// Obliterating an address takes the write lock on the bucket that address
+        /// lives in, and a child chooses its own bucket from its own hash.
+        /// `tokio::sync::RwLock` is not reentrant, so a child that lands in the
+        /// bucket its parent is holding used to wait on a lock the same task
+        /// already owned, and the obliterate never returned. At one bucket to a
+        /// group - where a client store starts - every child in the parent's group
+        /// collides, which is one child in 256; a 3.4 MB file of 53 chunks hung one
+        /// run in five.
+        ///
+        /// The collision is searched for rather than written down because both
+        /// hashes are content-derived: the first byte chooses the group, and with
+        /// one bucket in it the group is the bucket.
+        #[tokio::test]
+        async fn a_child_in_its_parent_bucket_does_not_deadlock_the_obliterate() {
+            let partition = Partition::from([0x61u8; 16]);
+            let context = Context::from([0x62u8; 16]);
+
+            let (payload, leaf_hash, root_hash, references) = (0u32..)
+                .find_map(|salt| {
+                    let payload = format!("leaf payload {salt}").into_bytes();
+                    let leaf_hash = crate::hash::hash_slice(&payload);
+                    let references = vec![FragmentReference {
+                        hash: leaf_hash,
+                        offset_content: 0,
+                    }];
+                    let root_hash = crate::hash::hash_slice(references.as_bytes());
+                    (root_hash.data()[0] == leaf_hash.data()[0])
+                        .then_some((payload, leaf_hash, root_hash, references))
+                })
+                .expect("a leaf hashing into its own list's group");
+
+            let store = create(
+                None::<&Path>,
+                ImmutableStoreCreateOptions::none(),
+                false,
+                ImmutableStoreSettings::default(),
+            )
+            .await
+            .expect("create store");
+
+            store
+                .clone()
+                .put(
+                    partition,
+                    Address {
+                        hash: leaf_hash,
+                        context,
+                    },
+                    Fragment {
+                        flags: 0,
+                        size_payload: payload.len() as u32,
+                        size_content: payload.len() as u64,
+                    },
+                    Some(Bytes::copy_from_slice(&payload)),
+                    false,
+                )
+                .await
+                .expect("put leaf");
+
+            let references = Bytes::copy_from_slice(references.as_bytes());
+            store
+                .clone()
+                .put(
+                    partition,
+                    Address {
+                        hash: root_hash,
+                        context,
+                    },
+                    Fragment {
+                        flags: FragmentFlags::PayloadFragmented.bits(),
+                        size_payload: references.len() as u32,
+                        size_content: payload.len() as u64,
+                    },
+                    Some(references),
+                    false,
+                )
+                .await
+                .expect("put fragment list");
+
+            let stats = Arc::new(crate::store_types::StoreObliterateStats::default());
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                store.clone().obliterate(
+                    partition,
+                    Address {
+                        hash: root_hash,
+                        context,
+                    },
+                    stats.clone(),
+                ),
+            )
+            .await
+            .expect("obliterating a tree whose child shares its parent's bucket must terminate")
+            .expect("obliterate");
+
+            assert_eq!(
+                stats.num_fragments.load(atomic::Ordering::Relaxed),
+                2,
+                "both the list and the leaf it references are fragments"
+            );
+
+            let addresses = [
+                Address {
+                    hash: root_hash,
+                    context,
+                },
+                Address {
+                    hash: leaf_hash,
+                    context,
+                },
+            ];
+            let mut results = [StoreMatchResult::default(); 2];
+            store
+                .clone()
+                .query(partition, &addresses, &mut results)
+                .await
+                .expect("query");
+            for result in results {
+                assert_eq!(
+                    result.match_made,
+                    StoreMatch::MatchNone,
+                    "an obliterated address must not resolve"
+                );
+            }
         }
 
         /// A tombstone is not a representation to adopt, so the walk passes over it and copies the

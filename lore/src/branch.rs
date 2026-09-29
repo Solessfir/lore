@@ -23,6 +23,7 @@ use lore_revision::lore::BranchId;
 use lore_revision::lore::execution_context;
 use lore_revision::lore_debug;
 use lore_revision::lore_error;
+use lore_revision::metadata::MetadataInherit;
 use lore_revision::metadata::branch::BranchMetadataError;
 use lore_revision::repository;
 use lore_revision::repository::BranchSwitchOptions;
@@ -171,7 +172,7 @@ async fn info_local(
                     .forward::<lore_revision::branch::info::InfoError>("resolving link path")?
             };
 
-            lore_revision::branch::info::info(repository, branch_name).await
+            lore_revision::branch::info::info_boxed(repository, branch_name).await
         }
     })
     .await
@@ -211,7 +212,7 @@ pub struct LoreBranchDiffArgs {
 ///
 /// | Event | Description |
 /// |-------|-------------|
-/// | [`LoreEvent::BranchDiffBegin`](crate::interface::LoreEvent::BranchDiffBegin) | Emitted before diff results begin streaming |
+/// | [`LoreEvent::BranchDiffBegin`](crate::interface::LoreEvent::BranchDiffBegin) | Emitted before diff results begin streaming. Includes the resolved branch names and revisions being compared |
 /// | [`LoreEvent::BranchDiffChangeBegin`](crate::interface::LoreEvent::BranchDiffChangeBegin) | Emitted before the list of changed files begins |
 /// | [`LoreEvent::BranchDiffChange`](crate::interface::LoreEvent::BranchDiffChange) | Emitted for each changed file between the two branches |
 /// | [`LoreEvent::BranchDiffChangeEnd`](crate::interface::LoreEvent::BranchDiffChangeEnd) | Emitted after all changed files have been reported |
@@ -314,6 +315,11 @@ pub struct LoreBranchMergeStartArgs {
     pub link: LoreString,
     /// Merge only the main repository, skipping all linked repositories
     pub ignore_links: u8,
+    /// Metadata keys to carry from the source revision onto the merge
+    /// revision. Empty carries nothing; the single entry `*` carries every
+    /// key that is not reserved to the merge itself.
+    #[serde(default)]
+    pub inherit_metadata: LoreArray<LoreString>,
 }
 
 /// Begins merging a source branch into the current branch, auto-committing if there are no conflicts.
@@ -379,6 +385,12 @@ async fn merge_start_local(
                 message: args.message.to_string(),
                 no_commit: args.no_commit != 0,
                 scope,
+                inherit_metadata: MetadataInherit::from_keys(
+                    args.inherit_metadata
+                        .as_slice()
+                        .iter()
+                        .map(LoreString::as_str),
+                ),
             };
 
             async move {
@@ -530,6 +542,11 @@ pub struct LoreBranchMergeIntoArgs {
     pub link: LoreString,
     /// Merge only the main repository, skipping all linked repositories
     pub ignore_links: u8,
+    /// Metadata keys to carry from the current branch onto the revision
+    /// created on the target branch. Empty carries nothing; the single entry
+    /// `*` carries every key that is not reserved to the merge itself.
+    #[serde(default)]
+    pub inherit_metadata: LoreArray<LoreString>,
 }
 
 /// Merges the current branch's staged changes into a target branch and auto-commits if conflict-free.
@@ -593,6 +610,12 @@ async fn merge_into_local(
                     Some(link_str)
                 },
                 ignore_links,
+                inherit_metadata: MetadataInherit::from_keys(
+                    args.inherit_metadata
+                        .as_slice()
+                        .iter()
+                        .map(LoreString::as_str),
+                ),
             };
 
             async move {
@@ -869,6 +892,7 @@ pub struct LoreBranchPushArgs {
 /// | [`LoreEvent::BranchPushRevisionPushBegin`](crate::interface::LoreEvent::BranchPushRevisionPushBegin) | Emitted when pushing a revision to the remote begins |
 /// | [`LoreEvent::BranchPushRevisionPushUpdate`](crate::interface::LoreEvent::BranchPushRevisionPushUpdate) | Emitted with progress updates during revision push |
 /// | [`LoreEvent::BranchPushRevisionPushEnd`](crate::interface::LoreEvent::BranchPushRevisionPushEnd) | Emitted when revision push completes |
+/// | [`LoreEvent::BranchPushStats`](crate::interface::LoreEvent::BranchPushStats) | Emitted once when the push finishes, with fragment dedup/copy/upload totals for the whole push. Requires `stats >= 1` on the global arguments |
 pub async fn push(
     globals: LoreGlobalArgs,
     args: LoreBranchPushArgs,
@@ -910,7 +934,7 @@ async fn push_impl(
     // Push is never local
     repository.set_disable_upload(false);
 
-    lore_revision::branch::push::push(repository, token, options).await
+    lore_revision::branch::push::push_boxed(repository, token, options).await
 }
 
 #[repr(C)]
@@ -954,7 +978,7 @@ pub struct LoreBranchSwitchArgs {
 /// | [`LoreEvent::RevisionSyncProgress`](crate::interface::LoreEvent::RevisionSyncProgress) | Emitted periodically during file realization |
 /// | [`LoreEvent::RevisionSyncRevision`](crate::interface::LoreEvent::RevisionSyncRevision) | Emitted with the resulting revision after switch |
 /// | [`LoreEvent::FilterExclude`](crate::interface::LoreEvent::FilterExclude) | Emitted for each path excluded by view or ignore filters |
-/// | [`LoreEvent::RevisionResolve`](crate::interface::LoreEvent::RevisionResolve) | Emitted when resolving a partial revision reference |
+/// | [`LoreEvent::RevisionResolve`](crate::interface::LoreEvent::RevisionResolve) | Emitted when resolving a revision number |
 pub async fn switch(
     globals: LoreGlobalArgs,
     args: LoreBranchSwitchArgs,
@@ -1127,6 +1151,10 @@ pub struct LoreBranchArchiveArgs {
 
 /// Archives a branch locally and, unless running in local mode, on the remote.
 ///
+/// Archiving a remote branch that was never pushed or that another client already
+/// archived is not an error. Any other remote failure, such as a missing
+/// authorization, fails the call.
+///
 /// # Events
 ///
 /// ## Standard Events
@@ -1185,7 +1213,7 @@ async fn archive_impl(
     // Make sure branch is not current
     let mut local_current = false;
     if let Ok((_revision, current_branch)) =
-        lore_revision::instance::load_current_anchor(&repository).await
+        lore_revision::instance::load_current_anchor_boxed(&repository).await
         && current_branch == branch.id
     {
         lore_error!("Cannot archive the current branch");
@@ -1207,14 +1235,26 @@ async fn archive_impl(
         }
     }
 
-    if !local_current
-        && !execution_context().globals().local()
-        && let Ok(remote) = repository.remote().await
-    {
+    let mut remote_fail = None;
+
+    if !local_current && !execution_context().globals().local() {
         // Archive remote branch
         lore_debug!("Attempt archive of remote branch");
-        if let Err(err) = branch::delete_remote(remote.clone(), repository.id, branch.id).await {
-            execution.dispatcher.send_error(err);
+        let remote_archive = match repository
+            .remote()
+            .await
+            .forward::<BranchError>("Failed to connect to remote")
+        {
+            Ok(remote) => branch::delete_remote(remote, repository.id, branch.id).await,
+            Err(err) => Err(err),
+        };
+
+        match remote_archive {
+            Ok(()) => (),
+            Err(err) if err.is_no_remote() || err.is_branch_not_found() => {
+                lore_debug!("No remote branch to archive: {err}");
+            }
+            Err(err) => remote_fail = Some(err),
         }
     }
 
@@ -1229,6 +1269,10 @@ async fn archive_impl(
         return Err(BranchError::from(lore_base::error::BranchNotFound {
             branch: branch.id.to_string(),
         }));
+    }
+
+    if let Some(err) = remote_fail {
+        return Err(err);
     }
 
     Ok(())
@@ -1426,19 +1470,20 @@ pub struct LoreBranchLatestListArgs {
     pub limit: u32,
 }
 
-pub async fn latest_list(
+/// Lists a branch's LATEST revision history. Blocks on the runtime, so it is called from outside
+/// it.
+pub fn latest_list(
     globals: LoreGlobalArgs,
     args: LoreBranchLatestListArgs,
     callback: LoreEventCallback,
 ) -> i32 {
-    repository_call_write(
+    crate::runtime().block_on(repository_call_write(
         globals,
         callback,
         args,
         latest_list,
         |repository, _token, args| latest_list_impl(repository, args),
-    )
-    .await
+    ))
 }
 
 async fn latest_list_impl(
@@ -1474,11 +1519,12 @@ async fn resolve_branch_id_or_current(
     branch: &str,
 ) -> Result<BranchId, BranchMetadataError> {
     if branch.is_empty() {
-        let (_revision, current_branch) = lore_revision::instance::load_current_anchor(&repository)
-            .await
-            .map_err(|_err| lore_base::error::InvalidArguments {
-                reason: "no current branch to operate on; specify --branch".into(),
-            })?;
+        let (_revision, current_branch) =
+            lore_revision::instance::load_current_anchor_boxed(&repository)
+                .await
+                .map_err(|_err| lore_base::error::InvalidArguments {
+                    reason: "no current branch to operate on; specify --branch".into(),
+                })?;
         return Ok(current_branch);
     }
 
@@ -1521,7 +1567,7 @@ async fn metadata_get_local(
                 let branch_id =
                     resolve_branch_id_or_current(repository.clone(), &branch_name).await?;
 
-                lore_revision::metadata::branch::get(
+                lore_revision::metadata::branch::get_boxed(
                     repository,
                     branch_id,
                     key.as_deref(),
@@ -1609,7 +1655,8 @@ async fn metadata_set_impl(
     }
     let values: Vec<&[u8]> = encoded_values.iter().map(|v| v.as_slice()).collect();
 
-    lore_revision::metadata::branch::set(repository, branch_id, &keys, &values, &formats).await
+    lore_revision::metadata::branch::set_boxed(repository, branch_id, &keys, &values, &formats)
+        .await
 }
 
 #[repr(C)]
@@ -1650,7 +1697,7 @@ async fn metadata_clear_local(
                     resolve_branch_id_or_current(repository.clone(), &branch_name).await?;
 
                 let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-                lore_revision::metadata::branch::clear(repository, branch_id, &key_refs).await
+                lore_revision::metadata::branch::clear_boxed(repository, branch_id, &key_refs).await
             }
         },
     )
@@ -1660,6 +1707,57 @@ async fn metadata_clear_local(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An old client's payload is this one without the field it never knew, so
+    /// it is built by removing the field rather than by transcribing the shape.
+    fn without_inherit_metadata<T: serde::Serialize>(args: &T) -> serde_json::Value {
+        let mut payload = serde_json::to_value(args).expect("args must serialise");
+        payload
+            .as_object_mut()
+            .expect("args serialise to an object")
+            .remove("inherit_metadata")
+            .expect("the field must be present before it is removed");
+        payload
+    }
+
+    #[test]
+    fn merge_start_args_old_payload_missing_inherit_metadata_uses_default() {
+        // Old IPC client payload with no inherit_metadata field. The new field
+        // must be `#[serde(default)]` so old clients keep working.
+        let payload = without_inherit_metadata(&LoreBranchMergeStartArgs {
+            branch: "feature".into(),
+            message: "merge feature".into(),
+            no_commit: 0,
+            link: Default::default(),
+            ignore_links: 0,
+            inherit_metadata: LoreArray::from_vec(vec![LoreString::from("change-request")]),
+        });
+
+        let args: LoreBranchMergeStartArgs =
+            serde_json::from_value(payload).expect("old payload must deserialise");
+
+        assert_eq!(args.branch.as_str(), "feature");
+        assert_eq!(args.message.as_str(), "merge feature");
+        assert!(args.inherit_metadata.as_slice().is_empty());
+    }
+
+    #[test]
+    fn merge_into_args_old_payload_missing_inherit_metadata_uses_default() {
+        let payload = without_inherit_metadata(&LoreBranchMergeIntoArgs {
+            branch: "main".into(),
+            branch_id: Default::default(),
+            message: "merge into main".into(),
+            link: Default::default(),
+            ignore_links: 0,
+            inherit_metadata: LoreArray::from_vec(vec![LoreString::from("*")]),
+        });
+
+        let args: LoreBranchMergeIntoArgs =
+            serde_json::from_value(payload).expect("old payload must deserialise");
+
+        assert_eq!(args.branch.as_str(), "main");
+        assert!(args.inherit_metadata.as_slice().is_empty());
+    }
 
     #[test]
     fn archive_args_old_payload_missing_cascade_fields_uses_defaults() {

@@ -11,6 +11,7 @@ use tonic::Request;
 use tonic::Response;
 use tonic::Status;
 use tracing::instrument;
+use tracing::warn;
 
 fn endpoint_to_proto(endpoint: &Option<lore_transport::Endpoint>) -> Option<Endpoint> {
     endpoint.as_ref().map(|endpoint| Endpoint {
@@ -20,6 +21,7 @@ fn endpoint_to_proto(endpoint: &Option<lore_transport::Endpoint>) -> Option<Endp
         revision_url: endpoint.revision_url.clone().unwrap_or_default(),
         lock_url: endpoint.lock_url.clone().unwrap_or_default(),
         notification_url: endpoint.notification_url.clone().unwrap_or_default(),
+        user_url: endpoint.user_url.clone().unwrap_or_default(),
     })
 }
 
@@ -35,7 +37,10 @@ fn config_to_proto(config: &Option<lore_revision::environment::Config>) -> Optio
                     lore_proto::lore::environment::v1::CompressionMode::NoCompression
                 }
                 CompressionMode::Lz4 => lore_proto::lore::environment::v1::CompressionMode::Lz4,
-                CompressionMode::Oodle => lore_proto::lore::environment::v1::CompressionMode::Oodle,
+                CompressionMode::Oodle => {
+                    warn!("Env config compression mode overridden from Oodle to Zstd");
+                    lore_proto::lore::environment::v1::CompressionMode::Zstd
+                }
                 CompressionMode::Zstd => lore_proto::lore::environment::v1::CompressionMode::Zstd,
             };
             v1_mode as i32

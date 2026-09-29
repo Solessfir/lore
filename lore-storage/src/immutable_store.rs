@@ -27,6 +27,7 @@ use crate::errors::NotSupported;
 use crate::errors::Oversized;
 use crate::errors::PayloadNotFound;
 use crate::errors::SlowDown;
+use crate::store_types::PayloadRead;
 use crate::store_types::StoreGetData;
 use crate::store_types::StoreMatch;
 use crate::store_types::StoreMatchResult;
@@ -47,11 +48,10 @@ pub enum StoreError {
     NotSupported,
 }
 
-/// Validate that a fragment's declared payload size does not exceed the
-/// protocol-level [`FRAGMENT_SIZE_THRESHOLD`]. Use before allocating or
+/// Validate that a fragment's sizes appear valid. Use before allocating or
 /// streaming a payload buffer based on attacker-influenced metadata.
-///
-/// [`FRAGMENT_SIZE_THRESHOLD`]: crate::FRAGMENT_SIZE_THRESHOLD
+/// These checks are necessary for data that may exist before hardening at the point of ingress
+/// was corrected
 pub fn validate_fragment_size(fragment: &Fragment) -> Result<(), StoreError> {
     let size_payload = fragment.size_payload as usize;
     if size_payload > crate::FRAGMENT_SIZE_THRESHOLD {
@@ -62,6 +62,19 @@ pub fn validate_fragment_size(fragment: &Fragment) -> Result<(), StoreError> {
             ),
         }));
     }
+
+    if (fragment.flags & FragmentFlags::PayloadFragmented) == 0 {
+        let size_content = fragment.size_content as usize;
+        if size_content > crate::FRAGMENT_SIZE_THRESHOLD {
+            return Err(StoreError::from(Oversized {
+                context: format!(
+                    "unfragmented size_content {size_content} exceeds FRAGMENT_SIZE_THRESHOLD {}",
+                    crate::FRAGMENT_SIZE_THRESHOLD
+                ),
+            }));
+        }
+    }
+
     Ok(())
 }
 
@@ -84,6 +97,31 @@ pub fn validate_fragment_payload(
         return Err(StoreError::internal(format!(
             "fragment payload length mismatch: buffer {payload_len} vs size_payload {size_payload}"
         )));
+    }
+    Ok(())
+}
+
+/// Whether the stored payload is the content itself, needing neither reassembly nor expansion, so
+/// a read of it can be handed over as it lies.
+///
+/// The sizes have to agree for that to hold. [`validate_fragment_metadata`] refuses a fragment
+/// where they do not, but only at ingress, and a store may already hold one from before that
+/// boundary existed: its payload is shorter than the content it claims, so it is not the content.
+pub(crate) fn payload_is_content(fragment: &Fragment) -> bool {
+    let fragmented =
+        (fragment.flags & FragmentFlags::PayloadFragmented) == FragmentFlags::PayloadFragmented;
+    let compressed = (fragment.flags & FragmentFlags::PayloadCompressed) != 0;
+    !fragmented && !compressed && fragment.size_payload as u64 == fragment.size_content
+}
+
+/// Refuse content the destination has no room for, rather than truncating it.
+pub(crate) fn validate_buffer_capacity(size: usize, capacity: usize) -> Result<(), StoreError> {
+    if size > capacity {
+        return Err(StoreError::from(Oversized {
+            context: format!(
+                "content of {size} bytes exceeds the {capacity} byte destination buffer"
+            ),
+        }));
     }
     Ok(())
 }
@@ -361,6 +399,47 @@ pub trait ImmutableStore: Any + Send + Sync {
         address: Address,
     ) -> Result<StoreGetData, StoreError>;
 
+    /// Read the payload stored under `address`, into `dst` when the payload is the content itself
+    /// and into a buffer of its own otherwise, reporting the fragment that describes it.
+    ///
+    /// One lookup settles where the payload belongs and reads it there, so a reader that already
+    /// has somewhere for the content to go pays no second lookup either way. What a returned
+    /// payload has to become — expanded, or walked as a fragment list — is the reader's to do; this
+    /// only decides where the stored bytes land. A payload `dst` has no room for is [`Oversized`];
+    /// a returned one is the reader's to size.
+    ///
+    /// The default implementation goes through [`get`](ImmutableStore::get) and copies. A store
+    /// overrides it to read its index once and have the read itself land in `dst`.
+    async fn get_into(
+        self: Arc<Self>,
+        partition: Partition,
+        address: Address,
+        dst: &mut crate::CallerBuffer,
+    ) -> Result<(Fragment, PayloadRead), StoreError> {
+        let data = self.get(partition, address).await?;
+        let fragment = data.fragment;
+        let payload = data
+            .payload
+            .ok_or_else(|| StoreError::from(PayloadNotFound::from(address.hash)))?;
+        validate_fragment_payload(&fragment, payload.len())?;
+
+        if !payload_is_content(&fragment) {
+            return Ok((fragment, PayloadRead::Returned(payload)));
+        }
+
+        let capacity = dst.len();
+        let Some(target) = dst.as_mut_slice().get_mut(..payload.len()) else {
+            return Err(StoreError::from(Oversized {
+                context: format!(
+                    "payload of {} bytes exceeds the {capacity} byte destination buffer",
+                    payload.len()
+                ),
+            }));
+        };
+        target.copy_from_slice(&payload);
+        Ok((fragment, PayloadRead::IntoBuffer))
+    }
+
     /// Check if this store is available for service
     async fn is_available(self: Arc<Self>, _timeout: Duration) -> bool {
         true
@@ -471,8 +550,14 @@ pub trait ImmutableStore: Any + Send + Sync {
     /// Return the current resume point for compaction
     async fn compact_resume_at(self: Arc<Self>) -> Option<usize>;
 
-    /// Stop any ongoing compaction gracefully
-    async fn compact_stop(self: Arc<Self>);
+    /// Stop eviction and compaction, returning once the passes in flight have given up.
+    /// With `terminate` the stop stays raised and the store never collects again; without
+    /// it the stop is lifted before returning, since a store is shared by path and a caller
+    /// quiescing it must not disable collection for the others. Stores that do not collect
+    /// need no implementation.
+    async fn stop_gc(self: Arc<Self>, terminate: bool) {
+        let _ = terminate;
+    }
 
     /// Get maximum supported query batch size, if any
     fn max_query_batch(&self) -> Option<usize>;
@@ -515,14 +600,12 @@ pub trait ImmutableStore: Any + Send + Sync {
     /// already-durable source does not make the new destination tuple durable.
     async fn copy(
         self: Arc<Self>,
-        _source_partition: Partition,
-        _source_address: Address,
-        _destination_partition: Partition,
-        _destination_context: Context,
-        _durable: bool,
-    ) -> Result<(), StoreError> {
-        Err(StoreError::internal("Copy not supported by this store"))
-    }
+        source_partition: Partition,
+        source_address: Address,
+        destination_partition: Partition,
+        destination_context: Context,
+        durable: bool,
+    ) -> Result<(), StoreError>;
 
     fn as_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync>
     where
@@ -569,6 +652,19 @@ mod tests {
     fn validate_size_rejects_over_threshold() {
         let fragment = make_fragment(crate::FRAGMENT_SIZE_THRESHOLD as u32 + 1);
         let err = validate_fragment_size(&fragment).expect_err("should reject oversize");
+        assert!(matches!(err, StoreError::Oversized(_)));
+    }
+
+    #[test]
+    fn validate_size_rejects_oversized_unfragmented_content() {
+        // size_payload within bounds but size_content over threshold: must be caught to
+        // prevent downstream callers (e.g. decompress) from pre-allocating a huge buffer.
+        let fragment = Fragment {
+            flags: 0,
+            size_payload: 128,
+            size_content: crate::FRAGMENT_SIZE_THRESHOLD as u64 + 1,
+        };
+        let err = validate_fragment_size(&fragment).expect_err("should reject oversize content");
         assert!(matches!(err, StoreError::Oversized(_)));
     }
 
@@ -754,7 +850,9 @@ mod tests {
 
         #[test]
         fn accepts_fragmented_with_large_content() {
-            // Fragmented fragments can address any amount of content
+            // Fragmented fragments address total file content that can far exceed
+            // FRAGMENT_SIZE_THRESHOLD; size_content is only bounded for non-fragmented
+            // fragments (where it drives the decompress allocation).
             let fragment = Fragment {
                 flags: FragmentFlags::PayloadFragmented.into(),
                 size_payload: 80,

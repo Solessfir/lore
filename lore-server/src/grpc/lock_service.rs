@@ -35,9 +35,8 @@ use tracing::warn;
 use super::extract_correlation_id;
 use super::get_repository;
 use super::get_user_id;
-use super::is_owner_or_admin;
 use super::timeout_grpc;
-use crate::grpc::can_admin_lock;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::util::setup_execution;
 
 const STATUS_MAX_RESOURCE_LEN: usize = 100;
@@ -92,11 +91,9 @@ fn handle_lock_error(error: LockError) -> Status {
 pub struct LoreLockService {
     lock_store: Arc<dyn LockStore>,
     notification: Arc<dyn NotificationSender>,
+    authorizer: Arc<dyn RepositoryAuthorizer>,
     rpc_timeout: Duration,
-    // Whether this server has [server.auth] configured at all - see
-    // can_admin_lock's doc comment (grpc/mod.rs) for why admin lock bypasses
-    // the permission check entirely when this is false, rather than being
-    // permanently unreachable on a server with no auth to check against.
+    // Admin operations remain available when no [server.auth] is configured.
     auth_enabled: bool,
 
     instrument_provider: LoreLockServiceInstrumentProvider,
@@ -108,6 +105,7 @@ impl LoreLockService {
     pub fn new(
         lock_store: Arc<dyn LockStore>,
         notification: Arc<dyn NotificationSender>,
+        authorizer: Arc<dyn RepositoryAuthorizer>,
         rpc_timeout: Duration,
         auth_enabled: bool,
     ) -> Self {
@@ -116,6 +114,7 @@ impl LoreLockService {
         Self {
             lock_store,
             notification,
+            authorizer,
             rpc_timeout,
             auth_enabled,
             locking_histogram: instrument_provider.length_histogram(
@@ -172,6 +171,17 @@ impl LoreLockService {
         let locks = locks.into_iter().map(Into::into).collect();
 
         Ok(locks)
+    }
+
+    /// `owner` or `admin` on `repository` waives the lock-ownership check.
+    async fn is_elevated(&self, extensions: &tonic::Extensions, repository: RepositoryId) -> bool {
+        self.authorizer
+            .permits(extensions, repository, "owner")
+            .await
+            || self
+                .authorizer
+                .permits(extensions, repository, "admin")
+                .await
     }
 }
 
@@ -297,7 +307,7 @@ impl LoreLockService {
         let user_id = get_user_id(request.extensions());
         let correlation_id = extract_correlation_id(&request).unwrap_or_default();
         let repository = get_repository(request.metadata())?;
-        let validate_user = !is_owner_or_admin(request.extensions(), repository);
+        let validate_user = !self.is_elevated(request.extensions(), repository).await;
         let unlock_request = request.into_inner();
 
         self.locking_histogram.record(
@@ -368,7 +378,7 @@ impl LoreLockService {
 
         LORE_CONTEXT
             .scope(execution, async move {
-                if !can_admin_lock(&extensions, repository, self.auth_enabled) {
+                if self.auth_enabled && !self.authorizer.permits(&extensions, repository, "migrate").await {
                     warn!("Attempt to apply admin locks, but user does not have the correct permissions");
                     return Err(Status::permission_denied("Permission denied"));
                 }
@@ -409,15 +419,12 @@ impl LoreLockService {
 
         LORE_CONTEXT
             .scope(execution, async move {
-                if !can_admin_lock(&extensions, repository, self.auth_enabled) {
+                if self.auth_enabled && !self.authorizer.permits(&extensions, repository, "migrate").await {
                     warn!("Attempt to apply admin unlock, but user does not have the correct permissions");
                     return Err(Status::permission_denied("Permission denied"));
                 }
 
-                // validate_user = false: admin unlock releases regardless of
-                // the lock's current owner - that's the entire point of this
-                // RPC (see can_admin_lock's doc comment for when it's
-                // actually reachable).
+                // Admin unlock releases resources regardless of their owner.
                 let resources = self
                     .lock_store
                     .unlock_resources(user_id.as_str(), false, repository, &resources)
@@ -498,7 +505,26 @@ mod test {
     use tonic::Code;
     use tonic::Request;
 
+    use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
+    use crate::authnz::repository_authorizer::RepositoryAuthorizer;
     use crate::grpc::lock_service::LoreLockService;
+
+    fn lock_service_with(
+        lock_store: store::MockMockLockStore,
+        authorizer: Arc<dyn RepositoryAuthorizer>,
+    ) -> LoreLockService {
+        LoreLockService::new(
+            Arc::new(lock_store),
+            Arc::new(crate::notification::local::NotificationSender::default()),
+            authorizer,
+            Duration::from_secs(60),
+            true,
+        )
+    }
+
+    fn lock_service(lock_store: store::MockMockLockStore) -> LoreLockService {
+        lock_service_with(lock_store, Arc::new(AllowAllRepositoryAuthorizer))
+    }
 
     mod store {
         use async_trait::async_trait;
@@ -547,19 +573,12 @@ mod test {
         use lore_proto::lock::StatusRequest;
 
         use super::*;
-        use crate::notification::local::NotificationSender;
 
         #[tokio::test]
         async fn resource_count_exceeds_limit() {
             let lock_store = super::store::MockMockLockStore::new();
 
-            let notification_sender = Arc::new(NotificationSender::default());
-            let lock_service = LoreLockService::new(
-                Arc::new(lock_store),
-                notification_sender,
-                Duration::from_secs(60),
-                true,
-            );
+            let lock_service = super::lock_service(lock_store);
 
             let resources: Vec<Resource> = (0..101)
                 .map(|_| Resource {
@@ -591,13 +610,7 @@ mod test {
                 .expect_check_locks_status()
                 .return_once(|_, _| Ok(vec![]));
 
-            let notification_sender = Arc::new(NotificationSender::default());
-            let lock_service = LoreLockService::new(
-                Arc::new(lock_store),
-                notification_sender,
-                Duration::from_secs(60),
-                true,
-            );
+            let lock_service = super::lock_service(lock_store);
 
             let resources: Vec<Resource> = (0..100)
                 .map(|_| Resource {
@@ -629,19 +642,12 @@ mod test {
         use lore_proto::lock::UnlockRequest;
 
         use super::*;
-        use crate::notification::local::NotificationSender;
 
         #[tokio::test]
         async fn lock_zero_resources() {
             let lock_store = super::store::MockMockLockStore::new();
 
-            let notification_sender = Arc::new(NotificationSender::default());
-            let lock_service = LoreLockService::new(
-                Arc::new(lock_store),
-                notification_sender,
-                Duration::from_secs(60),
-                true,
-            );
+            let lock_service = super::lock_service(lock_store);
 
             let mut request = Request::new(LockRequest { resources: vec![] });
             let repository = random::<RepositoryId>();
@@ -660,13 +666,7 @@ mod test {
         async fn unlock_zero_resources() {
             let lock_store = super::store::MockMockLockStore::new();
 
-            let notification_sender = Arc::new(NotificationSender::default());
-            let lock_service = LoreLockService::new(
-                Arc::new(lock_store),
-                notification_sender,
-                Duration::from_secs(60),
-                true,
-            );
+            let lock_service = super::lock_service(lock_store);
 
             let mut request = Request::new(UnlockRequest { resources: vec![] });
             let repository = random::<RepositoryId>();
@@ -685,13 +685,7 @@ mod test {
         async fn status_zero_resources() {
             let lock_store = super::store::MockMockLockStore::new();
 
-            let notification_sender = Arc::new(NotificationSender::default());
-            let lock_service = LoreLockService::new(
-                Arc::new(lock_store),
-                notification_sender,
-                Duration::from_secs(60),
-                true,
-            );
+            let lock_service = super::lock_service(lock_store);
 
             let mut request = Request::new(StatusRequest { resources: vec![] });
             let repository = random::<RepositoryId>();
@@ -710,13 +704,7 @@ mod test {
         async fn admin_unlock_zero_resources() {
             let lock_store = super::store::MockMockLockStore::new();
 
-            let notification_sender = Arc::new(NotificationSender::default());
-            let lock_service = LoreLockService::new(
-                Arc::new(lock_store),
-                notification_sender,
-                Duration::from_secs(60),
-                true,
-            );
+            let lock_service = super::lock_service(lock_store);
 
             let mut request = Request::new(AdminLockRequest {
                 resources: vec![],
@@ -741,13 +729,7 @@ mod test {
                 .expect_unlock_resources()
                 .return_once(|_, _, _, _| Err(lore_base::error::LockNotOwned.into()));
 
-            let notification_sender = Arc::new(NotificationSender::default());
-            let lock_service = LoreLockService::new(
-                Arc::new(lock_store),
-                notification_sender,
-                Duration::from_secs(60),
-                true,
-            );
+            let lock_service = super::lock_service(lock_store);
 
             let mut request = Request::new(UnlockRequest {
                 resources: vec![Resource {
@@ -768,6 +750,275 @@ mod test {
                 .expect_err("Unlock did not return error status");
 
             assert_eq!(error_status.code(), Code::FailedPrecondition);
+        }
+    }
+
+    /// Unlock elevates on `owner`/`admin`; admin operations require `migrate`
+    /// when authentication is configured, on both OIDC tiers.
+    mod actions {
+        use lore_proto::lock::AdminLockRequest;
+        use lore_proto::lock::AdminUnlockRequest;
+        use lore_proto::lock::Resource;
+        use lore_proto::lock::UnlockRequest;
+        use serde_json::json;
+
+        use super::*;
+        use crate::auth::jwt::AuthorizationToken;
+        use crate::auth::jwt::ResourcePermission;
+        use crate::authnz::global_grants_authorizer::GlobalGrantsAuthorizer;
+        use crate::authnz::repository_authorizer::RawToken;
+        use crate::authnz::resource_grants_authorizer::ResourceGrantsAuthorizer;
+
+        /// Tier 1, reading the actions from a dotted global claim.
+        fn tier1() -> Arc<dyn RepositoryAuthorizer> {
+            Arc::new(GlobalGrantsAuthorizer::new(Some(
+                "realm_access.roles".to_string(),
+            )))
+        }
+
+        /// Tier 2, reading per-repository grants from the legacy-shaped
+        /// `resources` claim.
+        fn tier2() -> Arc<dyn RepositoryAuthorizer> {
+            Arc::new(ResourceGrantsAuthorizer::new(
+                "resources".to_string(),
+                "resource_id".to_string(),
+                None,
+                "urc-{id}".to_string(),
+                "urc-*".to_string(),
+            ))
+        }
+
+        /// A token granting `actions` in the shape both tiers read: globally
+        /// under `realm_access.roles`, and per-repository under `resources`.
+        fn token_granting(repository: RepositoryId, actions: &[&str]) -> AuthorizationToken {
+            let serde_json::Value::Object(extra) = json!({ "realm_access": { "roles": actions } })
+            else {
+                unreachable!()
+            };
+            AuthorizationToken {
+                user_id: "the u".to_string(),
+                resources: Some(vec![ResourcePermission {
+                    resource_id: format!("urc-{repository}"),
+                    permission: actions.iter().map(ToString::to_string).collect(),
+                }]),
+                extra,
+                ..Default::default()
+            }
+        }
+
+        fn request_with_token<T>(
+            message: T,
+            repository: RepositoryId,
+            token: Option<AuthorizationToken>,
+        ) -> Request<T> {
+            let mut request = Request::new(message);
+            request.metadata_mut().insert_bin(
+                REPOSITORY_ID_KEY,
+                tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
+            );
+            if let Some(token) = token {
+                request.extensions_mut().insert(token);
+                request.extensions_mut().insert(RawToken("raw.jwt".into()));
+            }
+            request
+        }
+
+        fn one_resource() -> Vec<Resource> {
+            vec![Resource {
+                branch: Default::default(),
+                hash: Default::default(),
+                description: "".to_string(),
+            }]
+        }
+
+        /// The store records the `validate_user` flag it was called with,
+        /// which is what elevation waives.
+        fn store_expecting_validate_user(validate: bool) -> store::MockMockLockStore {
+            let mut lock_store = store::MockMockLockStore::new();
+            lock_store
+                .expect_unlock_resources()
+                .withf(move |_, validate_user, _, _| *validate_user == validate)
+                .return_once(|_, _, _, _| Ok(vec![]));
+            lock_store
+        }
+
+        #[tokio::test]
+        async fn unlock_elevates_with_the_action_on_both_tiers() {
+            for (tier, action) in [
+                (tier1(), "owner"),
+                (tier1(), "admin"),
+                (tier2(), "owner"),
+                (tier2(), "admin"),
+            ] {
+                let repository = random::<RepositoryId>();
+                let lock_service = lock_service_with(store_expecting_validate_user(false), tier);
+                let request = request_with_token(
+                    UnlockRequest {
+                        resources: one_resource(),
+                    },
+                    repository,
+                    Some(token_granting(repository, &[action])),
+                );
+                lock_service.unlock(request).await.unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn unlock_stays_owner_validated_without_the_action_on_both_tiers() {
+            for tier in [tier1(), tier2()] {
+                let repository = random::<RepositoryId>();
+                let lock_service = lock_service_with(store_expecting_validate_user(true), tier);
+                let request = request_with_token(
+                    UnlockRequest {
+                        resources: one_resource(),
+                    },
+                    repository,
+                    // A perfectly good token that grants something else.
+                    Some(token_granting(repository, &["push"])),
+                );
+                lock_service.unlock(request).await.unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn admin_lock_requires_migrate_on_both_tiers() {
+            for tier in [tier1(), tier2()] {
+                let repository = random::<RepositoryId>();
+                let mut lock_store = store::MockMockLockStore::new();
+                lock_store
+                    .expect_lock_resources()
+                    .return_once(|_, _, _| Ok(vec![]));
+                let lock_service = lock_service_with(lock_store, tier.clone());
+
+                let denied = lock_service
+                    .admin_lock(request_with_token(
+                        AdminLockRequest {
+                            resources: one_resource(),
+                            owner: "someone".to_string(),
+                        },
+                        repository,
+                        Some(token_granting(repository, &["push"])),
+                    ))
+                    .await
+                    .expect_err("admin lock without `migrate` is denied");
+                assert_eq!(denied.code(), Code::PermissionDenied);
+
+                lock_service
+                    .admin_lock(request_with_token(
+                        AdminLockRequest {
+                            resources: one_resource(),
+                            owner: "someone".to_string(),
+                        },
+                        repository,
+                        Some(token_granting(repository, &["migrate"])),
+                    ))
+                    .await
+                    .expect("admin lock with `migrate` is permitted");
+            }
+        }
+
+        #[tokio::test]
+        async fn admin_unlock_requires_migrate_on_both_tiers() {
+            for tier in [tier1(), tier2()] {
+                let repository = random::<RepositoryId>();
+                let lock_service = lock_service_with(store_expecting_validate_user(false), tier);
+
+                for token in [None, Some(token_granting(repository, &["push"]))] {
+                    let denied = lock_service
+                        .admin_unlock(request_with_token(
+                            AdminUnlockRequest {
+                                resources: one_resource(),
+                            },
+                            repository,
+                            token,
+                        ))
+                        .await
+                        .expect_err("admin unlock without `migrate` is denied");
+                    assert_eq!(denied.code(), Code::PermissionDenied);
+                }
+
+                lock_service
+                    .admin_unlock(request_with_token(
+                        AdminUnlockRequest {
+                            resources: one_resource(),
+                        },
+                        repository,
+                        Some(token_granting(repository, &["migrate"])),
+                    ))
+                    .await
+                    .expect("admin unlock with `migrate` is permitted");
+            }
+        }
+
+        #[tokio::test]
+        async fn admin_operations_work_without_authentication() {
+            let repository = random::<RepositoryId>();
+            let mut lock_store = store_expecting_validate_user(false);
+            lock_store
+                .expect_lock_resources()
+                .withf(|owner, _, _| owner == "someone")
+                .return_once(|_, _, _| Ok(vec![]));
+            let lock_service = LoreLockService::new(
+                Arc::new(lock_store),
+                Arc::new(crate::notification::local::NotificationSender::default()),
+                Arc::new(AllowAllRepositoryAuthorizer),
+                Duration::from_secs(60),
+                false,
+            );
+
+            lock_service
+                .admin_lock(request_with_token(
+                    AdminLockRequest {
+                        resources: one_resource(),
+                        owner: "someone".to_string(),
+                    },
+                    repository,
+                    None,
+                ))
+                .await
+                .expect("admin lock is available without authentication");
+            lock_service
+                .admin_unlock(request_with_token(
+                    AdminUnlockRequest {
+                        resources: one_resource(),
+                    },
+                    repository,
+                    None,
+                ))
+                .await
+                .expect("admin unlock is available without authentication");
+        }
+
+        /// Authentication-enabled servers still require a verified token
+        /// even when the configured authorizer would allow every action.
+        #[tokio::test]
+        async fn no_token_means_no_elevation_and_no_admin_lock() {
+            let repository = random::<RepositoryId>();
+            let lock_service = lock_service_with(store_expecting_validate_user(true), tier1());
+            lock_service
+                .unlock(request_with_token(
+                    UnlockRequest {
+                        resources: one_resource(),
+                    },
+                    repository,
+                    None,
+                ))
+                .await
+                .unwrap();
+
+            let lock_service = super::lock_service(store::MockMockLockStore::new());
+            let denied = lock_service
+                .admin_lock(request_with_token(
+                    AdminLockRequest {
+                        resources: one_resource(),
+                        owner: "someone".to_string(),
+                    },
+                    repository,
+                    None,
+                ))
+                .await
+                .expect_err("admin lock without a token is denied even under allow-all");
+            assert_eq!(denied.code(), Code::PermissionDenied);
         }
     }
 }

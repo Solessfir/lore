@@ -21,9 +21,9 @@ use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
-use crate::grpc::get_authorization;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::handlers::path_diff::link_pin_path_diffs;
@@ -37,10 +37,11 @@ pub async fn handler(
     request: Request<BranchDiffRequest>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
 ) -> Result<Response<BranchDiffResponse>, Status> {
     let repository_id = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
-    let authorization = get_authorization(request.extensions()).ok();
+    let can_read = link_read_authorizer(&repository_authorizer, request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let req = request.into_inner().clone();
     let branch_source = BranchId::from(req.branch_source);
@@ -57,7 +58,7 @@ pub async fn handler(
 
     let repository = Arc::new(
         RepositoryContext::new_server_context(immutable_store, mutable_store, repository_id)
-            .with_link_read(link_read_authorizer(authorization)),
+            .with_link_read(can_read),
     );
     LORE_CONTEXT
         .scope(execution, async move {
@@ -112,12 +113,14 @@ async fn branch_diff_handler(
 ) -> Result<Response<BranchDiffResponse>, Status> {
     let metadata = branch::metadata(repository.clone(), branch_source)
         .await
+        .filter_slow_down()?
         .map_err(|err| {
             warn!("Failed to get source branch metadata: {branch_source}");
             Status::not_found(err.to_string())
         })?;
     let source = branch::branch_metadata(repository.clone(), branch_source, &metadata)
         .await
+        .filter_slow_down()?
         .map_err(|e| {
             warn!("Failed to resolve source branch: {branch_source}");
             Status::not_found(e.to_string())
@@ -125,12 +128,14 @@ async fn branch_diff_handler(
 
     let metadata = branch::metadata(repository.clone(), branch_target)
         .await
+        .filter_slow_down()?
         .map_err(|err| {
             warn!("Failed to get target branch metadata: {branch_target}");
             Status::not_found(err.to_string())
         })?;
     let target = branch::branch_metadata(repository.clone(), branch_target, &metadata)
         .await
+        .filter_slow_down()?
         .map_err(|e| {
             warn!("Failed to resolve target branch: {branch_target}");
             Status::not_found(e.to_string())
@@ -149,7 +154,7 @@ async fn branch_diff_handler(
         auto_resolve,
     )
     .await;
-    match result {
+    match result.filter_slow_down()? {
         Ok(result) => {
             debug!("Found {} changes", result.changes.len());
             // The changes are base -> source; compare the registries over the
@@ -205,9 +210,14 @@ mod test {
     use rand::random;
 
     use super::*;
+    use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
     use crate::grpc::get_write_token;
     use crate::grpc::handlers::branch_push;
     use crate::store::test_store_create;
+
+    fn allow_all() -> Arc<dyn RepositoryAuthorizer> {
+        Arc::new(AllowAllRepositoryAuthorizer)
+    }
 
     async fn commit_revision_on_branch(
         repository_context: Arc<RepositoryContext>,
@@ -464,7 +474,7 @@ mod test {
                 REPOSITORY_ID_KEY,
                 tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
             );
-            let response = handler(request, immutable_store, mutable_store).await;
+            let response = handler(request, immutable_store, mutable_store, allow_all()).await;
             let expected = BranchDiffResponse {
                 diffs: vec![],
                 conflicts: vec![],
@@ -717,7 +727,7 @@ mod test {
                 REPOSITORY_ID_KEY,
                 tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
             );
-            let response = handler(request, immutable_store, mutable_store).await;
+            let response = handler(request, immutable_store, mutable_store, allow_all()).await;
             let expected = BranchDiffResponse {
                 diffs: vec![],
                 conflicts: vec![],
@@ -832,7 +842,9 @@ mod test {
                 tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
             );
 
-            handler(request, immutable_store, mutable_store).await.err()
+            handler(request, immutable_store, mutable_store, allow_all())
+                .await
+                .err()
         }))
         .await;
 
@@ -957,7 +969,7 @@ mod test {
                 tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
             );
 
-            let response = handler(request, immutable_store, mutable_store)
+            let response = handler(request, immutable_store, mutable_store, allow_all())
                 .await
                 .expect("Branch diff must resolve a base for histories that share no revision")
                 .into_inner();

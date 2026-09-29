@@ -34,6 +34,7 @@ use crate::Partition;
 use crate::errors::AddressNotFound;
 use crate::immutable_store::ImmutableStore;
 use crate::immutable_store::StoreError;
+use crate::local::fan_out::GroupLevel;
 use crate::local::immutable_store::SerializeFailureGuard;
 use crate::local::immutable_store::format_bucket_path;
 use crate::store_types::KeyType;
@@ -152,6 +153,22 @@ pub struct MutableStoreGroup {
     /// two-phase commit (`level.pending` deleted), so a mismatch with `bucket_count` indicates a
     /// pending level transition that needs the two-phase commit on the next flush.
     pub committed_level: std::sync::atomic::AtomicUsize,
+    /// Makes the whole-group flushes serial: both `flush_all` and the delayed per-bucket
+    /// flush hold it, so at most one flusher per group is ever in flight.
+    ///
+    /// Without it, two overlapping flushes each read `committed_level` before either
+    /// has finished and can take *different* paths — one the two-phase commit (write
+    /// `index_<bb>.new`, then rename it over the live file), the other the regular
+    /// in-place write. The rename then publishes its older `.new` snapshot over the
+    /// newer in-place write, silently discarding it: the losing write still returns
+    /// `Ok`, and the clobbered file even inherits the `.new` file's older mtime.
+    /// Note that locking the rename alone would not be enough — the
+    /// published snapshot is taken before the rename, so the two paths have to be
+    /// prevented from interleaving at all.
+    ///
+    /// Contention is per group, and only between concurrent flushes of the *same*
+    /// group; the 256 groups still flush in parallel.
+    pub flush_lock: Arc<Mutex<()>>,
 }
 
 impl MutableStoreGroup {
@@ -774,11 +791,8 @@ impl LocalMutableStore {
             None
         };
 
-        // Per-group level marker detection. For each group dir (if present on disk), first run
-        // T10 recovery to roll forward any interrupted fan-out commit, then read the marker; if
-        // the marker is missing, fall back to `settings.initial_fan_out_level` for fresh stores
-        // or 256 for existing legacy stores (the pre-fan-out 256-bucket layout). `committed_level`
-        // tracks the on-disk marker value (0 if absent) for the flush path's two-phase decision.
+        // Groups are surveyed before their levels are decided: the decision needs the store's
+        // serialize version, which is only known once every marker has been read.
         let index_existed_on_disk = mutable_path
             .as_ref()
             .is_some_and(|p| p.join("index").exists());
@@ -786,19 +800,19 @@ impl LocalMutableStore {
         // awaiting the groups in turn puts a store open behind `GROUP_COUNT` round trips to the
         // I/O engine, and each task carries the group it answers for because completions arrive
         // in whatever order the reads finish.
-        let initial_fan_out_level = settings.initial_fan_out_level;
-        let mut levels = vec![(initial_fan_out_level, 0usize, false); GROUP_COUNT];
+        let mut group_levels = vec![GroupLevel::Unwritten; GROUP_COUNT];
         if let Some(path) = mutable_path.as_ref() {
             let index_path = path.join("index");
             let mut tasks = JoinSet::new();
             for group_index in 0..GROUP_COUNT {
-                let group_path = index_path.join(format!("{:02x}", group_index as u8));
+                let group_path = crate::local::fan_out::group_dir_path(&index_path, group_index);
                 lore_base::lore_spawn!(tasks, async move {
+                    if !group_path.exists() {
+                        return (group_index, Ok(GroupLevel::Unwritten));
+                    }
                     // Roll forward any pending fan-out commit before reading the marker. After this returns the marker reflects the post-recovery state.
-                    if group_path.exists()
-                        && let Err(err) =
-                            crate::local::fan_out::recover_level_transition(&group_path, false)
-                                .await
+                    if let Err(err) =
+                        crate::local::fan_out::recover_level_transition(&group_path, false).await
                     {
                         return (
                             group_index,
@@ -809,15 +823,14 @@ impl LocalMutableStore {
                         );
                     }
 
-                    let level = match crate::local::fan_out::read_level_marker(&group_path).await {
-                        Ok(Some(level)) => Ok((level, level, true)),
-                        Ok(None) if index_existed_on_disk => Ok((BUCKET_COUNT, 0, false)),
-                        Ok(None) => Ok((initial_fan_out_level, 0, false)),
-                        Err(err) => Err(LocalMutableStoreError::internal_with_context(
-                            err,
-                            "Failed to read level marker for group",
-                        )),
-                    };
+                    let level = crate::local::fan_out::read_group_level(&group_path)
+                        .await
+                        .map_err(|err| {
+                            LocalMutableStoreError::internal_with_context(
+                                err,
+                                "Failed to read level marker for group",
+                            )
+                        });
                     (group_index, level)
                 });
             }
@@ -826,18 +839,13 @@ impl LocalMutableStore {
                 let (group_index, level) = joined.map_err(|err| {
                     LocalMutableStoreError::internal_with_context(err, "level marker task")
                 })?;
-                levels[group_index] = level?;
+                group_levels[group_index] = level?;
             }
         }
 
-        let mut bucket_counts: Vec<usize> = Vec::with_capacity(GROUP_COUNT);
-        let mut committed_levels: Vec<usize> = Vec::with_capacity(GROUP_COUNT);
-        let mut any_marker_seen = false;
-        for (initial, committed, marker_seen) in levels {
-            bucket_counts.push(initial);
-            committed_levels.push(committed);
-            any_marker_seen |= marker_seen;
-        }
+        let any_marker_seen = group_levels
+            .iter()
+            .any(|level| matches!(level, GroupLevel::Marked(_)));
 
         // Determine serialize_version per Decision 8. Fresh stores and stores with markers / older
         // versions becoming fan-out-aware all go to LazyFanOut. Existing TypedItems stores with no
@@ -851,6 +859,11 @@ impl LocalMutableStore {
             MutableStoreVersion::TypedItems as u32
         };
 
+        let unwritten_level = crate::local::fan_out::unwritten_group_level(
+            serialize_version == MutableStoreVersion::LazyFanOut as u32,
+            settings.initial_fan_out_level,
+        );
+
         let mut store = LocalMutableStore {
             path: mutable_path,
             lock,
@@ -860,14 +873,20 @@ impl LocalMutableStore {
             authoritative,
         };
 
-        for (group_index, &count) in bucket_counts.iter().enumerate() {
+        for level in group_levels {
+            let (count, committed) = match level {
+                GroupLevel::Marked(level) => (level, level),
+                GroupLevel::PreFanOut => (BUCKET_COUNT, 0),
+                GroupLevel::Unwritten => (unwritten_level, 0),
+            };
             store.group.push(Arc::new(MutableStoreGroup {
                 bucket: [const { OnceLock::new() }; BUCKET_COUNT],
                 dirty: std::array::from_fn(|_| AtomicBool::new(false)),
                 bucket_count: std::sync::atomic::AtomicUsize::new(count),
                 serialize_version: std::sync::atomic::AtomicU32::new(serialize_version),
                 fan_out_threshold: settings.fan_out_threshold,
-                committed_level: std::sync::atomic::AtomicUsize::new(committed_levels[group_index]),
+                committed_level: std::sync::atomic::AtomicUsize::new(committed),
+                flush_lock: Arc::new(Mutex::new(())),
             }));
         }
 
@@ -925,14 +944,38 @@ impl LocalMutableStore {
                     return;
                 };
 
+                // Same group lock as `flush_all`, so a delayed bucket write cannot be
+                // clobbered by a concurrent two-phase commit's rename. Acquired before
+                // the bucket guard to keep the lock order
+                // flush_lock -> bucket RwLock -> serialize_lock uniform with
+                // `flush_all`, which would otherwise be an inversion.
+                let flush_guard = group.flush_lock.clone().lock_owned().await;
+
+                // Re-check under the lock: a flush that ran while we waited may already
+                // have written this bucket. `serialize` would claim the dirty flag and
+                // bail out anyway, but only after taking the bucket guard.
+                if !group.dirty[bucket_index].load(atomic::Ordering::Relaxed) {
+                    return;
+                }
+
                 let bucket = bucket.read_owned().await;
                 let _ = MutableStoreBucket::serialize(
                     bucket,
-                    group,
+                    group.clone(),
                     path,
                     group_index,
                     bucket_index,
                     false, /* Don't wait and sync all data to storage media */
+                )
+                .await;
+
+                crate::local::fan_out::commit_if_initial_level(
+                    &flush_guard,
+                    &group.committed_level,
+                    &group.bucket_count,
+                    path,
+                    group_index,
+                    false,
                 )
                 .await;
             }
@@ -968,6 +1011,29 @@ impl LocalMutableStore {
             lore_base::lore_spawn!(tasks, async move {
                 let mut first_err: Option<LocalMutableStoreError> = None;
 
+                // One flusher per group at a time. Held for the whole group flush so
+                // that the fan-out check, the `committed_level` read that picks the
+                // commit path, and the writes themselves are one atomic unit: an
+                // overlapping flush must not observe a half-finished level transition
+                // and take the other path. See `MutableStoreGroup::flush_lock`.
+                let _flush_guard = group.flush_lock.clone().lock_owned().await;
+
+                // Re-check under the lock: another flusher may have drained this group
+                // while we waited. The scan that got us here is lock-free and stale by
+                // now, so skip the redundant fan-out check, path selection and - in the
+                // two-phase branch - the needless level-marker write. A pending level
+                // transition (`committed_level != active_buckets`) still has to be
+                // completed even with no dirty bucket, so it is never skipped.
+                if !group
+                    .dirty
+                    .iter()
+                    .any(|flag| flag.load(atomic::Ordering::Relaxed))
+                    && group.committed_level.load(atomic::Ordering::Relaxed)
+                        == group.bucket_count.load(atomic::Ordering::Relaxed)
+                {
+                    return Ok(());
+                }
+
                 // Fan-out trigger: if any dirty bucket exceeds the threshold and we're below max level, redistribute entries before serializing.
                 if let Err(err) =
                     maybe_fan_out_mutable_group(&group, path.as_ref(), group_index, authoritative)
@@ -981,7 +1047,7 @@ impl LocalMutableStore {
                 let group_path = {
                     let mut p = path.as_path().to_path_buf();
                     p.push("index");
-                    p.push(format!("{:02x}", group_index as u8));
+                    crate::local::fan_out::push_group_dir(&mut p, group_index);
                     p
                 };
                 let fan_out_aware = group.serialize_version.load(atomic::Ordering::Relaxed)
@@ -1646,10 +1712,13 @@ async fn maybe_fan_out_mutable_group(
             bucket.sorted_index.insert(insert_slot, entry_index as u32);
             bucket.entry.push(entry);
         }
+        // The redistribute leaves every `[0..target]` bucket holding exactly the entries it
+        // should, while the layout on disk is still the pre-fan-out one until the flush commits.
+        // A lazy deserialize of any of them would therefore replace live entries with a stale
+        // file, or with nothing for a slot the old layout never wrote.
+        bucket.deserialized = true;
         if count > 0 {
             group.dirty[new_idx].store(true, atomic::Ordering::Relaxed);
-            // Mark deserialized so subsequent operations don't try to re-read from disk.
-            bucket.deserialized = true;
         }
     }
 
@@ -1808,6 +1877,304 @@ mod tests {
             path.exists(),
             "authoritative store must preserve the corrupt bucket file"
         );
+    }
+
+    /// Client-shaped settings: groups start at level 1.
+    fn client_settings() -> MutableStoreSettings {
+        MutableStoreSettings {
+            initial_fan_out_level: 1,
+            ..Default::default()
+        }
+    }
+
+    /// Store `count` keys spread across groups, at bucket bytes that route away from bucket 0
+    /// once a group is at 256 — so a group misread as pre-fan-out sends a lookup to a different
+    /// bucket than the one holding it.
+    async fn store_keys(
+        store: &Arc<LocalMutableStore>,
+        partition: Partition,
+        count: u8,
+    ) -> Vec<Hash> {
+        use crate::mutable_store::MutableStore;
+        let dyn_store: Arc<dyn MutableStore> = store.clone();
+        let mut keys = Vec::new();
+        for index in 0..count {
+            let mut key = Hash::default();
+            key.data_mut()[0] = index;
+            key.data_mut()[1] = 0xAB;
+            dyn_store
+                .clone()
+                .store(
+                    partition,
+                    key,
+                    Hash::from_u64(index as u64 + 1),
+                    KeyType::BranchMetadata,
+                )
+                .await
+                .expect("store succeeds");
+            keys.push(key);
+        }
+        keys
+    }
+
+    /// Run the background timer's flush for every group's bucket 0, and nothing else. At level 1
+    /// that is the only addressable bucket.
+    async fn run_delayed_flush(store: &Arc<LocalMutableStore>) {
+        let weak = Arc::downgrade(store);
+        for group_index in 0..GROUP_COUNT {
+            LocalMutableStore::flush_delayed(weak.clone(), group_index, 0, 0)
+                .await
+                .expect("delayed flush joins");
+        }
+    }
+
+    /// Every `level` marker under a store's index directory.
+    fn level_markers(index_root: &Path) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        let Ok(groups) = std::fs::read_dir(index_root) else {
+            return found;
+        };
+        for group in groups.flatten() {
+            let marker = group.path().join(crate::local::fan_out::MARKER_FILENAME);
+            if marker.exists() {
+                found.push(marker);
+            }
+        }
+        found
+    }
+
+    /// The mutable twin of the immutable store's regression: a group persisted only by the
+    /// delayed flush must be reopened at the level it was written at. Left marker-less, a level-1
+    /// group is read back as a pre-fan-out 256-bucket layout and everything in `index_00` moves
+    /// out of reach — here that is branch heads and revision metadata.
+    ///
+    /// Reachable when a sub-256 store is given a non-zero flush delay. The client's level-1
+    /// default sets the delay to 0, which stops `mark_dirty` spawning the task, and the server
+    /// runs the delayed flush with groups at 256, where a missing marker reads back correctly;
+    /// this pins the invariant rather than leaving it to those defaults.
+    #[tokio::test]
+    async fn a_group_the_delayed_flush_persisted_reopens_at_its_written_level() {
+        use crate::mutable_store::MutableStore;
+        let dir = crate::test_util::TempDir::new("ms_delayed_level_");
+        let partition = Partition::default();
+        let index_root = dir.path().join("mutable").join("index");
+
+        let keys = {
+            let store = Arc::new(
+                LocalMutableStore::new(
+                    Some(dir.path()),
+                    client_settings(),
+                    make_in_memory_immutable().await,
+                )
+                .await
+                .expect("store opens"),
+            );
+            assert_eq!(
+                store.group[0].bucket_count.load(atomic::Ordering::Relaxed),
+                1,
+                "a client store starts its groups at level 1"
+            );
+
+            let keys = store_keys(&store, partition, 32).await;
+            // Persist the way the background timer does, and nothing else: no `flush`, so the
+            // two-phase commit that would write the markers never runs.
+            run_delayed_flush(&store).await;
+            keys
+        };
+
+        let mut checked = 0;
+        for group in std::fs::read_dir(&index_root)
+            .expect("index dir exists")
+            .flatten()
+        {
+            let has_bucket = std::fs::read_dir(group.path())
+                .expect("group dir")
+                .flatten()
+                .any(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.starts_with("index_"))
+                });
+            if !has_bucket {
+                continue;
+            }
+            checked += 1;
+            assert_eq!(
+                crate::local::fan_out::read_level_marker(&group.path())
+                    .await
+                    .expect("marker readable"),
+                Some(1),
+                "group {} must record the level its bucket files were written at",
+                group.path().display()
+            );
+        }
+        assert!(
+            checked > 0,
+            "the delayed flush has to have written something"
+        );
+
+        let store = Arc::new(
+            LocalMutableStore::new(
+                Some(dir.path()),
+                client_settings(),
+                make_in_memory_immutable().await,
+            )
+            .await
+            .expect("store reopens"),
+        );
+        let dyn_store: Arc<dyn MutableStore> = store.clone();
+        for (index, key) in keys.iter().enumerate() {
+            assert_eq!(
+                store.group[key.data()[0] as usize]
+                    .bucket_count
+                    .load(atomic::Ordering::Relaxed),
+                1,
+                "group for {key} reopened at the wrong level"
+            );
+            let loaded = dyn_store
+                .clone()
+                .load(partition, *key, KeyType::BranchMetadata)
+                .await
+                .unwrap_or_else(|err| {
+                    panic!("{key} was stored and persisted but reads back as {err:?}")
+                });
+            assert_eq!(loaded, Hash::from_u64(index as u64 + 1));
+        }
+    }
+
+    /// A store at the flat 256-bucket layout — every legacy store, and every server store —
+    /// gains no markers: such a group already reads back at the level it was written at.
+    #[tokio::test]
+    async fn a_flat_layout_store_gains_no_level_markers() {
+        use crate::mutable_store::MutableStore;
+        let dir = crate::test_util::TempDir::new("ms_flat_level_");
+        let partition = Partition::default();
+        let index_root = dir.path().join("mutable").join("index");
+        let settings = || MutableStoreSettings {
+            initial_fan_out_level: crate::local::fan_out::FAN_OUT_LEVEL_MAX,
+            ..Default::default()
+        };
+
+        let keys = {
+            let store = Arc::new(
+                LocalMutableStore::new(
+                    Some(dir.path()),
+                    settings(),
+                    make_in_memory_immutable().await,
+                )
+                .await
+                .expect("store opens"),
+            );
+            assert_eq!(
+                store.group[0].bucket_count.load(atomic::Ordering::Relaxed),
+                BUCKET_COUNT,
+                "this store starts at the flat layout"
+            );
+
+            let keys = store_keys(&store, partition, 32).await;
+            // Bucket 0xAB is where these keys live at 256, so flush that one.
+            let weak = Arc::downgrade(&store);
+            for group_index in 0..GROUP_COUNT {
+                LocalMutableStore::flush_delayed(weak.clone(), group_index, 0xAB, 0)
+                    .await
+                    .expect("delayed flush joins");
+            }
+            keys
+        };
+
+        assert_eq!(
+            level_markers(&index_root),
+            Vec::<PathBuf>::new(),
+            "a group already at 256 reads back at 256 without a marker"
+        );
+
+        let store = Arc::new(
+            LocalMutableStore::new(
+                Some(dir.path()),
+                settings(),
+                make_in_memory_immutable().await,
+            )
+            .await
+            .expect("store reopens"),
+        );
+        let dyn_store: Arc<dyn MutableStore> = store.clone();
+        for (index, key) in keys.iter().enumerate() {
+            assert_eq!(
+                store.group[key.data()[0] as usize]
+                    .bucket_count
+                    .load(atomic::Ordering::Relaxed),
+                BUCKET_COUNT,
+                "group for {key} reopened at the wrong level"
+            );
+            let loaded = dyn_store
+                .clone()
+                .load(partition, *key, KeyType::BranchMetadata)
+                .await
+                .unwrap_or_else(|err| panic!("{key} reads back as {err:?}"));
+            assert_eq!(loaded, Hash::from_u64(index as u64 + 1));
+        }
+    }
+
+    /// A group that already carries a marker keeps the level it records: the initial-level write
+    /// is for groups that have never had one, and must not overwrite a committed level.
+    #[tokio::test]
+    async fn a_marked_group_keeps_the_level_it_recorded() {
+        use crate::mutable_store::MutableStore;
+        let dir = crate::test_util::TempDir::new("ms_marked_level_");
+        let partition = Partition::default();
+        let index_root = dir.path().join("mutable").join("index");
+
+        {
+            let store = Arc::new(
+                LocalMutableStore::new(
+                    Some(dir.path()),
+                    client_settings(),
+                    make_in_memory_immutable().await,
+                )
+                .await
+                .expect("store opens"),
+            );
+            let _ = store_keys(&store, partition, 8).await;
+            let dyn_store: Arc<dyn MutableStore> = store.clone();
+            // A real flush commits the level through the two-phase path.
+            dyn_store.flush(false).await.expect("flush succeeds");
+        }
+
+        let before: Vec<(PathBuf, Vec<u8>)> = level_markers(&index_root)
+            .into_iter()
+            .map(|path| {
+                let bytes = std::fs::read(&path).expect("marker readable");
+                (path, bytes)
+            })
+            .collect();
+        assert!(
+            !before.is_empty(),
+            "the flush has to have committed a level"
+        );
+
+        {
+            let store = Arc::new(
+                LocalMutableStore::new(
+                    Some(dir.path()),
+                    client_settings(),
+                    make_in_memory_immutable().await,
+                )
+                .await
+                .expect("store reopens"),
+            );
+            let _ = store_keys(&store, partition, 16).await;
+            run_delayed_flush(&store).await;
+        }
+
+        for (path, bytes) in before {
+            assert_eq!(
+                std::fs::read(&path).expect("marker still readable"),
+                bytes,
+                "marker at {} was rewritten",
+                path.display()
+            );
+        }
     }
 
     #[test]

@@ -23,10 +23,11 @@ use clap::Parser;
 use lore_base::lore_spawn;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::runtime::LoreTaskLifecycleEvent;
-use lore_base::runtime::LoreTaskSpawnLocation;
+use lore_base::runtime::LoreTaskSpawn;
+use lore_base::runtime::TaskLifecycleObserver;
 use lore_base::runtime::runtime;
 use lore_base::runtime::runtime_with_settings;
-use lore_base::runtime::set_task_lifecycle_callback;
+use lore_base::runtime::set_task_lifecycle_observer;
 use lore_base::version::LORE_LIBRARY_VERSION;
 use lore_revision::cluster::topology::Topology;
 use lore_revision::environment::EnvironmentConfig;
@@ -44,12 +45,17 @@ use lore_storage::hash::StringHash;
 use lore_storage::local::immutable_store::ImmutableStoreCreateOptions;
 use lore_telemetry::execution_state::ServerExecutionState;
 use lore_telemetry::user_agent_filter::UserAgentFilter;
-use lore_transport::grpc::set_user_agent;
+use lore_transport::make_user_agent_with_component;
 use lore_transport::quic::client;
 use lore_transport::quic::client::ClientCerts;
+use lore_transport::quic::client::STREAM_COUNT;
 use lore_transport::quic::client::ServiceClient;
 use lore_transport::quic::storage_service::client::StorageClient;
+use lore_transport::set_fallback_user_agent_product;
+use lore_transport::user_agent_product;
 use opentelemetry::KeyValue;
+use opentelemetry::metrics::Counter;
+use opentelemetry::metrics::UpDownCounter;
 use opentelemetry_sdk::resource::ResourceDetector;
 use rustls::server::NoClientAuth;
 use tokio::runtime::Handle;
@@ -64,8 +70,11 @@ use tracing::warn;
 
 use crate::auth::jwk::JwkServiceImpl;
 use crate::auth::jwt::JwtVerifier;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::authnz::repository_catalog::RepositoryCatalog;
 use crate::grpc::GrpcInternalServerBuilder;
 use crate::grpc::GrpcServerBuilder;
+use crate::grpc::GrpcTimeouts;
 use crate::grpc::forwarded_requests::ForwardedRequests;
 use crate::grpc::forwarded_requests::GrpcForwardedRequests;
 use crate::grpc::notification_service::NotificationService;
@@ -93,20 +102,24 @@ use crate::quic::replication_store_service::client_container;
 use crate::quic::replication_store_service::client_container::ClientContainerConfig;
 use crate::quic::replication_store_service::server::ReplicationStoreService;
 use crate::quic::storage_service::StorageService;
+use crate::quic::stream_handler::AdmissionLimits;
 use crate::quic::stream_handler::StreamHandler;
 use crate::server_config::ServerConfig;
 use crate::settings::CompositeStoreSettings;
 use crate::settings::CompositeSubStoreSettings;
 use crate::settings::GrpcSettings;
 use crate::settings::HttpSettings;
+use crate::settings::ImmutableStoreSettings;
 use crate::settings::LocalImmutableStoreSettings;
 use crate::settings::LocalMutableStoreSettings;
+use crate::settings::MutableStoreSettings;
 use crate::settings::NotificationSettings;
 use crate::settings::QuicSettings;
 use crate::settings::RemoteStoreSettings;
 use crate::settings::ReplicatedStoreSettings;
 use crate::settings::ReplicationMode;
 use crate::settings::Settings;
+use crate::settings::default_authorization_timeout_seconds;
 use crate::store::replica_factory::ReplicationStoreTargetFactory;
 use crate::store::replicated_store::ReplicatedStore;
 use crate::store::resolve_plugin_config_with_fallback;
@@ -123,6 +136,8 @@ mod store_mode {
     pub const REMOTE: &str = "remote";
     pub const COMPOSITE: &str = "composite";
     pub const REPLICATED: &str = "replicated";
+    /// Build no store. `[lock_store]` only.
+    pub const NONE: &str = "none";
 }
 
 /// Command-line options for the Lore server binary.
@@ -171,7 +186,7 @@ pub struct Cli {
 /// lore_server::server::server_main(ServerConfig::default()).unwrap();
 /// ```
 pub fn server_main(config: ServerConfig) -> Result<()> {
-    set_user_agent(format!("lore-server/{}", LORE_LIBRARY_VERSION.as_str()));
+    set_fallback_user_agent_product("lore-server".to_string());
     assume_server_policies();
 
     let cli = Cli::parse();
@@ -340,6 +355,14 @@ impl From<QuicSettings> for QuinnConfigBuilder {
     }
 }
 
+/// Requests a connection may hold in handling, defaulting to the capacity of its streams' pools.
+fn connection_inflight_limit(settings: &QuicSettings, process_limit: usize) -> usize {
+    settings.connection_inflight_limit.unwrap_or_else(|| {
+        let streams = settings.max_bidi_streams.unwrap_or(STREAM_COUNT as u64);
+        process_limit.saturating_mul(streams as usize)
+    })
+}
+
 async fn launch_quinn_server(
     name: &'static str,
     stream_handler_factory: Box<dyn StreamHandlerFactory>,
@@ -403,7 +426,7 @@ async fn launch_quinn_server(
 /// compiled with. Reported through the `ServerInfo` RPC so clients and tests
 /// can detect capabilities that are only present in some builds (for example
 /// `failure_generator`, which enables fault-injection used by smoke tests).
-fn compiled_features() -> Vec<String> {
+pub fn compiled_features() -> Vec<String> {
     let mut features = Vec::new();
     if cfg!(feature = "failure_generator") {
         features.push("failure_generator".to_string());
@@ -424,6 +447,8 @@ async fn launch_grpc_server(
     mutable_store: Arc<dyn MutableStore>,
     lock_store: Option<Arc<dyn LockStore>>,
     jwt_verifier: Option<JwtVerifier>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
+    repository_catalog: Arc<dyn RepositoryCatalog>,
     settings: Settings,
     notification_sender: Arc<dyn NotificationSender>,
     notification_service: Option<NotificationService>,
@@ -442,11 +467,13 @@ async fn launch_grpc_server(
     let addr =
         SocketAddr::from_str(format!("{}:{}", grpc_settings.host, grpc_settings.port).as_str())?;
 
+    let locks = lock_store.is_some() && service_settings.lock_service.enabled;
+
     info!(
         "Starting Lore GRPC Server: {}, Auth: {} Locks: {}",
         &addr,
         jwt_verifier.as_ref().map_or("disabled", |_| "enabled"),
-        lock_store.as_ref().map_or("disabled", |_| "enabled"),
+        if locks { "enabled" } else { "disabled" },
     );
 
     // The settings map has no relevant entries to surface yet, so it stays empty.
@@ -498,12 +525,15 @@ async fn launch_grpc_server(
             grpc_settings
                 .http2_keepalive_timeout_seconds
                 .map(Duration::from_secs),
-            Duration::from_secs(grpc_settings.request_handler_timeout_seconds),
+            GrpcTimeouts {
+                request_handler: Duration::from_secs(grpc_settings.request_handler_timeout_seconds),
+                authorization: Duration::from_secs(grpc_settings.authorization_timeout_seconds),
+            },
             service_settings,
             user_agent_filter,
             forwarded_requests,
         )
-        .with_jwt_verifier(jwt_verifier)?
+        .with_jwt_verifier(jwt_verifier, repository_authorizer, repository_catalog)?
         .serve(addr, async move {
             let _ = shutdown_rx.wait_for(|&v| v).await;
         })
@@ -568,6 +598,8 @@ async fn launch_grpc_internal_server(
     mutable_store: Arc<dyn MutableStore>,
     notification_sender: Arc<dyn NotificationSender>,
     hook_dispatcher: Arc<HookDispatcher>,
+    jwt_verifier: Option<JwtVerifier>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let grpc_settings = settings
@@ -603,6 +635,8 @@ async fn launch_grpc_internal_server(
             notification_sender,
             hook_dispatcher,
             settings.environment.clone().unwrap_or_default(),
+            jwt_verifier,
+            repository_authorizer,
         )?
         .with_tls_config(cert_path, key_path, cert_chain_path)?
         .with_http2_config(
@@ -653,6 +687,7 @@ async fn launch_http_server(
     immutable_store: Arc<dyn ImmutableStore>,
     mutable_store: Arc<dyn MutableStore>,
     jwt_verifier: Option<JwtVerifier>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     LoreHttpServer::serve(
@@ -660,6 +695,7 @@ async fn launch_http_server(
         immutable_store,
         mutable_store,
         jwt_verifier,
+        repository_authorizer,
         async move {
             let _ = shutdown_rx.wait_for(|&v| v).await;
         },
@@ -723,8 +759,9 @@ impl QuicPublicStreamHandler {
         local_store: Arc<dyn ImmutableStore>,
         mutable_store: Arc<dyn MutableStore>,
         jwt_verifier: Option<JwtVerifier>,
-        process_limit: usize,
-        handler_duration_timeout: Option<Duration>,
+        repository_authorizer: Arc<dyn RepositoryAuthorizer>,
+        limits: AdmissionLimits,
+        user_agent_filter: Arc<UserAgentFilter>,
     ) -> Self {
         let mut service_store = ServiceStore::default();
 
@@ -732,10 +769,12 @@ impl QuicPublicStreamHandler {
             |immutable_store: Arc<dyn ImmutableStore>,
              local_store: Arc<dyn ImmutableStore>,
              mutable_store: Arc<dyn MutableStore>,
-             jwt_verifier: Option<JwtVerifier>| {
+             jwt_verifier: Option<JwtVerifier>,
+             repository_authorizer: Arc<dyn RepositoryAuthorizer>| {
                 Box::new(move |context: Arc<AttributeMap>| {
                     let storage_protocol = StorageService::new(
                         Arc::new(jwt_verifier.clone()),
+                        repository_authorizer.clone(),
                         immutable_store.clone(),
                         local_store.clone(),
                         mutable_store.clone(),
@@ -743,8 +782,7 @@ impl QuicPublicStreamHandler {
                     Box::new(StreamHandler::new(
                         Arc::new(storage_protocol),
                         context,
-                        process_limit,
-                        handler_duration_timeout,
+                        limits,
                     )) as Box<dyn StreamDataHandler>
                 }) as StreamDataHandlerBuilder
             };
@@ -756,6 +794,7 @@ impl QuicPublicStreamHandler {
                 local_store.clone(),
                 mutable_store.clone(),
                 jwt_verifier.clone(),
+                repository_authorizer.clone(),
             ),
         );
         {
@@ -763,21 +802,21 @@ impl QuicPublicStreamHandler {
             let local_store = local_store.clone();
             let mutable_store = mutable_store.clone();
             let jwt_verifier = jwt_verifier.clone();
+            let repository_authorizer = repository_authorizer.clone();
+            let user_agent_filter = user_agent_filter.clone();
             service_store.add_service(
                 StorageClient::ALPN,
                 Box::new(move |context: Arc<AttributeMap>| {
                     let v4_service = crate::quic::storage_service_v4::StorageServiceV4::new(
                         Arc::new(jwt_verifier.clone()),
+                        repository_authorizer.clone(),
                         immutable_store.clone(),
                         local_store.clone(),
                         mutable_store.clone(),
+                        user_agent_filter.clone(),
                     );
-                    Box::new(StreamHandler::new(
-                        Arc::new(v4_service),
-                        context,
-                        process_limit,
-                        handler_duration_timeout,
-                    )) as Box<dyn StreamDataHandler>
+                    Box::new(StreamHandler::new(Arc::new(v4_service), context, limits))
+                        as Box<dyn StreamDataHandler>
                 }) as StreamDataHandlerBuilder,
             );
         }
@@ -810,22 +849,20 @@ impl QuicInternalStreamHandler {
     fn new(
         immutable_store: Arc<dyn ImmutableStore>,
         local_store: Arc<dyn ImmutableStore>,
-        process_limit: usize,
-        handler_duration_timeout: Option<Duration>,
+        limits: AdmissionLimits,
+        user_agent_filter: Arc<UserAgentFilter>,
     ) -> Self {
         let mut service_store = ServiceStore::default();
         {
             service_store.add_service(
                 ReplicationStoreClient::ALPN,
                 Box::new(move |context: Arc<AttributeMap>| {
-                    let protocol =
-                        ReplicationStoreService::new(immutable_store.clone(), local_store.clone());
-                    Box::new(StreamHandler::new(
-                        Arc::new(protocol),
-                        context,
-                        process_limit,
-                        handler_duration_timeout,
-                    ))
+                    let protocol = ReplicationStoreService::new(
+                        immutable_store.clone(),
+                        local_store.clone(),
+                        user_agent_filter.clone(),
+                    );
+                    Box::new(StreamHandler::new(Arc::new(protocol), context, limits))
                 }),
             );
         }
@@ -961,6 +998,12 @@ fn configure_lock_store_via_plugin(
     if let Some(lock_settings) = &settings.lock_store {
         let mode = &lock_settings.mode;
 
+        // The only way to opt out of a store `default.toml` sets.
+        if mode == store_mode::NONE {
+            info!("No lock store configured, LockService will not register");
+            return Ok(None);
+        }
+
         if mode == store_mode::LOCAL {
             info!("Creating local (in-memory) lock store");
             let store = crate::lock::store::LocalLockStore::default();
@@ -993,34 +1036,203 @@ fn local_store() -> Option<Arc<dyn ImmutableStore>> {
 /// Directory under the system temporary directory where the server keeps
 /// zero-config artifacts (local stores and ephemeral certificates) when no
 /// explicit locations are configured.
+///
+/// `std::env::temp_dir` hands back `TMPDIR` as it stands, which an empty one
+/// makes a relative directory, so the result is resolved against the process
+/// working directory.
 fn local_data_dir() -> PathBuf {
-    std::env::temp_dir().join("lore-server")
+    let dir = std::env::temp_dir().join("lore-server");
+
+    std::path::absolute(&dir).unwrap_or(dir)
 }
 
-/// Resolve the configured local store path, falling back to a directory under
-/// the system temporary directory when none was provided.
+/// Whether the configuration names a local store path.
+fn is_path_configured(configured: &str) -> bool {
+    !configured.trim().is_empty()
+}
+
+/// Where the local store lives, falling back to a directory under the system
+/// temporary directory when the configuration names none.
 ///
-/// The resolved path is logged so operators can see where on-disk state lives.
-/// When no path was configured, the generated temporary path is logged as a
-/// prominent warning because that location is ephemeral and not persisted
-/// across reboots.
-fn resolve_local_store_path(configured: &str, store_label: &str) -> PathBuf {
-    if configured.trim().is_empty() {
-        let path = local_data_dir();
-        warn!(
-            store = store_label,
-            path = %path.display(),
-            "No local store path configured for the '{}' store; generated a path under the system \
-             temporary directory: {}. This data is EPHEMERAL and not persisted across reboots — \
-             configure an explicit path for production.",
-            store_label,
-            path.display(),
-        );
-        path
-    } else {
-        let path = PathBuf::from(configured);
-        info!(store = store_label, path = %path.display(), "Using configured local store path");
-        path
+/// A relative path is resolved against the process working directory, where the
+/// storage layer creates it. The `disallowed_methods` fence on
+/// `std::env::current_dir` guards library calls carrying a caller's directory;
+/// this is the server resolving its own configuration. Resolution is lexical,
+/// so the location is classified before the directory exists.
+fn local_store_path(configured: &str) -> PathBuf {
+    if !is_path_configured(configured) {
+        return local_data_dir();
+    }
+
+    let path = PathBuf::from(configured);
+
+    std::path::absolute(&path).unwrap_or(path)
+}
+
+/// A local store the configuration asks for.
+struct LocalStoreLocation {
+    /// Names the store in the log.
+    label: &'static str,
+    /// Where the store lands.
+    path: PathBuf,
+    /// Whether the configuration named the path.
+    configured: bool,
+    /// Whether the server writes at this path.
+    reaches_disk: bool,
+}
+
+/// Marks which immutable tiers are written at.
+///
+/// Every local tier is handed the store the first one creates, so a tier naming
+/// another path has nothing written at the path it names, and one naming the
+/// same path shares the store standing there.
+fn mark_shared_immutable_tiers(tiers: &mut [LocalStoreLocation]) {
+    let Some((created, shared)) = tiers.split_first_mut() else {
+        return;
+    };
+
+    for tier in shared {
+        tier.reaches_disk = tier.path == created.path;
+    }
+}
+
+/// Adds the local store `mode` names, if it names one.
+fn push_local_store(
+    stores: &mut Vec<LocalStoreLocation>,
+    label: &'static str,
+    mode: &str,
+    configured: Option<&str>,
+) {
+    if mode == store_mode::LOCAL
+        && let Some(configured) = configured
+    {
+        stores.push(LocalStoreLocation {
+            label,
+            path: local_store_path(configured),
+            configured: is_path_configured(configured),
+            reaches_disk: true,
+        });
+    }
+}
+
+/// Every local store the configuration asks for, in the order the server builds
+/// them.
+///
+/// The process holds one local immutable store, in `LOCAL_STORE`, which the
+/// first tier configured as local creates and every later local tier is handed;
+/// see [`mark_shared_immutable_tiers`]. Composite tiers are built in the order
+/// local, durable, replicas. The local mutable store is separate, at its own
+/// path.
+///
+/// A remote or replicated store writes to no local path, so a `[local]` block
+/// left in its configuration is not listed.
+fn local_store_locations(
+    immutable: &ImmutableStoreSettings,
+    mutable: &MutableStoreSettings,
+) -> Vec<LocalStoreLocation> {
+    let mut stores = Vec::new();
+
+    push_local_store(
+        &mut stores,
+        "immutable",
+        &immutable.mode,
+        immutable.local.as_ref().map(|local| local.path.as_str()),
+    );
+
+    if immutable.mode == store_mode::COMPOSITE
+        && let Some(composite) = immutable.composite.as_ref()
+    {
+        let tiers = std::iter::once(("immutable composite local", &composite.local))
+            .chain(
+                composite
+                    .durable
+                    .as_ref()
+                    .map(|tier| ("immutable composite durable", tier)),
+            )
+            .chain(
+                composite
+                    .replica
+                    .iter()
+                    .flatten()
+                    .map(|tier| ("immutable composite replica", tier)),
+            );
+
+        for (label, tier) in tiers {
+            push_local_store(
+                &mut stores,
+                label,
+                &tier.mode,
+                tier.local.as_ref().map(|local| local.path.as_str()),
+            );
+        }
+    }
+
+    mark_shared_immutable_tiers(&mut stores);
+
+    push_local_store(
+        &mut stores,
+        "mutable",
+        &mutable.mode,
+        mutable.local.as_ref().map(|local| local.path.as_str()),
+    );
+
+    stores
+}
+
+/// The store paths the disk space monitor watches.
+fn monitored_local_store_paths(stores: Vec<LocalStoreLocation>) -> Vec<PathBuf> {
+    stores
+        .into_iter()
+        .filter(|store| store.reaches_disk)
+        .map(|store| store.path)
+        .collect()
+}
+
+/// Reports where every local store lands.
+///
+/// A store nothing is written at draws that alone: where the path points says
+/// nothing an operator can act on. The remaining two conditions are independent,
+/// since either can hold without the other: a path the configuration does not
+/// name, and a path inside a system temporary directory.
+fn report_local_store_locations(stores: &[LocalStoreLocation]) {
+    for store in stores {
+        if !store.reaches_disk {
+            warn!(
+                store = store.label,
+                path = %store.path.display(),
+                "The '{}' local store names {}, but every local immutable tier is handed the \
+                 store the first one creates, so nothing is written there. Remove the path, or \
+                 make this the first local tier.",
+                store.label,
+                store.path.display(),
+            );
+            continue;
+        }
+
+        if store.configured {
+            info!(store = store.label, path = %store.path.display(), "Using configured local store path");
+        } else {
+            warn!(
+                store = store.label,
+                path = %store.path.display(),
+                "No local store path is configured for the '{}' store, so the server generated {}. \
+                 Configure an explicit path for production.",
+                store.label,
+                store.path.display(),
+            );
+        }
+
+        if crate::util::local_store_monitor::is_temporary_path(&store.path) {
+            warn!(
+                store = store.label,
+                path = %store.path.display(),
+                "The '{}' local store is at {}, inside a system temporary directory. This data is \
+                 EPHEMERAL and not persisted across reboots. Configure a persistent location for \
+                 production.",
+                store.label,
+                store.path.display(),
+            );
+        }
     }
 }
 
@@ -1090,7 +1302,7 @@ async fn create_local_store(
     flush_background: bool,
 ) -> Result<Arc<dyn ImmutableStore>> {
     let default_settings = lore_storage::local::immutable_store::ImmutableStoreSettings::default();
-    let store_path = resolve_local_store_path(&settings.path, "immutable");
+    let store_path = local_store_path(&settings.path);
 
     let options = ImmutableStoreCreateOptions {
         max_capacity: settings.max_capacity,
@@ -1108,7 +1320,6 @@ async fn create_local_store(
         options,
         true,  /* Server mode, deserialize all buckets immediately */
         lore_storage::local::immutable_store::ImmutableStoreSettings {
-            allow_partial_fragment: false, /* Server mode, partial fragments not allowed */
             protect_local_fragment: false, /* Server mode, no need to try protect local fragments from eviction */
             implicit_durable_stored: true, /* Server mode, consider all fragments as durably stored */
             isolate_partitions: true, /* Server mode, one process holds content for every tenant */
@@ -1118,7 +1329,7 @@ async fn create_local_store(
             target_size_percentage: settings.target_size_percentage.unwrap_or(default_settings.target_size_percentage),
             compaction_parallel_groups: settings.compaction_parallel_groups.unwrap_or(default_settings.compaction_parallel_groups),
             verify_write: false,
-            atime: false,
+            atime: true,
             initial_fan_out_level: lore_storage::local::fan_out::FAN_OUT_LEVEL_MAX, /* Server mode, full 256-bucket layout from the start */
             fan_out_threshold: lore_storage::local::fan_out::FAN_OUT_THRESHOLD_DEFAULT,
         },
@@ -1156,7 +1367,7 @@ async fn configure_local_mutable_store(
 ) -> Result<Arc<dyn MutableStore>> {
     info!("Wiring up local mutable store");
 
-    let store_path = resolve_local_store_path(&settings.path, "mutable");
+    let store_path = local_store_path(&settings.path);
 
     Ok(lore_storage::local::mutable_store::create(
         Some(store_path.as_path()),
@@ -1224,6 +1435,10 @@ async fn configure_replicated_immutable_store(
     if let Some(expected_rtt_ms) = settings.expected_rtt_ms {
         factory.transport_config.expected_rtt_ms = expected_rtt_ms;
     }
+    factory.user_agent = Some(make_user_agent_with_component(
+        user_agent_product(),
+        "replicated-immutable-store",
+    ));
 
     let container_config = ClientContainerConfig {
         regenerate_retry_policy: (&settings.regenerate_retry).into(),
@@ -1420,6 +1635,7 @@ async fn configure_composite_substore(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn configure_notification(
     endpoints: &mut JoinSet<Result<()>>,
     registry: &PluginRegistry,
@@ -1427,6 +1643,8 @@ async fn configure_notification(
     notification_settings: &Option<NotificationSettings>,
     immutable_store: Option<&Arc<dyn ImmutableStore>>,
     plugins: &HashMap<String, toml::Value>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
+    authorization_timeout: Duration,
 ) -> Result<(Arc<dyn NotificationSender>, Option<NotificationService>)> {
     let mode = notification_settings
         .as_ref()
@@ -1435,7 +1653,14 @@ async fn configure_notification(
         "local" => {
             info!("Starting local notification service");
             let sender = Arc::new(crate::notification::local::NotificationSender::default());
-            Ok((sender.clone(), Some(NotificationService::new(sender))))
+            Ok((
+                sender.clone(),
+                Some(NotificationService::new(
+                    sender,
+                    repository_authorizer,
+                    authorization_timeout,
+                )),
+            ))
         }
         plugin_name => {
             info!(plugin_name = plugin_name, "Creating notification plugin");
@@ -1566,48 +1791,56 @@ async fn seed_local_store(settings: &LocalImmutableStoreSettings) -> Result<(), 
     }
 }
 
-fn observe_task_lifecycles() {
-    let meter = lore_telemetry::meter("lore.runtime");
-    let spawned_tasks = meter
-        .u64_counter("lore.runtime.tasks.spawned.total")
-        .build();
-    let inflight_tasks = meter
-        .i64_up_down_counter("lore.runtime.tasks.running.total")
-        .build();
+/// Counts spawned and in-flight tasks, attributed to where each task was spawned.
+struct TaskLifecycleMetrics {
+    spawned_tasks: Counter<u64>,
+    inflight_tasks: UpDownCounter<i64>,
+}
 
-    let callback = move |event: LoreTaskLifecycleEvent, spawn_location: &LoreTaskSpawnLocation| {
-        let context_label = if let Some(context) = lore_revision::runtime::try_execution_context() {
-            if let Some(lore_state) = context
-                .caller_state()
-                .cloned()
-                .and_then(|any| ::std::sync::Arc::downcast::<ServerExecutionState>(any).ok())
-            {
-                lore_state.context_label
-            } else {
-                "<no server state>"
-            }
-        } else {
-            "<no context>"
+impl TaskLifecycleObserver for TaskLifecycleMetrics {
+    fn context_label(&self) -> &'static str {
+        let Some(context) = lore_revision::runtime::try_execution_context() else {
+            return "<no context>";
         };
 
+        context
+            .caller_state()
+            .cloned()
+            .and_then(|any| Arc::downcast::<ServerExecutionState>(any).ok())
+            .map_or("<no server state>", |state| state.context_label)
+    }
+
+    fn on_event(&self, event: LoreTaskLifecycleEvent, spawn: &LoreTaskSpawn) {
         let labels = [
-            KeyValue::new("context_label", context_label),
-            KeyValue::new("spawn_file", spawn_location.file),
-            KeyValue::new("spawn_line_number", spawn_location.line as i64),
+            KeyValue::new("context_label", spawn.context_label),
+            KeyValue::new("spawn_file", spawn.file),
+            KeyValue::new("spawn_line_number", spawn.line as i64),
         ];
 
         match event {
             LoreTaskLifecycleEvent::Started => {
-                spawned_tasks.add(1, &labels);
-                inflight_tasks.add(1, &labels);
+                self.spawned_tasks.add(1, &labels);
+                self.inflight_tasks.add(1, &labels);
             }
             LoreTaskLifecycleEvent::Completed | LoreTaskLifecycleEvent::Dropped => {
-                inflight_tasks.add(-1, &labels);
+                self.inflight_tasks.add(-1, &labels);
             }
         }
+    }
+}
+
+fn observe_task_lifecycles() {
+    let meter = lore_telemetry::meter("lore.runtime");
+    let observer = TaskLifecycleMetrics {
+        spawned_tasks: meter
+            .u64_counter("lore.runtime.tasks.spawned.total")
+            .build(),
+        inflight_tasks: meter
+            .i64_up_down_counter("lore.runtime.tasks.running.total")
+            .build(),
     };
 
-    if !set_task_lifecycle_callback(Box::new(callback)) {
+    if !set_task_lifecycle_observer(Box::new(observer)) {
         error!("Failed to set task events callback");
     }
 }
@@ -1726,6 +1959,9 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         plugin_registry.list_notification_plugins(),
     );
 
+    let local_stores = local_store_locations(&settings.immutable_store, &settings.mutable_store);
+    report_local_store_locations(&local_stores);
+
     #[cfg(feature = "seeding")]
     {
         let mode = &settings.immutable_store.mode;
@@ -1786,6 +2022,11 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         configure_mutable_store_via_plugin(&plugin_registry, &settings, immutable_store.clone())
             .await?;
 
+    crate::util::local_store_monitor::start_local_store_monitor(
+        monitored_local_store_paths(local_stores),
+        &settings.server.local_store_monitor,
+    );
+
     let lock_store = configure_lock_store_via_plugin(&plugin_registry, &settings)?;
 
     let connection_close_timeout =
@@ -1801,33 +2042,50 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     };
 
     let jwt_verifier = match settings.server.auth.as_ref() {
-        Some(auth) => match auth.jwk.as_ref() {
-            Some(jwk) => {
-                let jwk_service = JwkServiceImpl::new(jwk.clone());
-                jwk_service
-                    .fetch_new_keys(None /* fetch all keys */)
-                    .await?;
-                let jwt_verifier = JwtVerifier {
-                    jwk_service: Arc::new(jwk_service),
-                    jwt_issuer: auth.jwt_issuer.clone(),
-                    jwt_audience: auth.jwt_audience.clone(),
-                };
-                Some(jwt_verifier)
-            }
-            None => None,
-        },
+        Some(auth) => {
+            let jwk = auth.jwk.clone().unwrap_or_default();
+            let jwk_service = JwkServiceImpl::with_issuers(jwk, Some(&auth.jwt_issuer))?;
+            jwk_service
+                .fetch_new_keys(None /* fetch all keys */)
+                .await?;
+            Some(JwtVerifier {
+                jwk_service: Arc::new(jwk_service),
+                jwt_issuer: Some(auth.jwt_issuer.clone()),
+                jwt_audience: Some(auth.jwt_audience.clone()),
+                jwt_typ: auth.jwt_typ.clone(),
+                identity_claim: auth.identity_claim.clone(),
+            })
+        }
         None => None,
     };
 
-    let forwarded_requests: Option<Arc<dyn ForwardedRequests>> = if let Some(grpc_public_services) =
-        &settings.server.grpc_public_services
-        && let Some(forwarded_requests_settings) = &grpc_public_services.forwarded_requests
-    {
-        let factory = GrpcForwardedRequests::new(forwarded_requests_settings).await?;
-        Some(Arc::new(factory))
-    } else {
-        None
-    };
+    // One shared authorizer, selected by the configuration (D8's four-way
+    // flowchart), threaded into the gRPC, QUIC and HTTP servers.
+    let auth_url = settings
+        .environment
+        .as_ref()
+        .and_then(|environment| environment.endpoint.as_ref())
+        .and_then(|endpoint| endpoint.auth_url.clone());
+    let repository_authorizer = crate::authnz::repository_authorizer::repository_authorizer(
+        settings.server.auth.as_ref(),
+        auth_url.clone(),
+    )?;
+    let repository_catalog = crate::authnz::repository_catalog::repository_catalog(
+        settings.server.auth.as_ref(),
+        auth_url.as_deref(),
+        immutable_store.clone(),
+        mutable_store.clone(),
+    )?;
+
+    let forwarded_requests: Option<Arc<dyn ForwardedRequests>> =
+        if let Some(forwarded_requests_settings) =
+            &settings.server.grpc_public_services.forwarded_requests
+        {
+            let factory = GrpcForwardedRequests::new(forwarded_requests_settings).await?;
+            Some(Arc::new(factory))
+        } else {
+            None
+        };
 
     let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
     let mut endpoints = JoinSet::new();
@@ -1840,6 +2098,21 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     });
 
     if !is_maintenance {
+        // Subscribe authorizes from the request body, so its check is made in
+        // the handler rather than by the partition-access layer. It is the
+        // same kind of check either way, so it answers to the same
+        // authorization budget as that layer rather than to the longer
+        // request-handler budget. Without a gRPC endpoint the service is
+        // unreachable and the fallback is moot.
+        let notification_authorization_timeout = Duration::from_secs(
+            settings
+                .server
+                .grpc
+                .as_ref()
+                .map_or_else(default_authorization_timeout_seconds, |grpc| {
+                    grpc.authorization_timeout_seconds
+                }),
+        );
         let (notification, notification_service) = configure_notification(
             &mut endpoints,
             &plugin_registry,
@@ -1847,6 +2120,8 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             &settings.notification,
             local_store().as_ref(),
             &settings.plugins,
+            repository_authorizer.clone(),
+            notification_authorization_timeout,
         )
         .await?;
 
@@ -1871,6 +2146,8 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             let mutable_store = mutable_store.clone();
             let lock_store = lock_store.clone();
             let jwt_verifier = jwt_verifier.clone();
+            let repository_authorizer = repository_authorizer.clone();
+            let repository_catalog = repository_catalog.clone();
             let settings = settings.clone();
             let notification = notification.clone();
             let user_agent_filter = user_agent_filter.clone();
@@ -1888,6 +2165,8 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 mutable_store,
                 lock_store,
                 jwt_verifier,
+                repository_authorizer,
+                repository_catalog,
                 settings,
                 notification,
                 notification_service,
@@ -1920,6 +2199,8 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 let mutable_store = mutable_store.clone();
                 let notification_sender = notification.clone();
                 let hook_dispatcher = hook_dispatcher.clone();
+                let jwt_verifier = jwt_verifier.clone();
+                let repository_authorizer = repository_authorizer.clone();
                 let shutdown_rx = _shutdown_rx.clone();
                 launch_grpc_internal_server(
                     settings,
@@ -1928,6 +2209,8 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                     mutable_store,
                     notification_sender,
                     hook_dispatcher,
+                    jwt_verifier,
+                    repository_authorizer,
                     shutdown_rx,
                 )
             });
@@ -1968,6 +2251,8 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             let mutable_store = mutable_store.clone();
             let settings = settings.clone();
             let jwt_verifier = jwt_verifier.clone();
+            let repository_authorizer = repository_authorizer.clone();
+            let user_agent_filter = user_agent_filter.clone();
             let shutdown_rx = _shutdown_rx.clone();
 
             let quic_settings = settings
@@ -1978,9 +2263,18 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 .handler_timeout_seconds
                 .map(Duration::from_secs);
 
-            /// With 8 streams per connection this amounts to 4000 commands
-            /// being processed in parallel per connection
-            const DEFAULT_PROCESS_LIMIT: usize = 500;
+            /// With the 8 streams a connection opens this amounts to 4000 commands being
+            /// processed in parallel per connection.
+            const DEFAULT_STREAM_MESSAGE_LIMIT: usize = 500;
+            let process_limit = quic_settings
+                .stream_message_limit
+                .unwrap_or(DEFAULT_STREAM_MESSAGE_LIMIT);
+            let limits = AdmissionLimits {
+                process_limit,
+                inflight_limit: connection_inflight_limit(&quic_settings, process_limit),
+                handler_timeout: request_handler_timeout,
+                permit_timeout: quic_settings.permit_timeout_ms.map(Duration::from_millis),
+            };
 
             let local_immutable_store = local_store().unwrap_or_else(|| {
                 warn!("No local store available for public QUIC server, operations requiring local store will route to the main store");
@@ -1999,10 +2293,9 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                     local_immutable_store,
                     mutable_store,
                     jwt_verifier,
-                    quic_settings
-                        .connection_message_limit
-                        .unwrap_or(DEFAULT_PROCESS_LIMIT),
-                    request_handler_timeout,
+                    repository_authorizer,
+                    limits,
+                    user_agent_filter,
                 )),
                 frequency,
                 quic_settings,
@@ -2045,6 +2338,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             let immutable_store = immutable_store.clone();
             let settings = settings.clone();
             let shutdown_rx = _shutdown_rx.clone();
+            let user_agent_filter = user_agent_filter.clone();
 
             let quic_settings = settings
                 .server
@@ -2059,15 +2353,23 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 immutable_store.clone()
             });
 
+            let process_limit = quic_settings
+                .stream_message_limit
+                .unwrap_or(replication_store_service::DEFAULT_CLIENT_MESSAGE_LIMIT);
+            let limits = AdmissionLimits {
+                process_limit,
+                inflight_limit: connection_inflight_limit(&quic_settings, process_limit),
+                handler_timeout: request_handler_timeout,
+                permit_timeout: quic_settings.permit_timeout_ms.map(Duration::from_millis),
+            };
+
             launch_quinn_server(
                 "internal",
                 Box::new(QuicInternalStreamHandler::new(
                     immutable_store,
                     local_immutable_store,
-                    quic_settings
-                        .connection_message_limit
-                        .unwrap_or(replication_store_service::DEFAULT_CLIENT_MESSAGE_LIMIT),
-                    request_handler_timeout,
+                    limits,
+                    user_agent_filter,
                 )),
                 frequency,
                 quic_settings,
@@ -2094,6 +2396,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                     immutable_store,
                     mutable_store,
                     jwt_verifier,
+                    repository_authorizer,
                     shutdown_rx,
                 )
             );
@@ -2170,6 +2473,369 @@ fn server_log_dispatch(level: lore_base::log::LoreLogLevel, location: &str, mess
 
 #[cfg(test)]
 mod tests {
+    /// Covers where the local store ends up on disk, and whether that location
+    /// survives a reboot.
+    mod local_store_path_resolution {
+        use super::super::is_path_configured;
+        use super::super::local_data_dir;
+        use super::super::local_store_path;
+        use crate::util::local_store_monitor::is_temporary_path;
+
+        #[test]
+        fn a_path_counts_as_configured_only_when_it_names_something() {
+            assert!(is_path_configured("/srv/lore/store"));
+            assert!(!is_path_configured(""));
+            assert!(!is_path_configured("   "));
+        }
+
+        #[test]
+        fn an_unconfigured_path_falls_back_under_the_temp_dir() {
+            let path = local_store_path("");
+
+            assert_eq!(path, local_data_dir());
+            assert!(is_temporary_path(&path));
+        }
+
+        #[test]
+        fn a_blank_path_falls_back_under_the_temp_dir() {
+            assert_eq!(local_store_path("   "), local_data_dir());
+        }
+
+        /// Sourced from the temporary directory, which is absolute however the
+        /// platform spells one.
+        #[test]
+        fn a_configured_absolute_path_is_taken_as_given() {
+            let path = std::env::temp_dir().join("lore-configured-store");
+            let configured = path.to_str().expect("temporary directory path is UTF-8");
+
+            assert_eq!(local_store_path(configured), path);
+        }
+
+        /// The storage layer creates a relative path against the working
+        /// directory, so the reported location must match.
+        // The process directory is the assertion, not a carried one.
+        #[allow(clippy::disallowed_methods)]
+        #[test]
+        fn a_relative_path_is_resolved_against_the_working_directory() {
+            let current = std::env::current_dir().expect("working directory");
+
+            assert_eq!(local_store_path("store"), current.join("store"));
+        }
+
+        /// `./` is what the shipped `gha.toml` configures.
+        #[allow(clippy::disallowed_methods)]
+        #[test]
+        fn a_working_directory_path_resolves_to_the_working_directory() {
+            let current = std::env::current_dir().expect("working directory");
+
+            assert_eq!(local_store_path("./"), current);
+        }
+
+        /// Classification is lexical, so a first start decides as a later one
+        /// does.
+        #[test]
+        fn a_temporary_path_is_classified_before_it_exists() {
+            let path = std::env::temp_dir().join("lore-server-classified-before-it-exists");
+
+            assert!(!path.exists());
+            assert!(is_temporary_path(&path));
+        }
+
+        /// The shipped `local.toml` names a path under the temporary
+        /// directory, so being configured says nothing about surviving a
+        /// reboot.
+        #[test]
+        fn a_configured_temporary_path_is_configured_and_temporary() {
+            let path = std::env::temp_dir().join("lore-server");
+            let configured = path.to_str().expect("temporary directory path is UTF-8");
+
+            assert!(is_path_configured(configured));
+            assert!(is_temporary_path(&local_store_path(configured)));
+        }
+
+        #[test]
+        fn a_configured_persistent_path_is_neither() {
+            assert!(is_path_configured("/srv/lore/store"));
+            assert!(!is_temporary_path(&local_store_path("/srv/lore/store")));
+        }
+
+        /// Both conditions hold for the zero-configuration default.
+        #[test]
+        fn an_unconfigured_path_is_neither_configured_nor_persistent() {
+            assert!(!is_path_configured(""));
+            assert!(is_temporary_path(&local_store_path("")));
+        }
+    }
+
+    /// Covers which local stores are reported and given to the disk space
+    /// monitor.
+    mod local_stores {
+        use std::path::PathBuf;
+
+        use super::super::LocalStoreLocation;
+        use super::super::local_data_dir;
+        use super::super::local_store_locations;
+        use super::super::local_store_path;
+        use super::super::monitored_local_store_paths;
+        use crate::settings::ImmutableStoreSettings;
+        use crate::settings::MutableStoreSettings;
+
+        const LOCAL_IMMUTABLE: &str = r#"
+            mode = "local"
+            [local]
+            flush_delay_seconds = 10
+            path = "/tmp/lore-server"
+        "#;
+
+        const LOCAL_MUTABLE: &str = r#"
+            mode = "local"
+            [local]
+            flush_delay_seconds = 10
+            path = "/tmp/lore-server"
+        "#;
+
+        const REMOTE_MUTABLE: &str = r#"
+            mode = "remote"
+        "#;
+
+        const COMPOSITE_WITH_LOCAL_TIER: &str = r#"
+            mode = "composite"
+            [composite.local]
+            mode = "local"
+            [composite.local.local]
+            flush_delay_seconds = 10
+            path = "/tmp/lore-server"
+        "#;
+
+        const COMPOSITE_WITHOUT_LOCAL_TIER: &str = r#"
+            mode = "composite"
+            [composite.local]
+            mode = "local"
+        "#;
+
+        /// Only the first local tier reaches disk.
+        const COMPOSITE_WITH_EVERY_TIER_LOCAL: &str = r#"
+            mode = "composite"
+
+            [composite.local]
+            mode = "local"
+
+            [composite.local.local]
+            flush_delay_seconds = 10
+            path = "/var/lore/cache"
+
+            [composite.durable]
+            mode = "local"
+
+            [composite.durable.local]
+            flush_delay_seconds = 10
+            path = "/var/lore/durable"
+
+            [[composite.replica]]
+            mode = "local"
+
+            [composite.replica.local]
+            flush_delay_seconds = 10
+            path = "/var/lore/replica"
+        "#;
+
+        const UNCONFIGURED_IMMUTABLE: &str = r#"
+            mode = "local"
+            [local]
+            flush_delay_seconds = 10
+            path = ""
+        "#;
+
+        fn immutable(config: &'static str) -> ImmutableStoreSettings {
+            toml::from_str(config).expect("[immutable_store] should deserialize")
+        }
+
+        fn mutable(config: &'static str) -> MutableStoreSettings {
+            toml::from_str(config).expect("[mutable_store] should deserialize")
+        }
+
+        fn locations(
+            immutable_config: &'static str,
+            mutable_config: &'static str,
+        ) -> Vec<LocalStoreLocation> {
+            local_store_locations(&immutable(immutable_config), &mutable(mutable_config))
+        }
+
+        fn watched(immutable_config: &'static str, mutable_config: &'static str) -> Vec<PathBuf> {
+            monitored_local_store_paths(locations(immutable_config, mutable_config))
+        }
+
+        fn reaches_disk(stores: &[LocalStoreLocation]) -> Vec<bool> {
+            stores.iter().map(|store| store.reaches_disk).collect()
+        }
+
+        fn labels(stores: &[LocalStoreLocation]) -> Vec<&'static str> {
+            stores.iter().map(|store| store.label).collect()
+        }
+
+        #[test]
+        fn both_local_stores_are_watched() {
+            assert_eq!(
+                watched(LOCAL_IMMUTABLE, LOCAL_MUTABLE),
+                vec![local_store_path("/tmp/lore-server"); 2]
+            );
+        }
+
+        #[test]
+        fn each_store_is_named_by_what_it_is() {
+            assert_eq!(
+                labels(&locations(LOCAL_IMMUTABLE, LOCAL_MUTABLE)),
+                vec!["immutable", "mutable"]
+            );
+        }
+
+        /// A `[local]` block left in a remote deployment's config names a
+        /// directory the server never writes to.
+        #[test]
+        fn a_store_that_is_not_local_is_not_listed() {
+            let remote_immutable = r#"
+                mode = "remote"
+                [local]
+                flush_delay_seconds = 10
+                path = "/tmp/lore-server"
+            "#;
+
+            assert!(locations(remote_immutable, REMOTE_MUTABLE).is_empty());
+        }
+
+        #[test]
+        fn a_composite_local_tier_is_watched() {
+            assert_eq!(
+                watched(COMPOSITE_WITH_LOCAL_TIER, REMOTE_MUTABLE),
+                vec![local_store_path("/tmp/lore-server")]
+            );
+        }
+
+        /// A second local tier never gets a store at its own path.
+        #[test]
+        fn only_the_first_local_composite_tier_is_watched() {
+            assert_eq!(
+                watched(COMPOSITE_WITH_EVERY_TIER_LOCAL, REMOTE_MUTABLE),
+                vec![local_store_path("/var/lore/cache")]
+            );
+        }
+
+        /// The tiers that reach no disk are still listed, so the paths they
+        /// name can be reported as unused.
+        #[test]
+        fn every_local_composite_tier_is_listed() {
+            let stores = locations(COMPOSITE_WITH_EVERY_TIER_LOCAL, REMOTE_MUTABLE);
+
+            assert_eq!(
+                labels(&stores),
+                vec![
+                    "immutable composite local",
+                    "immutable composite durable",
+                    "immutable composite replica"
+                ]
+            );
+            assert_eq!(reaches_disk(&stores), vec![true, false, false]);
+        }
+
+        /// A later tier naming the first tier's path shares the store standing
+        /// there, so it is written at and must not be reported as unused.
+        #[test]
+        fn a_composite_tier_repeating_the_first_path_is_written_at() {
+            let tiers_share_a_path = r#"
+                mode = "composite"
+
+                [composite.local]
+                mode = "local"
+
+                [composite.local.local]
+                flush_delay_seconds = 10
+                path = "/var/lore/store"
+
+                [composite.durable]
+                mode = "local"
+
+                [composite.durable.local]
+                flush_delay_seconds = 10
+                path = "/var/lore/store"
+            "#;
+
+            let stores = locations(tiers_share_a_path, REMOTE_MUTABLE);
+
+            assert_eq!(reaches_disk(&stores), vec![true, true]);
+        }
+
+        /// The mutable store is its own store, not a tier handed the immutable
+        /// one.
+        #[test]
+        fn the_mutable_store_reaches_disk_beside_a_composite_tier() {
+            let stores = locations(COMPOSITE_WITH_LOCAL_TIER, LOCAL_MUTABLE);
+
+            assert_eq!(reaches_disk(&stores), vec![true, true]);
+        }
+
+        /// First in build order, not the cache tier by name.
+        #[test]
+        fn the_first_local_tier_is_watched_whichever_tier_that_is() {
+            let cache_is_remote = r#"
+                mode = "composite"
+
+                [composite.local]
+                mode = "remote"
+
+                [composite.durable]
+                mode = "local"
+
+                [composite.durable.local]
+                flush_delay_seconds = 10
+                path = "/var/lore/durable"
+            "#;
+
+            assert_eq!(
+                watched(cache_is_remote, REMOTE_MUTABLE),
+                vec![local_store_path("/var/lore/durable")]
+            );
+        }
+
+        #[test]
+        fn a_composite_store_with_no_local_tier_settings_is_not_listed() {
+            assert!(locations(COMPOSITE_WITHOUT_LOCAL_TIER, REMOTE_MUTABLE).is_empty());
+        }
+
+        #[test]
+        fn an_unconfigured_local_store_is_watched_where_it_falls_back_to() {
+            assert_eq!(
+                watched(UNCONFIGURED_IMMUTABLE, REMOTE_MUTABLE),
+                vec![local_data_dir()]
+            );
+        }
+
+        #[test]
+        fn an_unconfigured_local_store_is_recorded_as_unconfigured() {
+            let stores = locations(UNCONFIGURED_IMMUTABLE, REMOTE_MUTABLE);
+
+            assert_eq!(
+                stores
+                    .iter()
+                    .map(|store| store.configured)
+                    .collect::<Vec<_>>(),
+                vec![false]
+            );
+        }
+
+        #[test]
+        fn a_configured_local_store_is_recorded_as_configured() {
+            let stores = locations(LOCAL_IMMUTABLE, REMOTE_MUTABLE);
+
+            assert_eq!(
+                stores
+                    .iter()
+                    .map(|store| store.configured)
+                    .collect::<Vec<_>>(),
+                vec![true]
+            );
+        }
+    }
+
     /// Covers the `[server.http]` to `LoreHttpServerSettings` mapping, the one seam
     /// between config deserialization and the HTTP server's own settings.
     mod http_settings_mapping {

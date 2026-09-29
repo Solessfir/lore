@@ -110,8 +110,7 @@ impl NotificationClient {
                             auth_url,
                             &identity,
                             repository,
-                            self.remote.identity_token(),
-                            self.remote.access_token(),
+                            self.remote.credentials(),
                         )
                         .await;
                     let client =
@@ -123,7 +122,7 @@ impl NotificationClient {
                 }
                 Err(err) => {
                     if !retry.wait().await {
-                        return Err(err).internal("connecting to notification service")?;
+                        return Err(err).forward_any("connecting to notification service");
                     }
                     retry_attempt += 1;
                 }
@@ -184,7 +183,7 @@ impl lore_revision::notification::NotificationClient for NotificationClient {
 
         let stop = cancellation_token.clone();
         let client_ref = client;
-        let event_sender = execution_context().dispatcher.sender();
+        let event_sender = execution_context().dispatcher.keep_open();
         let task = lore_spawn_net!(async move {
             LoreEvent::NotificationSubscribed(LoreNotificationSubscribedEventData { repository })
                 .send();

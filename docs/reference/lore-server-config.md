@@ -82,12 +82,40 @@ With no config files loaded, the server runs as a self-contained, single-node in
 
 ## Server and endpoint settings
 
-The `[server]` table and its sub-tables configure the network endpoints and graceful-shutdown behavior.
+The `[server]` table and its sub-tables configure the network endpoints, graceful-shutdown behavior, and the disk space check on the local stores.
 
 | Field | Default | Description |
 | --- | --- | --- |
 | `server.connection_close_timeout_seconds` | `5` | Seconds to wait for open connections to close after a shutdown signal. |
 | `server.runtime_shutdown_timeout_seconds` | `25` | Seconds to wait for the async runtime to shut down after connections close. Accepts the alias `shutdown_delay_seconds`. |
+
+### Advertised endpoints
+
+`[environment.endpoint]` defines the external service endpoints advertised for the client.
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `auth_url` | none | The authentication service clients log in at and exchange tokens with. Setting it requires `[server.auth]`. If `auth_url` and `[server.auth]` are not set, starts the server unauthenticated. |
+| `user_url` | `auth_url` | The user directory that clients use to resolve user IDs to display names, and back. If not set, uses `auth_url` as the user service. If both are unset, falls back to an offline resolver that returns user IDs as names. |
+
+```toml
+[environment.endpoint]
+auth_url = "ucs-auth://auth.example.com"
+user_url = "ucs-auth://directory.example.com"
+```
+
+### Local store disk space
+
+`[server.local_store_monitor]` configures the periodic check of the disk space left to the local stores (see [Store settings](#store-settings)). Only stores the server writes at are watched, so a `[local]` block left in a remote deployment's configuration is ignored, as is a composite immutable tier that names a path other than the first local tier's — every local tier is handed the store the first one creates.
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `check_interval_seconds` | `30` | Seconds between checks. `0` turns the check off. |
+| `low_space_threshold_bytes` | `10737418240` | Warn while free space on a volume holding a local store is below this (10 GiB). |
+
+The reading is taken per volume, not per store: stores sharing a filesystem are checked once and named together in a single warning. The first check runs at startup, so a server starting on a full volume says so immediately. A store path that matches no mounted filesystem is warned about once and goes unmonitored until a mount covers it again.
+
+At startup the server also reports where each local store lands, warning when the configuration names no path, when the path is inside a system temporary directory (see [Zero-config defaults](#zero-config-defaults)), and when a composite tier names a path nothing is written at.
 
 ### QUIC endpoints
 
@@ -177,7 +205,11 @@ Each entry must be a bare `type/subtype` drawn from the RFC 9110 token character
 
 ### gRPC endpoints
 
-`[server.grpc]` is the public gRPC API (HTTP/2 over TCP) serving the admin, storage, revision, repository, environment, lock, and notification services. It runs whenever the server is in normal (non-maintenance) mode. `[server.grpc_internal]` is the opt-in server-to-server gRPC internal endpoint; it is disabled by default and requires mutual TLS. Both tables share the same field set.
+`[server.grpc]` is the public gRPC API over HTTP/2 and TCP. It serves the admin,
+storage, revision, repository, environment, thin-client, lock, and notification
+services in normal mode. `[server.grpc_internal]` is the opt-in server-to-server
+endpoint. It is disabled by default and requires mutual TLS. Both tables share
+the same fields.
 
 > [!NOTE]
 > `[server.grpc]`'s default port `41337` is the same number as `[server.quic]`, but the two do not conflict: gRPC listens on TCP and QUIC on UDP.
@@ -198,37 +230,175 @@ Each entry must be a bare `type/subtype` drawn from the RFC 9110 token character
 | `enabled` | `false` | Whether to start the replication endpoint. Set `true` to opt in. |
 | `verify_client_certs` | `true` | Require client certificates (mutual TLS). The endpoint refuses to start unless this is `true` with a full certificate triple (`cert_file` + `pkey_file` + `cert_chain`), or explicitly set to `false` to accept unverified clients. |
 
-### gRPC public-service tuning
+### gRPC public services
 
-`[server.grpc_public_services]` applies per-service tuning to the public gRPC endpoint. Only the lock service is currently configurable.
+`[server.grpc_public_services]` holds one block per service the public gRPC endpoint can register, plus `forwarded_requests`.
+
+Every service block accepts `enabled` and a `general` namespace. A block may
+also define service-specific fields. A `general` field affects only the
+services named in its description:
 
 | Field | Default | Description |
 | --- | --- | --- |
-| `lock_service.max_encoding_message_size` | `16777216` (16 MiB) | Maximum encoded gRPC response size, in bytes, for the lock service. When unset, the gRPC framework default applies. |
+| `enabled` | `true` | Whether the public router registers this service. Set `false` and every RPC on it answers `UNIMPLEMENTED`. |
+| `general.max_encoding_message_size` | unset | Maximum encoded gRPC response size in bytes. When unset, the gRPC framework default applies. Honored by `lock_service`. |
+
+Use `lock_service.general.max_encoding_message_size` instead of
+`lock_service.max_encoding_message_size`, which current servers ignore. During
+a mixed-version rollout, set both paths. Legacy servers read the direct key;
+current servers read the key beneath `general`. Remove the direct key after all
+servers are upgraded.
+
+#### Selecting services
+
+An absent block means enabled. A present block without `enabled` also means
+enabled. Restrict a deployment by disabling every service it must not serve:
+
+| Block | Registers |
+| --- | --- |
+| `admin_service` | `urc.rpc.AdminService` (`ServerInfo`, `Obliterate`) |
+| `storage_service` | `urc.rpc.StorageService` and `lore.storage.v1.StorageService` |
+| `revision_service` | `urc.rpc.RevisionService` and `lore.revision.v1.RevisionService` |
+| `repository_service` | `urc.rpc.RepositoryService` and `lore.repository.v1.RepositoryService` |
+| `environment_service` | `urc.rpc.EnvironmentService` and `lore.environment.v1.EnvironmentService` |
+| `thin_client_service` | `lore.thin_client.v1.ThinClientService`. Every RPC it serves is a read. |
+| `lock_service` | `urc.lock.LockService`. Also requires `[lock_store]` at a mode other than `none`. |
+| `notification_service` | `lore.notification.NotificationService`. Registers for local notification mode, the default when `[notification]` is absent. Notification plugins provide a sender but do not register this public service. |
+
+One block gates a whole proto family. The legacy `urc.rpc` services are not
+read-only shadows of their `v1` twins. They carry `BranchPush`,
+`RepositoryCreate`, and `RepositoryDelete`.
+
+Each flag is a scalar, so it is also settable from the environment:
+
+```shell
+LORE__SERVER__GRPC_PUBLIC_SERVICES__STORAGE_SERVICE__ENABLED=false
+```
+
+Disabling every service is legal. The process starts, and the public gRPC
+listener answers every RPC with `UNIMPLEMENTED`. The same result occurs when
+only `lock_service` is enabled without a store, or only `notification_service`
+is enabled with a notification plugin. An empty effective set logs a warning:
+`No public gRPC services registered; every RPC on this listener will answer
+UNIMPLEMENTED`.
+
+Unknown keys are ignored, as elsewhere in the settings. A misspelled block or
+key therefore leaves the service registered. Verify the effective set in the
+startup log.
+
+The startup message `Registered public gRPC services` lists the services that
+the router registered. Its `authenticated` field reports whether `[server.auth]`
+is active. The effective set can differ from the configured set because
+`lock_service` requires a store and `notification_service` requires local mode.
+
+For example, a read-only thin-client deployment disables every other service:
+
+```toml
+# Enabled by default; written out so the file states what the process serves.
+[server.grpc_public_services.thin_client_service]
+enabled = true
+
+[server.grpc_public_services.admin_service]
+enabled = false
+
+[server.grpc_public_services.storage_service]
+enabled = false
+
+# ... revision_service, repository_service, environment_service,
+#     lock_service, notification_service
+```
+
+`lore-server/config/thin.example.toml` is a complete example. It contains the
+exclusions above, disables the QUIC and HTTP listeners, and points both stores
+at a separate full server so the process keeps no repository copy. Copy it to a
+separate directory as `default.toml`, then point `LORE_CONFIG_PATH` at that
+directory. The server does not load the example in place.
+
+> [!IMPORTANT]
+> These flags govern only the gRPC router. The separate QUIC and HTTP listeners
+> accept writes, so a read-only process must also set
+> `server.quic.enabled = false` and `server.http.enabled = false`. Disabling HTTP
+> also removes `/health_check`. Use a gRPC readiness probe or an external
+> health-only endpoint.
+>
+> These flags reduce exposure, not memory. The stores are unaffected.
+>
+> A service added in a later release defaults to enabled. It therefore mounts on
+> a restricted deployment without an edit. Check the `Registered public gRPC
+> services` line after an upgrade.
+
+#### Forwarded requests
+
+`[server.grpc_public_services.forwarded_requests]` lets this server answer selected
+public RPCs by forwarding them to another Lore server's internal endpoint. It is
+absent by default, and no RPC is forwarded until it is named under `enabled_rpcs`.
+
+`[server.grpc_public_services.forwarded_requests.enabled_rpcs]` takes one boolean
+per forwardable RPC, all `false` by default. Releases add to the set; an unknown
+key here is ignored, so a name that is not yet forwardable forwards nothing.
+
+`[server.grpc_public_services.forwarded_requests.client]` configures the channel to
+the peer. The defaults suit a long-lived connection that sits idle between
+forwards; tune them to the path the peer is actually reached over:
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `url` | none (required) | The peer's internal gRPC endpoint, for example `https://peer.example.com:41340`. |
+| `certs` | none | Optional certificate block for mutual TLS to the peer — same fields as the [Certificate block](#certificate-block). The peer's `[server.grpc_internal]` requires client certificates unless it sets `verify_client_certs = false`. |
+| `connect_timeout_seconds` | `5` | Ceiling on the TCP connect, divided across the addresses the URL resolves to. It covers neither DNS resolution nor the TLS handshake, so it is not a bound on the whole of establishing a connection. |
+| `request_timeout_seconds` | `40` | Deadline for each forwarded request. Keep below the `request_handler_timeout_seconds` of the endpoint doing the forwarding, so that handler outlives the call it forwards. |
+| `tcp_keepalive_seconds` | `30` | TCP keep-alive probe interval. Holds open any NAT or proxy flow state on the path while the channel is idle between requests. |
+| `http2_keepalive_interval_seconds` | `20` | HTTP/2 keep-alive PING interval. Keep below the idle timeout of anything on the path that reaps idle connections. Pings are sent while the channel is idle, not only while requests are in flight. |
+| `http2_keepalive_timeout_seconds` | `10` | How long a keep-alive PING may go unanswered before the connection is dropped and redialled. |
+
+```toml
+[server.grpc_public_services.forwarded_requests.client]
+url = "https://peer.example.com:41340"
+
+[server.grpc_public_services.forwarded_requests.client.certs]
+cert_file = "/etc/lore/tls/client.crt"
+pkey_file = "/etc/lore/tls/client.key"
+cert_chain = "/etc/lore/tls/ca.crt"
+
+[server.grpc_public_services.forwarded_requests.enabled_rpcs]
+repository_get = true
+```
 
 ### Authentication
 
-`[server.auth]` configures JWT verification for the gRPC API. When `[server.auth]` (or its `[server.auth.jwk]` sub-table) is absent — as in every shipped config — JWT verification is disabled and the gRPC services accept unauthenticated requests.
+`[server.auth]` configures JWT verification for the gRPC API. When `[server.auth]` is defined, JWT verification is enabled. If it is absent, the services accept unauthenticated requests. If `[server.auth.jwk].endpoint` is set, it will be used as the JWKS endpoint. If not, the validation keys will be discovered from JWT issuer OIDC discovery document.
+
+When `[server.auth]` is present, `jwt_issuer` and `jwt_audience` are both mandatory and the server refuses to start without them: A deployment that verifies tokens without pinning issuer would accept tokens from any issuer. And a deployment that doesn't pin the audience would accept tokens minted for any service.
 
 | Field | Default | Description |
 | --- | --- | --- |
-| `jwt_issuer` | none | Expected JWT `iss` claim. When set, tokens with a different issuer are rejected; when unset, issuer validation is skipped. |
-| `jwt_audience` | none | Array of accepted JWT `aud` values. A token's audience must match one entry; when unset, audience validation is skipped. |
-| `jwk` | none | The `[server.auth.jwk]` sub-table below. Its presence enables JWT verification. |
+| `jwt_issuer` | required | Accepted JWT `iss` values, as a string or an array. Tokens whose issuer matches no entry are rejected. Two entries are for the duration of an issuer's `iss` cutover if the issuer is changed. The validator accepts tokens minted under both the old and the new value while both are in flight. |
+| `jwt_audience` | required | Array of accepted JWT `aud` values. A token's audience must match one entry. |
+| `jwt_typ` | none | Accepted JWT `typ` header values, as a string or an array. When set, a token whose header carries no `typ`, or a `typ` that doesn't match any of the entries, is rejected. If unset, the token value is not checked. `jwt_typ = "at+jwt"` is the RFC 9068 access-token profile for OAuth2/OIDC deployments, and should be used for OIDC-compliant setups. Values compare as media types: case-insensitively, and with or without the `application/` prefix, so `at+jwt` also accepts `application/at+jwt`. |
+| `jwk` | none | The optional `[server.auth.jwk]` override sub-table below. |
+| `permission_claim` | none | Dotted path of the JWT claim carrying the caller's allowed actions, e.g. `realm_access.roles` (Keycloak) or `groups` (Dex). When using `GlobalGrantsAuthorizer` (Tier 1), this JWT claim defines where the user's global permissions are read from. When `resource_claim` is set and `ResourceGrantsAuthorizer` (Tier 2) is in use, it instead names the field inside each resource entry holding the per-partition actions, defaulting to `permission`. |
+| `resource_claim` | none | Dotted path of the JWT claim carrying per-repository resource grants. If this is set, enables the granular `ResourceGrantsAuthorizer` (Tier 2) authorizer. |
+| `resource_id_claim` | `resource_id` | The field inside each resource entry that names the resource, for providers whose entry shape cannot be changed. Keycloak's UMA `authorization.permissions` entries carry the resource name in `rsname`, for example: set `resource_claim = "authorization.permissions"`, `resource_id_claim = "rsname"` and `permission_claim = "scopes"` to read them. Tier 2 only. |
+| `resource_id_template` | `urc-{id}` | Template that renders a repository id into the corresponding resource name. `{id}` is replaced by the repository id. When verifying permissions with `ResourceGrantsAuthorizer` (Tier 2), uses this string to search for the matching resource entry in the JWT. |
+| `resource_wildcard` | `urc-*` | The resource name that matches every repository. |
+| `identity_claim` | `sub` | The claim recorded and compared as the caller's identity. The value read from this claim will be recorded as the user ID in Lore revisions. Any unique string value can be used as the user ID. |
+| `baseline_access` | `denied` | What the `baseline` repository catalog answers to `lore repository list`: `denied` (the default) lists none, `reachable` lists every partition ID the server holds. Gates listing of the IDs only, never grants access to the contents. `denied` blocks no operation on a partition the caller holds a grant for. Not consulted by the `auth_service` catalog. A server with no `[server.auth]` lists everything it holds. |
+| `repository_catalog` | derived | Which catalog answers `lore repository list`: `auth_service` fetches the list from `UrcAuthApi` gRPC service's `LookupUserPermissions`. `baseline` fetches the list from the server's own store, based on `baseline_access` configuration rule. When unset, uses `auth_service` if `[environment.endpoint] auth_url` is set, and `baseline` otherwise. Set this to `auth_service` to keep an auth-service catalog on a deployment authorizing from token claims, or set it to `baseline` to list from the server store on a `UrcAuthApi` deployment. |
+| `repository_catalog_url` | `auth_url` | The `UrcAuthApi` endpoint the `auth_service` catalog asks. Defaults to `[environment.endpoint] auth_url`. This is required with `repository_catalog = "auth_service"` when `auth_url` is unset. The catalog forwards the caller's own token, so the endpoint must accept the tokens this server verifies. |
 
 `[server.auth.jwk]`:
 
 | Field | Default | Description |
 | --- | --- | --- |
-| `endpoint` | none (required) | URL of the JWKS (JSON Web Key Set) endpoint. The server fetches and caches signing keys from it at startup and re-fetches on an unknown key ID. |
+| `endpoint` | none | URL of the JWKS (JSON Web Key Set) endpoint, as an override for providers with non-standard discovery. When unset and `jwt_issuer` is an issuer URL, the server resolves the endpoint through OIDC discovery: it fetches `<jwt_issuer>/.well-known/openid-configuration` (the first jwt_issuer entry, when several issuers are configured) and takes `jwks_uri` from it. The server fetches and caches signing keys at startup and re-fetches on an unknown key ID. If this is unset, and `jwt_issuer` has no issuer URL, this is a startup error. |
 
 ```toml
+# Presence of `[server.auth]` enables JWT verification. By default the
+# JWKS endpoint is resolved through OIDC discovery against jwt_issuer.
+# Add [server.auth.jwk] endpoint = "..." to override discovery.
 [server.auth]
 jwt_issuer = "https://accounts.example.com"
 jwt_audience = ["lore-service"]
-
-[server.auth.jwk]
-endpoint = "https://accounts.example.com/.well-known/jwks.json"
 ```
 
 ## Store settings
@@ -239,7 +409,9 @@ Lore Server keeps three stores: an immutable store for content-addressed fragmen
 | --- | --- | --- |
 | `[immutable_store]` | `local` | `local`, `composite`, `replicated`, `remote`, or a plugin name such as `aws`. |
 | `[mutable_store]` | `local` | `local`, `remote`, or a plugin name such as `aws`. |
-| `[lock_store]` | `local` | `local`, or a plugin name such as `aws` (DynamoDB). |
+| `[lock_store]` | `local` | `local`, `none`, or a plugin name such as `aws` (DynamoDB). |
+
+`lock_store.mode = "none"` builds no lock store, so `LockService` does not register. The mode exists because `default.toml` sets `[lock_store]` and a layered configuration cannot remove a key a lower layer supplied.
 
 Each mode reads its settings from a matching sub-table. The `local` mode uses `[immutable_store.local]`, `[mutable_store.local]`, and the in-memory local lock store. Plugin modes such as `aws` read from `[plugins.<name>]` (see [Plugin backends](#plugin-backends)).
 
@@ -340,7 +512,7 @@ Five kinds of backend can be supplied by a plugin, each chosen by a different fi
 | --- | --- | --- |
 | Immutable store | `immutable_store.mode` | `local`, `composite`, `replicated`, `remote` |
 | Mutable store | `mutable_store.mode` | `local`, `remote` |
-| Lock store | `lock_store.mode` | `local` |
+| Lock store | `lock_store.mode` | `local`, `none` |
 | Topology | `topology.provider` | `none`, `fixed`, `rotating_id_fixed`, `composite` |
 | Notification | `notification.mode` | `local` |
 

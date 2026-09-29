@@ -11,8 +11,8 @@ from error_types import (
     DeleteDefaultError,
     DeleteProtectedError,
     LocalChanges,
+    LoreException,
     NotFound,
-    UnknownLoreError,
     ZeroRevisionError,
 )
 from lore_parsers import parse_branch_list_json, parse_jsonl
@@ -298,7 +298,9 @@ def test_branch(new_lore_repo):
 
     repo.branch_switch("recreate-branch")
 
-    assert not repo.file_exists(new_file), "Branch switch did not sync files as expected"
+    assert not repo.file_exists(new_file), (
+        "Branch switch did not sync files as expected"
+    )
 
     repo.branch_switch("main", local=True)
 
@@ -308,7 +310,9 @@ def test_branch(new_lore_repo):
 
     repo.branch_switch("recreate-branch")
 
-    assert not repo.file_exists(new_file), "Branch switch did not sync files as expected"
+    assert not repo.file_exists(new_file), (
+        "Branch switch did not sync files as expected"
+    )
 
     repo.branch_switch("main")
 
@@ -409,7 +413,11 @@ def test_branch_switch_bare(new_lore_repo):
     bare_clone = repo.clone(bare=True)
 
     # Verify bare clone has no working files
-    working_files = [f for f in os.listdir(bare_clone.path) if not f.startswith(".urc") and not f.startswith(".lore")]
+    working_files = [
+        f
+        for f in os.listdir(bare_clone.path)
+        if not f.startswith(".urc") and not f.startswith(".lore")
+    ]
     assert working_files == [], (
         f"Bare clone should have no working files, found: {working_files}"
     )
@@ -429,7 +437,11 @@ def test_branch_switch_bare(new_lore_repo):
     )
 
     # Verify no working files were created by the bare switch
-    working_files = [f for f in os.listdir(bare_clone.path) if not f.startswith(".urc") and not f.startswith(".lore")]
+    working_files = [
+        f
+        for f in os.listdir(bare_clone.path)
+        if not f.startswith(".urc") and not f.startswith(".lore")
+    ]
     assert working_files == [], (
         f"Bare switch should not create working files, found: {working_files}"
     )
@@ -447,7 +459,11 @@ def test_branch_switch_bare(new_lore_repo):
         f"Expected current branch main, got: {branch_list.current_branch}"
     )
 
-    working_files = [f for f in os.listdir(bare_clone.path) if not f.startswith(".urc") and not f.startswith(".lore")]
+    working_files = [
+        f
+        for f in os.listdir(bare_clone.path)
+        if not f.startswith(".urc") and not f.startswith(".lore")
+    ]
     assert working_files == [], (
         f"Bare switch back should not create working files, found: {working_files}"
     )
@@ -506,7 +522,9 @@ def test_branch_list_archived(new_lore_repo):
     # the active and archived lists are disjoint.
     active, archived = local_branch_sets()
     assert "main" in active, "Active branch 'main' should appear in the local list"
-    assert not archived, f"No branch should be archived before any archive; got {archived}"
+    assert not archived, (
+        f"No branch should be archived before any archive; got {archived}"
+    )
     assert active.isdisjoint(archived), (
         f"A branch must appear in either the local or archived list, never both; "
         f"overlap={active & archived}"
@@ -537,7 +555,9 @@ def test_branch_list_archived(new_lore_repo):
     assert "to-archive" not in active, (
         "Archived branch should be removed from the active local list"
     )
-    assert "to-archive" in archived, "Archived branch should appear in the archived list"
+    assert "to-archive" in archived, (
+        "Archived branch should appear in the archived list"
+    )
     assert "main" in active, "Unrelated active branch 'main' must stay active"
     assert "main" not in archived, "Active branch 'main' must never appear as archived"
     assert active.isdisjoint(archived), (
@@ -548,7 +568,9 @@ def test_branch_list_archived(new_lore_repo):
     # The archived entry is reported at the local location.
     archived_entry = next(
         e
-        for e in parse_jsonl(repo.branch_list(archived=True, json=True), "branchListEntry")
+        for e in parse_jsonl(
+            repo.branch_list(archived=True, json=True), "branchListEntry"
+        )
         if e["location"] == "local" and e["archived"] and e["name"] == "to-archive"
     )
     assert archived_entry["location"] == "local", (
@@ -988,9 +1010,7 @@ def test_push_restores_deleted_branch_no_new_commits(new_lore_repo):
 
     # Create a branch with a commit and push it
     repo.branch_create("restore-branch")
-    repo.write_commit_push(
-        "Branch commit", {text_file: ["Line one\nBranch line\n"]}
-    )
+    repo.write_commit_push("Branch commit", {text_file: ["Line one\nBranch line\n"]})
 
     # Clone with the branch
     clone = repo.clone(branch="restore-branch")
@@ -1141,9 +1161,7 @@ def test_delete_and_create_different_name_same_client(new_lore_repo):
     repo.write_commit_push("New branch commit", {text_file: ["Line one\nNew branch\n"]})
 
     branch_list = repo.branch_list()
-    assert branch_list.has_remote_branch("new-name"), (
-        "new-name should exist after push"
-    )
+    assert branch_list.has_remote_branch("new-name"), "new-name should exist after push"
 
 
 @pytest.mark.smoke
@@ -1159,9 +1177,7 @@ def test_name_conflict_from_two_clones(new_lore_repo):
 
     # Clone A creates and pushes branch "shared-name"
     clone_a.branch_create("shared-name")
-    clone_a.write_commit_push(
-        "Clone A commit", {text_file: ["Line one\nClone A\n"]}
-    )
+    clone_a.write_commit_push("Clone A commit", {text_file: ["Line one\nClone A\n"]})
 
     # Clone B tries to create a branch with the same name — should fail
     with pytest.raises(BranchAlreadyExistsError):
@@ -1345,18 +1361,14 @@ def test_branch_info_remote_local_flags(new_lore_repo):
     )[0]
     assert info["archived"] is False
     assert info["latest"] != ZERO_HASH, "--local must report the local latest"
-    assert info["latestRemote"] == ZERO_HASH, (
-        "--local must leave latestRemote zero"
-    )
+    assert info["latestRemote"] == ZERO_HASH, "--local must leave latestRemote zero"
 
     # --remote on the same branch.
     info = parse_jsonl(
         repo.branch_info("flag-test", json=True, remote=True), "branchInfo"
     )[0]
     assert info["archived"] is False
-    assert info["latestRemote"] != ZERO_HASH, (
-        "--remote must report the remote latest"
-    )
+    assert info["latestRemote"] != ZERO_HASH, "--remote must report the remote latest"
 
     repo.branch_archive("flag-test")
 
@@ -1417,3 +1429,67 @@ def test_branch_info_remote_local_flags(new_lore_repo):
         "--remote in a second instance must report archived=true once the "
         "branch is gone from the remote"
     )
+
+
+@pytest.mark.smoke
+def test_branch_archive_missing_remote_branch_is_quiet(new_lore_repo):
+    """Archiving converges quietly when the remote branch is already gone."""
+    repo: Lore = new_lore_repo()
+    text_file = "file.txt"
+
+    repo.write_commit_push("Initial commit", {text_file: ["Line one\n"]})
+
+    # A branch that was created offline never reached the remote, so the
+    # remote side of the archive has nothing to delete.
+    repo.branch_create("never-pushed", offline=True)
+    repo.branch_switch("main", offline=True)
+
+    output = repo.branch_archive("never-pushed")
+    assert "Archived branch never-pushed" in output, (
+        "Archiving a never-pushed branch should report the local archive"
+    )
+    assert "[Error]" not in output, (
+        f"Archiving a never-pushed branch should not report an error; got {output}"
+    )
+
+    # A branch another client already archived is the same convergence, seen
+    # from a second instance that still holds the branch locally.
+    repo.branch_create("archived-elsewhere")
+    repo.write_commit_push("Branch commit", {text_file: ["Line one\nBranch\n"]})
+    repo.branch_switch("main")
+
+    other = repo.clone()
+    other.branch_switch("archived-elsewhere")
+    other.branch_switch("main")
+
+    repo.branch_archive("archived-elsewhere")
+
+    output = other.branch_archive("archived-elsewhere")
+    assert "Archived branch archived-elsewhere" in output, (
+        "Archiving a remotely archived branch should report the local archive"
+    )
+    assert "[Error]" not in output, (
+        f"Archiving a remotely archived branch should not report an error; got {output}"
+    )
+
+
+@pytest.mark.smoke
+def test_branch_archive_unreachable_remote_fails(new_lore_repo):
+    """A remote that cannot be reached fails the archive instead of passing silently."""
+    # Nothing listens on port 1, so the connection is refused rather than
+    # left to time out.
+    repo: Lore = new_lore_repo(create_repo=False, remote_url="lore://127.0.0.1:1/")
+    repo.repository_create(offline=True)
+
+    with repo.open_file("base.txt", "w+") as f:
+        f.write("base v1\n")
+    repo.stage(scan=True, offline=True)
+    repo.commit("v1", offline=True)
+
+    repo.branch_create("unreachable-remote", offline=True)
+    repo.branch_switch("main", offline=True)
+
+    # The local archive succeeds, but the remote branch could not be archived
+    # and the connection failure is not a not-found, so the command must fail.
+    with pytest.raises(LoreException):
+        repo.branch_archive("unreachable-remote")

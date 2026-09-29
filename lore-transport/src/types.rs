@@ -20,6 +20,15 @@ impl EnvironmentConfig {
         self.config.as_ref().and_then(|c| c.max_query_batch)
     }
 
+    /// The compression mode the server states it prefers, as the number it sent. The codec that
+    /// number names is `lore_storage::CompressionMode`, which this crate does not depend on.
+    pub fn compression_mode(&self) -> Option<u32> {
+        self.config
+            .as_ref()
+            .and_then(|config| config.compression_mode.as_ref())
+            .map(ServerCompressionMode::as_u32)
+    }
+
     /// Per-service endpoint URL. If the environment's `endpoint.storage_url`
     /// is set and non-empty, it overrides `fallback`; otherwise `fallback` is
     /// returned unchanged. Same contract for the other `*_url` methods below.
@@ -65,6 +74,15 @@ impl EnvironmentConfig {
             fallback,
         )
     }
+
+    /// User directory endpoint: resolves user IDs to display names and back.
+    /// Falls back to `auth_url` if empty.
+    pub fn user_url<'a>(&'a self, fallback: &'a str) -> &'a str {
+        service_url_or(
+            self.endpoint.as_ref().and_then(|e| e.user_url.as_deref()),
+            fallback,
+        )
+    }
 }
 
 fn service_url_or<'a>(override_url: Option<&'a str>, fallback: &'a str) -> &'a str {
@@ -83,15 +101,20 @@ pub struct Endpoint {
     pub revision_url: Option<String>,
     pub lock_url: Option<String>,
     pub notification_url: Option<String>,
+    /// User directory endpoint: resolves user IDs to display names and back.
+    /// Falls back to `auth_url` if empty.
+    pub user_url: Option<String>,
 }
 
+/// A compression mode as it arrives from a server, held as the number it was sent as: the codec
+/// it names is `lore_storage::CompressionMode`, which this crate does not depend on.
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(bound(deserialize = "'de: 'static"))]
-pub struct CompressionMode(u32);
+pub struct ServerCompressionMode(u32);
 
-impl CompressionMode {
+impl ServerCompressionMode {
     pub fn from_u32(value: u32) -> Self {
-        CompressionMode(value)
+        ServerCompressionMode(value)
     }
 
     pub fn as_u32(&self) -> u32 {
@@ -103,7 +126,7 @@ impl CompressionMode {
 #[serde(bound(deserialize = "'de: 'static"))]
 pub struct EnvironmentServerConfig {
     pub max_query_batch: Option<usize>,
-    pub compression_mode: Option<CompressionMode>,
+    pub compression_mode: Option<ServerCompressionMode>,
 }
 
 // ---------------------------------------------------------------------------
@@ -318,5 +341,30 @@ mod tests {
         assert_eq!(env.revision_url(FALLBACK), FALLBACK);
         assert_eq!(env.repository_url(FALLBACK), FALLBACK);
         assert_eq!(env.notification_url(FALLBACK), FALLBACK);
+    }
+
+    /// Uses `auth_url` as fallback user directory, unless
+    /// `user_url` is defined
+    #[test]
+    fn user_url_follows_the_auth_url_until_advertised() {
+        const AUTH_URL: &str = "ucs-auth://auth.example.com";
+
+        assert_eq!(env_with(Endpoint::default()).user_url(AUTH_URL), AUTH_URL);
+        assert_eq!(
+            env_with(Endpoint {
+                user_url: Some(String::new()),
+                ..Default::default()
+            })
+            .user_url(AUTH_URL),
+            AUTH_URL
+        );
+        assert_eq!(
+            env_with(Endpoint {
+                user_url: Some("ucs-auth://directory.example.com".into()),
+                ..Default::default()
+            })
+            .user_url(AUTH_URL),
+            "ucs-auth://directory.example.com"
+        );
     }
 }

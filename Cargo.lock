@@ -182,6 +182,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-channel"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "924ed96dd52d1b75e9c1a3e6275715fd320f5f9439fb5a4a11fa51f4221158d2"
+dependencies = [
+ "concurrent-queue",
+ "event-listener-strategy",
+ "futures-core",
+ "pin-project-lite",
+]
+
+[[package]]
 name = "async-stream"
 version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1063,6 +1075,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
+name = "concurrent-queue"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ca0197aee26d1ae37445ee532fefce43251d24cc7c166799f4d46817f1d3973"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "config"
 version = "0.15.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1414,11 +1435,11 @@ checksum = "56254986775e3233ffa9c4d7d3faaf6d36a2c09d30b20687e9f88bc8bafc16c8"
 
 [[package]]
 name = "diffy"
-version = "0.4.2"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b545b8c50194bdd008283985ab0b31dba153cfd5b3066a92770634fbc0d7d291"
+checksum = "3e3dc2f773b6aaa63b1a7684b8589f670a8a0146a510b74d23a401c882364b49"
 dependencies = [
- "nu-ansi-term",
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -1559,6 +1580,26 @@ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "event-listener"
+version = "5.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a23add41df1562121a9393cb065eab5146a1242410f23a644851e90cfd669d2"
+dependencies = [
+ "parking",
+ "pin-project-lite",
+]
+
+[[package]]
+name = "event-listener-strategy"
+version = "0.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8be9f3dfaaffdae2972880079a491a1a8bb7cbed0b8dd7a347f668b4150a3b93"
+dependencies = [
+ "event-listener",
+ "pin-project-lite",
 ]
 
 [[package]]
@@ -1837,8 +1878,6 @@ checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 [[package]]
 name = "glob-match"
 version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9985c9503b412198aa4197559e9a318524ebc4519c229bfa05a535828c950b9d"
 
 [[package]]
 name = "governor"
@@ -1865,9 +1904,9 @@ dependencies = [
 
 [[package]]
 name = "h2"
-version = "0.4.14"
+version = "0.4.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "171fefbc92fe4a4de27e0698d6a5b392d6a0e333506bc49133760b3bcf948733"
+checksum = "ef8e5e5a340588f4452631496976cf8636d4a7ecf600239fdc27615d2530bc16"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -1913,6 +1952,9 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+dependencies = [
+ "foldhash 0.2.0",
+]
 
 [[package]]
 name = "heck"
@@ -2444,22 +2486,18 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
 name = "lore"
-version = "0.8.7-nightly"
+version = "0.10.1-nightly"
 dependencies = [
- "anyhow",
  "bitcode",
- "blake3",
  "bytes",
- "cbindgen",
- "cc",
  "chrono",
+ "ctor",
  "dashmap",
- "enum_dispatch",
- "glob",
  "libc",
  "lore-base",
  "lore-credential",
  "lore-error-set",
+ "lore-io",
  "lore-macro",
  "lore-notification",
  "lore-revision",
@@ -2467,7 +2505,6 @@ dependencies = [
  "lore-transport",
  "parking_lot",
  "rand",
- "regex",
  "serde",
  "serde_json",
  "serial_test",
@@ -2475,13 +2512,12 @@ dependencies = [
  "tokio",
  "toml 0.9.12+spec-1.1.0",
  "uuid",
- "vergen",
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "lore-aws"
-version = "0.8.7-nightly"
+version = "0.10.1-nightly"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -2523,9 +2559,8 @@ dependencies = [
 
 [[package]]
 name = "lore-base"
-version = "0.8.7-nightly"
+version = "0.10.1-nightly"
 dependencies = [
- "anyhow",
  "backtrace",
  "bitcode",
  "bitflags",
@@ -2536,6 +2571,7 @@ dependencies = [
  "directories",
  "hex",
  "libc",
+ "lore-base",
  "lore-error-set",
  "lore-io",
  "parking_lot",
@@ -2543,17 +2579,29 @@ dependencies = [
  "rand",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "uuid",
- "vergen",
  "windows-sys 0.61.2",
  "zerocopy",
 ]
 
 [[package]]
+name = "lore-capi"
+version = "0.10.1-nightly"
+dependencies = [
+ "blake3",
+ "cbindgen",
+ "cc",
+ "glob",
+ "lore",
+ "regex",
+]
+
+[[package]]
 name = "lore-chaos-client"
-version = "0.8.7-nightly"
+version = "0.10.1-nightly"
 dependencies = [
  "anyhow",
  "clap",
@@ -2570,11 +2618,10 @@ dependencies = [
 
 [[package]]
 name = "lore-client"
-version = "0.8.7-nightly"
+version = "0.10.1-nightly"
 dependencies = [
  "anstream 0.6.21",
  "anstyle",
- "anyhow",
  "chrono",
  "clap",
  "clap-markdown",
@@ -2587,14 +2634,13 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "toml 0.9.12+spec-1.1.0",
- "vergen",
  "windows-sys 0.61.2",
  "winresource",
 ]
 
 [[package]]
 name = "lore-credential"
-version = "0.8.7-nightly"
+version = "0.10.1-nightly"
 dependencies = [
  "base64 0.22.1",
  "jsonwebtoken",
@@ -2631,7 +2677,7 @@ dependencies = [
 
 [[package]]
 name = "lore-hashicorp"
-version = "0.8.7-nightly"
+version = "0.10.1-nightly"
 dependencies = [
  "async-trait",
  "lore-base",
@@ -2659,6 +2705,7 @@ dependencies = [
  "aws-sdk-s3",
  "axum",
  "bytes",
+ "ctor",
  "lore",
  "lore-aws",
  "lore-base",
@@ -2667,6 +2714,7 @@ dependencies = [
  "lore-revision",
  "lore-server",
  "lore-storage",
+ "lore-transport",
  "rand",
  "rcgen",
  "reqwest",
@@ -2675,7 +2723,6 @@ dependencies = [
  "rustls",
  "serde_dynamo",
  "serde_json",
- "tempfile",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -2687,7 +2734,7 @@ dependencies = [
 
 [[package]]
 name = "lore-io"
-version = "0.8.7-nightly"
+version = "0.10.1-nightly"
 dependencies = [
  "bytes",
  "futures",
@@ -2701,7 +2748,7 @@ dependencies = [
 
 [[package]]
 name = "lore-macro"
-version = "0.8.7-nightly"
+version = "0.10.1-nightly"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2710,7 +2757,7 @@ dependencies = [
 
 [[package]]
 name = "lore-notification"
-version = "0.8.7-nightly"
+version = "0.10.1-nightly"
 dependencies = [
  "async-trait",
  "lore-base",
@@ -2726,7 +2773,7 @@ dependencies = [
 
 [[package]]
 name = "lore-proto"
-version = "0.1.61"
+version = "0.1.64"
 dependencies = [
  "lore-base",
  "prost",
@@ -2738,7 +2785,7 @@ dependencies = [
 
 [[package]]
 name = "lore-revision"
-version = "0.8.7-nightly"
+version = "0.10.1-nightly"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2784,7 +2831,6 @@ dependencies = [
  "serde_json",
  "serde_with",
  "smallvec",
- "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -2802,9 +2848,10 @@ dependencies = [
 
 [[package]]
 name = "lore-server"
-version = "0.8.7-nightly"
+version = "0.10.1-nightly"
 dependencies = [
  "anyhow",
+ "async-channel",
  "async-stream",
  "async-trait",
  "axum",
@@ -2846,6 +2893,7 @@ dependencies = [
  "prost-types",
  "quinn",
  "rand",
+ "rcgen",
  "reqwest",
  "ring",
  "rustls",
@@ -2881,7 +2929,7 @@ dependencies = [
 
 [[package]]
 name = "lore-storage"
-version = "0.8.7-nightly"
+version = "0.10.1-nightly"
 dependencies = [
  "async-trait",
  "bitflags",
@@ -2901,6 +2949,7 @@ dependencies = [
  "lz4-sys",
  "opentelemetry",
  "parking_lot",
+ "pin-project",
  "rand",
  "serde",
  "smallvec",
@@ -2917,7 +2966,7 @@ dependencies = [
 
 [[package]]
 name = "lore-telemetry"
-version = "0.8.7-nightly"
+version = "0.10.1-nightly"
 dependencies = [
  "axum",
  "http 1.4.0",
@@ -2939,7 +2988,7 @@ dependencies = [
 
 [[package]]
 name = "lore-transport"
-version = "0.8.7-nightly"
+version = "0.10.1-nightly"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -3385,6 +3434,12 @@ name = "outref"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1a80800c0488c3a21695ea981a54918fbb37abf04f4d0720c453632255e2ff0e"
+
+[[package]]
+name = "parking"
+version = "2.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f38d5652c16fde515bb1ecef450ab0f6a219d619a7274976324d5e377f7dceba"
 
 [[package]]
 name = "parking_lot"
@@ -4408,9 +4463,9 @@ dependencies = [
 
 [[package]]
 name = "spin"
-version = "0.10.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d5fe4ccb98d9c292d56fec89a5e07da7fc4cf0dc11e156b41793132775d3e591"
+checksum = "023a211cb3138dbc438680b32560ad89f699977624c9f8dbb95a47d5b4c07dd3"
 
 [[package]]
 name = "spinning_top"

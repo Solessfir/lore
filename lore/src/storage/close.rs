@@ -18,14 +18,12 @@ use std::sync::Arc;
 use lore_base::error::InvalidArguments;
 use lore_base::lore_spawn_guarded;
 use lore_base::runtime::LORE_CONTEXT;
-use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
-use lore_revision::event::EventError;
 use lore_revision::interface::ExecutionContext;
-use lore_revision::interface::LoreError;
 use lore_revision::lore::execution_context;
 use lore_storage::ImmutableStore;
 use lore_storage::MutableStore;
+use lore_storage::StorageError;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -47,7 +45,7 @@ pub(crate) fn spawn_flush_stores(
         Arc::new(ExecutionContext::default()) as Arc<dyn std::any::Any + Send + Sync>,
         || {
             lore_spawn_guarded!(async move {
-                immutable_store.clone().compact_stop().await;
+                immutable_store.clone().stop_gc(false).await;
                 let _ = immutable_store.flush(sync_data).await;
                 let _ = mutable_store.flush(sync_data).await;
             });
@@ -62,24 +60,6 @@ pub(crate) fn spawn_flush_stores(
 pub struct LoreStorageCloseArgs {
     /// Handle to release; from `LORE_EVENT_STORAGE_OPENED`
     pub handle: LoreStore,
-}
-
-#[error_set]
-enum CloseError {
-    InvalidArguments,
-}
-
-impl EventError for CloseError {
-    fn translated(&self) -> LoreError {
-        match self {
-            CloseError::InvalidArguments(_) => LoreError::InvalidArguments,
-            CloseError::Internal(_) => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
 }
 
 /// Release a content-addressed storage handle.
@@ -109,7 +89,7 @@ async fn close_local(
         // Unregister first so concurrent `handle::lookup` returns None for new ops; ops that
         // already grabbed the handle still hold their `Arc` and the drain below waits them out.
         let Some(store) = handle::unregister(args.handle) else {
-            return Err(CloseError::from(InvalidArguments {
+            return Err(StorageError::from(InvalidArguments {
                 reason: "storage handle is unknown or already closed".into(),
             }));
         };
@@ -120,7 +100,7 @@ async fn close_local(
         let sync_data = execution_context().globals().sync_data();
         spawn_flush_stores(store.immutable.clone(), store.mutable.clone(), sync_data);
 
-        Ok::<_, CloseError>(())
+        Ok::<_, StorageError>(())
     })
     .await
 }

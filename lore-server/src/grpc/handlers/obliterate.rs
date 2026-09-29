@@ -18,6 +18,7 @@ use tracing::warn;
 use crate::auth::jwt::AuthorizationToken;
 use crate::auth::jwt::JwtVerifier;
 use crate::auth::jwt_interceptor::extract_bearer_token;
+use crate::grpc::FilterSlowDownExt;
 use crate::grpc::can_obliterate;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
@@ -95,6 +96,7 @@ pub async fn handler(
             immutable_store
                 .obliterate(repository, address, stats.clone())
                 .await
+                .filter_slow_down()?
                 .map_err(|e| {
                     warn!("Failed to obliterate {address}: {e}");
                     if e.is_address_not_found() {
@@ -155,6 +157,7 @@ mod tests {
     use super::*;
     use crate::auth::jwk::JWKService;
     use crate::auth::jwk::JWKServiceError;
+    use crate::auth::jwt::DEFAULT_IDENTITY_CLAIM;
     use crate::auth::jwt::ResourcePermission;
     use crate::hooks::HookDispatcher;
     use crate::notification::testing::MockNotificationSender;
@@ -192,6 +195,8 @@ mod tests {
             jwk_service: Arc::new(jwk_service),
             jwt_issuer: None,
             jwt_audience: Some(vec![TEST_AUDIENCE.to_string()]),
+            jwt_typ: None,
+            identity_claim: DEFAULT_IDENTITY_CLAIM.to_string(),
         }
     }
 
@@ -206,13 +211,16 @@ mod tests {
                 .add(Duration::from_secs(60))
                 .as_secs(),
             audience: vec![TEST_AUDIENCE.to_string()],
-            env: "test".to_string(),
-            name: "test".to_string(),
-            preferred_username: "test".to_string(),
+            env: Some("test".to_string()),
+            name: Some("test".to_string()),
+            preferred_username: Some("test".to_string()),
+            client_id: None,
             resources,
             groups: None,
             is_service_account: Some(false),
-            idp: "test".to_string(),
+            idp: Some("test".to_string()),
+            extra: Default::default(),
+            identity: None,
         };
         let key = EncodingKey::from_secret(SIGNING_SECRET.as_ref());
         let mut header = Header::new(ALGORITHM);

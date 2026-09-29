@@ -131,6 +131,7 @@ async fn migrate_initial_to_typed(
             committed_level: std::sync::atomic::AtomicUsize::new(
                 lore_storage::local::fan_out::FAN_OUT_LEVEL_MAX,
             ),
+            flush_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         }));
     }
 
@@ -177,6 +178,7 @@ async fn migrate_initial_to_typed(
             committed_level: std::sync::atomic::AtomicUsize::new(
                 lore_storage::local::fan_out::FAN_OUT_LEVEL_MAX,
             ),
+            flush_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         }));
     }
 
@@ -409,14 +411,13 @@ async fn migrate_immutable_value_to_typed(
     remote: &Arc<Connection>,
 ) -> Result<(), MutableStoreError> {
     let repository = Arc::new(RepositoryContext::new(RepositoryContextCreationArgs {
-        path: None,
+        paths: None,
         immutable_store: immutable_store.clone(),
         mutable_store: mutable_store as Arc<dyn store::MutableStore>,
         id: entry.partition,
         instance_id: crate::instance::InstanceId::default(),
         remote: Ok(remote.clone()),
         filter: Arc::default(),
-        format: crate::repository::RepositoryFormat::Lore,
         filesystem_provider: None,
     }));
     let hash = entry.value;

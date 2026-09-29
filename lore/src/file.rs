@@ -13,6 +13,7 @@ use lore_revision::file::hash::HashError;
 use lore_revision::file::history::HistoryOptions;
 use lore_revision::file::info::InfoOptions;
 use lore_revision::file::obliterate::ObliterateError;
+use lore_revision::file::reset::ResetMergeSide;
 use lore_revision::file::reset::ResetOptions;
 use lore_revision::file::unstage::UnstageOptions;
 use lore_revision::file::write::WriteAddressOptions;
@@ -614,15 +615,7 @@ async fn stage_merge_local(
         args,
         stage_merge,
         move |repository, token, args| async move {
-            let options = StageOptions {
-                case_change: stage::StageCaseChange::Error,
-                node_flags: node::NodeFlags::NoFlags,
-                file_id: None,
-                no_children: false,
-                scan: true,
-            };
-
-            file::stage::stage_merge(repository, &token, args.paths, options).await
+            file::stage::stage_merge(repository, &token, args.paths).await
         },
     )
     .await
@@ -948,6 +941,9 @@ pub struct LoreFileResetToLastMergedArgs {
     pub branch: LoreString,
     /// Purge untracked files
     pub purge: u8,
+    /// Merge side to restore, 0 = resolved (the merge revision), 1 = self ("mine"), 2 = other ("theirs")
+    #[serde(default)]
+    pub merge_side: u32,
 }
 
 /// Resets files to the state they were in at the last merged revision on a branch.
@@ -999,7 +995,13 @@ async fn reset_to_last_merged_local(
                 single_node: false,
             };
 
-            file::reset::reset_to_last_merged(repository, args.paths, args.branch, options)
+            file::reset::reset_to_last_merged(
+                repository,
+                args.paths,
+                args.branch,
+                ResetMergeSide::from_u32(args.merge_side),
+                options,
+            )
         },
     )
     .await
@@ -1110,7 +1112,8 @@ async fn write_impl(
 
         let path = args.path.to_string();
 
-        lore_revision::file::write::write_file(repository, token, path, output, options).await?;
+        lore_revision::file::write::write_file_boxed(repository, token, path, output, options)
+            .await?;
     }
 
     Ok(())
@@ -1182,11 +1185,11 @@ async fn obliterate_impl(
             })
         })?;
 
-        lore_revision::file::obliterate::obliterate_address(repository, address).await?;
+        lore_revision::file::obliterate::obliterate_address_boxed(repository, address).await?;
     } else {
         let path = args.path.to_string();
 
-        lore_revision::file::obliterate::obliterate_file(repository, token, path).await?;
+        lore_revision::file::obliterate::obliterate_file_boxed(repository, token, path).await?;
     }
 
     Ok(())
@@ -1247,11 +1250,11 @@ async fn dump_impl(
         let address =
             Address::from_str(args.address.as_str()).internal("invalid address for dump")?;
 
-        lore_revision::file::dump::dump_address(repository, address).await?;
+        lore_revision::file::dump::dump_address_boxed(repository, address).await?;
     } else {
         let path = args.path.to_string();
 
-        lore_revision::file::dump::dump_file(repository, path).await?;
+        lore_revision::file::dump::dump_file_boxed(repository, path).await?;
     }
 
     Ok(())
@@ -1378,4 +1381,22 @@ async fn history_local(
         file::history::history(repository, path, options)
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reset_to_last_merged_args_old_payload_missing_merge_side_uses_default() {
+        // Old IPC client payload with no merge_side field. The new field must be
+        // `#[serde(default)]` so old clients keep working.
+        let payload = r#"{ "paths": [], "branch": "main", "purge": 0 }"#;
+
+        let args: LoreFileResetToLastMergedArgs =
+            serde_json::from_str(payload).expect("old payload must deserialise");
+
+        assert_eq!(args.branch.as_str(), "main");
+        assert_eq!(args.merge_side, 0);
+    }
 }

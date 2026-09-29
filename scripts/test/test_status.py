@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: MIT
 import logging
 import os
+import stat
+import sys
 
 import pytest
 from test_utils import posix_join, to_posix
@@ -19,9 +21,7 @@ def _status_files_by_path(repo: Lore, **kwargs) -> dict[str, dict]:
     interfere with file-level assertions.
     """
     entries = parse_status_json(repo.status(json=True, offline=True, **kwargs))
-    return {
-        to_posix(e.get("path", "")): e for e in entries if e.get("type") == "file"
-    }
+    return {to_posix(e.get("path", "")): e for e in entries if e.get("type") == "file"}
 
 
 @pytest.mark.smoke
@@ -307,7 +307,7 @@ def _status_entries(repo: Lore, **kwargs) -> dict[str, dict]:
 
 
 @pytest.mark.smoke
-def test_status_scan_view_filter(new_lore_repo, tmp_path_factory):
+def test_status_scan_view_filter(new_lore_repo, scratch_dir):
     """`status --scan` reconciles a view-filtered clone against the filesystem
     reporting exactly the changes to materialized (in-view) content and nothing
     for content the view filter excluded.
@@ -352,7 +352,7 @@ def test_status_scan_view_filter(new_lore_repo, tmp_path_factory):
     repo.commit()
     repo.push()
 
-    view_dir = tmp_path_factory.mktemp("view")
+    view_dir = scratch_dir("view", create=True)
     view_path = os.path.join(view_dir, "view.txt")
     with open(view_path, "w+") as view_file:
         view_file.write("**\n")
@@ -366,13 +366,17 @@ def test_status_scan_view_filter(new_lore_repo, tmp_path_factory):
     for p in in_view:
         assert clone.file_exists(p), f"view filter dropped an in-view file: {p}"
     for p in excluded:
-        assert not clone.path_exists(p), f"view filter materialized an excluded file: {p}"
+        assert not clone.path_exists(p), (
+            f"view filter materialized an excluded file: {p}"
+        )
 
     # A pristine clone is in sync with the filesystem: --scan reports nothing.
     # Excluded subtrees (plain/, drop/) were never written, so they must not
     # surface as phantom directory deletes.
     clean = _status_entries(clone, scan=True)
-    assert clean == {}, f"--scan on a pristine view-filtered clone reported changes: {sorted(clean)}"
+    assert clean == {}, (
+        f"--scan on a pristine view-filtered clone reported changes: {sorted(clean)}"
+    )
 
     # Genuinely change three in-view files across depths.
     deep = posix_join("assets", "d0", "d1", "d2", "d3", "deep.txt")
@@ -404,7 +408,9 @@ def test_status_scan_view_filter(new_lore_repo, tmp_path_factory):
         for p, e in scanned.items()
         if e.get("type") != "file" and e.get("action") == "delete"
     }
-    assert strays == {}, f"--scan reported stray deletes for excluded directories: {strays}"
+    assert strays == {}, (
+        f"--scan reported stray deletes for excluded directories: {strays}"
+    )
 
     # Suppressing phantom deletes must not hide a real one: removing an entire
     # materialized in-view directory still reports the directory as deleted.
@@ -430,11 +436,13 @@ def test_status_scan_view_filter(new_lore_repo, tmp_path_factory):
     clone.stage()
     clone.commit()
     post = _status_entries(clone, scan=True)
-    assert post == {}, f"--scan after committing the deletion reported changes: {sorted(post)}"
+    assert post == {}, (
+        f"--scan after committing the deletion reported changes: {sorted(post)}"
+    )
 
 
 @pytest.mark.smoke
-def test_status_scan_view_pure_exclusion(new_lore_repo, tmp_path_factory):
+def test_status_scan_view_pure_exclusion(new_lore_repo, scratch_dir):
     """`status --scan` on a pristine clone under a pure-exclusion view reports
     no changes.
 
@@ -458,7 +466,7 @@ def test_status_scan_view_pure_exclusion(new_lore_repo, tmp_path_factory):
     repo.commit()
     repo.push()
 
-    view_dir = tmp_path_factory.mktemp("view")
+    view_dir = scratch_dir("view", create=True)
     view_path = os.path.join(view_dir, "view.txt")
     with open(view_path, "w+") as view_file:
         view_file.write("some/path/**/with/*/*\n")
@@ -507,7 +515,7 @@ def test_status_revision_only(new_lore_repo):
 
 
 @pytest.mark.smoke
-def test_status_count(new_lore_repo, tmp_path_factory):
+def test_status_count(new_lore_repo, scratch_dir):
     """`status --count` reports the directory and file totals of the tree.
 
     Covers: the full-tree total; agreement between `--count` and `--count
@@ -549,7 +557,7 @@ def test_status_count(new_lore_repo, tmp_path_factory):
         "Count event emitted without --count"
     )
 
-    view_dir = tmp_path_factory.mktemp("view")
+    view_dir = scratch_dir("view", create=True)
     view_path = os.path.join(view_dir, "view.txt")
     with open(view_path, "w+") as view_file:
         view_file.write("**\n")
@@ -580,7 +588,7 @@ def test_status_count(new_lore_repo, tmp_path_factory):
 
 
 @pytest.mark.smoke
-def test_status_count_link(new_lore_repo, tmp_path_factory):
+def test_status_count_link(new_lore_repo, scratch_dir):
     """`status --count` counts a link mount as a directory, descends only into
     the linked subtree (honoring path remapping), and applies the local view
     filter to the linked content via the remapped mount path.
@@ -643,7 +651,7 @@ def test_status_count_link(new_lore_repo, tmp_path_factory):
         repo.status(posix_join("lk", "keep", "k.txt"), count=True, json=True)
     ) == {"directories": 0, "files": 1}
 
-    view_dir = tmp_path_factory.mktemp("link-view")
+    view_dir = scratch_dir("link-view", create=True)
     view_path = os.path.join(view_dir, "view.txt")
     with open(view_path, "w+") as view_file:
         view_file.write("**\n")
@@ -763,9 +771,10 @@ def test_status_count_layer(new_lore_repo):
     assert parse_status_count_json(
         repo.status(posix_join("lay", "keep"), count=True, json=True)
     ) == {"directories": 1, "files": 1}
-    assert parse_status_count_json(
-        repo.status("root.txt", count=True, json=True)
-    ) == {"directories": 0, "files": 1}
+    assert parse_status_count_json(repo.status("root.txt", count=True, json=True)) == {
+        "directories": 0,
+        "files": 1,
+    }
 
     with repo.open_file(posix_join(repo.dot_dir(), "view"), "w+") as view_file:
         view_file.write("**\n")
@@ -1003,4 +1012,48 @@ def test_status_check_dirty_rehashes_same_size(new_lore_repo):
     after = _status_files_by_path(repo)
     assert set(after) == {"modified.bin"}, (
         f"reverted file must remain cleared on a later status, got {sorted(after)}"
+    )
+
+
+@pytest.mark.smoke
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows holds no executable bit")
+def test_status_scan_reports_a_mode_only_change(new_lore_repo):
+    """The executable bit is part of what a file is, so a chmod alone is a
+    modification. It moves neither the size nor the modification time of the
+    file, so the scan has to compare the bit to see it, staging has to take it,
+    and the revision has to carry it to a fresh clone.
+    """
+    repo: Lore = new_lore_repo()
+
+    with repo.open_file("script.sh", "w+b") as output_file:
+        output_file.write(b"#!/bin/sh\necho unchanged\n")
+    repo.stage(scan=True)
+    repo.commit()
+    repo.push()
+
+    os.chmod(os.path.join(repo.path, "script.sh"), 0o755)
+
+    scanned = _status_files_by_path(repo, scan=True)
+    assert set(scanned) == {"script.sh"}, (
+        f"a chmod with no content change must be reported, got {sorted(scanned)}"
+    )
+    assert scanned["script.sh"]["action"] == "keep"
+
+    repo.stage(scan=True)
+    staged = _status_files_by_path(repo)
+    assert set(staged) == {"script.sh"}, (
+        f"the staged mode change must still be reported, got {sorted(staged)}"
+    )
+
+    repo.commit()
+    repo.push()
+
+    assert not _status_files_by_path(repo, scan=True), (
+        "the committed mode must leave nothing to report"
+    )
+
+    clone = repo.clone()
+    cloned_mode = os.stat(os.path.join(clone.path, "script.sh")).st_mode
+    assert cloned_mode & stat.S_IXUSR, (
+        f"the revision must carry the executable bit to a clone: {cloned_mode:o}"
     )

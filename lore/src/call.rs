@@ -20,8 +20,8 @@ use lore_revision::repository;
 use lore_revision::repository::RepositoryAccess;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryError;
-use lore_revision::repository::RepositoryFormat;
 pub use lore_revision::repository::RepositoryWriteToken;
+use lore_revision::repository::get_dot_lore_path;
 use lore_revision::util;
 
 use crate::interface::LoreEventCallback;
@@ -234,9 +234,8 @@ async fn prepare_repository_call(
 
     let execution = setup_execution(globals, callback);
 
-    let format = RepositoryFormat::detect(&repository_path);
-    let dot_dir = format.dot_dir();
-    if !repository_path.join(dot_dir).is_dir() {
+    let dotpath = get_dot_lore_path(&repository_path).map_err(|err| err.ffi_code())?;
+    if !dotpath.is_dir() {
         let err = RepositoryError::from(RepositoryNotFound {
             repository: repository_path.display().to_string(),
         });
@@ -302,7 +301,7 @@ pub async fn no_repository_call<Arg, T, F, Fut, ResT, ErrT>(
     command: F,
 ) -> i32
 where
-    ErrT: EventError + FfiError + HasTrace,
+    ErrT: FfiError + HasTrace + std::fmt::Display,
     Arg: std::fmt::Debug,
     F: FnOnce(Arg) -> Fut,
     Fut: Future<Output = Result<ResT, ErrT>> + 'static,
@@ -391,7 +390,7 @@ mod tests {
     use super::*;
 
     // A concrete `#[error_set]` error for the wrapper closures. Its `NotFound`
-    // variant wraps `lore_base::error::NotFound`, which carries error code 13, so
+    // variant wraps `lore_base::error::NotFound`, which carries error code 79, so
     // the failure path has a known non-internal code to assert against.
     #[error_set]
     enum SampleError {
@@ -454,7 +453,7 @@ mod tests {
             .collect();
         assert_eq!(completes.len(), 1, "exactly one Complete event");
 
-        // The status holds the error code (13 for `NotFound`) and the detail is
+        // The status holds the error code (79 for `NotFound`) and the detail is
         // populated with that code and the error's message.
         let data = &completes[0];
         let expected_code = SampleError::from(NotFound).ffi_code();

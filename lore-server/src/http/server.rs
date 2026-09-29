@@ -33,6 +33,7 @@ use super::security_headers::PolicyField;
 use super::tracing::lore_http_tracing;
 use crate::auth::jwt::JwtVerifier;
 use crate::auth::jwt_axum_middleware::jwt_axum_verify_authorization;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::correlation::layer::CorrelationIdLayerBuilder;
 use crate::http::repositories;
 use crate::util::core_hop::CoreHopLayer;
@@ -62,6 +63,7 @@ pub struct ServerState {
     pub immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     pub mutable_store: Arc<dyn lore_storage::MutableStore>,
     pub jwt_verifier: Option<JwtVerifier>,
+    pub repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     pub max_file_size: u64,
     pub presign_config: Option<PresignConfig>,
 }
@@ -124,6 +126,23 @@ impl LoreHttpServerSettings {
     }
 }
 
+fn apply_presigned_transport_limits(
+    router: Router,
+    max_file_size: u64,
+    settings: &LoreHttpServerSettings,
+) -> Router {
+    // This route bypasses `authenticated_router`, so it needs its own transport limits.
+    router
+        .layer(DefaultBodyLimit::max(max_file_size as usize))
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            axum::http::StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(settings.request_timeout_seconds),
+        ))
+        .layer(tower_http::timeout::RequestBodyTimeoutLayer::new(
+            Duration::from_secs(settings.request_body_timeout_seconds),
+        ))
+}
+
 // Expose a testable router factory
 pub fn create_router(
     shared_state: ServerState,
@@ -161,10 +180,13 @@ pub fn create_router(
         .nest("/v1", authenticated_router);
 
     if shared_state.presign_config.is_some() {
-        router = router.nest(
-            "/v1/presigned",
+        let presigned_router = apply_presigned_transport_limits(
             presigned::create_router(Arc::new(shared_state.clone())),
+            shared_state.max_file_size,
+            settings,
         );
+
+        router = router.nest("/v1/presigned", presigned_router);
     }
 
     router
@@ -273,6 +295,7 @@ impl LoreHttpServer {
         immutable_store: Arc<dyn lore_storage::ImmutableStore>,
         mutable_store: Arc<dyn lore_storage::MutableStore>,
         jwt_verifier: Option<JwtVerifier>,
+        repository_authorizer: Arc<dyn RepositoryAuthorizer>,
         signal: impl Future<Output = ()> + Send + 'static,
     ) -> Result<()> {
         let addr = SocketAddr::from_str(format!("{}:{}", settings.host, settings.port).as_str())
@@ -315,6 +338,7 @@ impl LoreHttpServer {
             immutable_store,
             mutable_store,
             jwt_verifier,
+            repository_authorizer,
             max_file_size: settings.max_file_size,
             presign_config,
         };
@@ -337,6 +361,10 @@ impl LoreHttpServer {
 
 #[cfg(test)]
 mod tests {
+    use axum::http::StatusCode;
+    use axum::routing::get;
+    use axum_test::TestServer;
+
     use super::super::security_headers::DEFAULT_ALLOWED_CONTENT_TYPES;
     use super::*;
 
@@ -368,6 +396,29 @@ mod tests {
 
         assert!(config.content_type_allowlist.is_allowed("application/zip"));
         assert!(config.content_type_allowlist.is_allowed("image/png"));
+    }
+
+    #[tokio::test]
+    async fn presigned_transport_limits_timeout_slow_handlers() {
+        let settings = LoreHttpServerSettings {
+            request_timeout_seconds: 0,
+            ..LoreHttpServerSettings::test_default()
+        };
+        let router = apply_presigned_transport_limits(
+            Router::new().route(
+                "/",
+                get(|| async {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    StatusCode::OK
+                }),
+            ),
+            100,
+            &settings,
+        );
+
+        let response = TestServer::new(router).unwrap().get("/").await;
+
+        assert_eq!(response.status_code(), StatusCode::REQUEST_TIMEOUT);
     }
 
     #[test]

@@ -15,8 +15,6 @@ use lore_proto::lore::thin_client::v1::RevisionDiffResponse;
 use lore_proto::lore::thin_client::v1::revision_diff_response::Payload;
 use lore_revision::branch;
 use lore_revision::branch::BranchError;
-use lore_revision::change::FileAction;
-use lore_revision::change::NodeChange;
 use lore_revision::diff::diff_revision_paths;
 use lore_revision::link;
 use lore_revision::lore::BranchId;
@@ -42,9 +40,9 @@ use super::helpers::identifier_for_signature;
 use super::helpers::link_pin_change_to_diff_change;
 use super::helpers::node_change_to_diff_change;
 use super::helpers::resolve_to_identifier;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
-use crate::grpc::get_authorization;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::link_read_authorizer;
@@ -114,11 +112,14 @@ pub async fn handler(
     request: Request<RevisionDiffRequest>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     config: RevisionDiffConfig,
+    history_step_size: u64,
+    acceleration: crate::grpc::server::RevisionListAcceleration,
 ) -> Result<Response<RevisionDiffStream>, Status> {
     let repository_id = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
-    let authorization = get_authorization(request.extensions()).ok();
+    let can_read = link_read_authorizer(&repository_authorizer, request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let req = request.into_inner();
 
@@ -137,15 +138,27 @@ pub async fn handler(
     let execution = setup_execution(module_path!(), correlation_id, user_id);
     let repository = Arc::new(
         RepositoryContext::new_server_context(immutable_store, mutable_store, repository_id)
-            .with_link_read(link_read_authorizer(authorization)),
+            .with_link_read(can_read),
     );
 
     LORE_CONTEXT
         .scope(execution, async move {
             // Resolve both sides up-front so unary errors surface before
             // the stream opens.
-            let (from_sig, from_id) = resolve_to_identifier(&repository, query_from.into()).await?;
-            let (to_sig, to_id) = resolve_to_identifier(&repository, query_to.into()).await?;
+            let (from_sig, from_id) = resolve_to_identifier(
+                &repository,
+                query_from.into(),
+                history_step_size,
+                acceleration,
+            )
+            .await?;
+            let (to_sig, to_id) = resolve_to_identifier(
+                &repository,
+                query_to.into(),
+                history_step_size,
+                acceleration,
+            )
+            .await?;
 
             let (tx, rx) = mpsc::channel(256);
 
@@ -283,7 +296,10 @@ async fn branch_stack_contains(
     branch_id: BranchId,
     revision: Hash,
 ) -> Result<bool, Status> {
-    let metadata = match branch::metadata(repository.clone(), branch_id).await {
+    let metadata = match branch::metadata(repository.clone(), branch_id)
+        .await
+        .filter_slow_down()?
+    {
         Ok(metadata) => metadata,
         Err(err) if err.is_branch_not_found() => return Ok(false),
         Err(err) => {
@@ -372,7 +388,7 @@ async fn run_two_way(
         diff_revision_paths(repo_clone, from_state, to_state, None, producer_tx).await
     });
     while let Some(item) = producer_rx.recv().await {
-        let change = item.map_err(|err| {
+        let change = item.filter_slow_down()?.map_err(|err| {
             warn!(
                 {REPOSITORY_ID} = %repository.id,
                 from = %from_sig_clone,
@@ -383,14 +399,14 @@ async fn run_two_way(
             warn_error_to_status(&err, |e| Status::internal(e.to_string()))
         })?;
         let index = match partitions
-            .resolve_or_announce(surviving_repository_id(&change), tx)
+            .resolve_or_announce(change.content_repository_id(), tx)
             .await
         {
             Ok(index) => index,
             Err(SendOutcome::ReceiverDropped) => return Ok(()),
             Err(SendOutcome::Sent) => unreachable!("resolve_or_announce returns Sent only via Ok"),
         };
-        let payload = Payload::Change(node_change_to_diff_change(&change, index));
+        let payload = Payload::Change(node_change_to_diff_change(&change, index).await);
         match send_payload(tx, payload).await {
             SendOutcome::Sent => {}
             SendOutcome::ReceiverDropped => return Ok(()),
@@ -398,9 +414,21 @@ async fn run_two_way(
     }
 
     // Surface any error from the producer task itself.
-    match producer.await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(err)) => {
+    let produced = match producer.await {
+        Ok(produced) => produced,
+        Err(join_err) => {
+            warn!(
+                {REPOSITORY_ID} = %repository.id,
+                ?join_err,
+                "2-way revision diff producer task panicked",
+            );
+            return Err(Status::internal("revision diff producer task failed"));
+        }
+    };
+
+    match produced.filter_slow_down()? {
+        Ok(()) => Ok(()),
+        Err(err) => {
             warn!(
                 {REPOSITORY_ID} = %repository.id,
                 from = %from_sig,
@@ -411,14 +439,6 @@ async fn run_two_way(
             Err(warn_error_to_status(&err, |e| {
                 Status::internal(e.to_string())
             }))
-        }
-        Err(join_err) => {
-            warn!(
-                {REPOSITORY_ID} = %repository.id,
-                ?join_err,
-                "2-way revision diff producer task panicked",
-            );
-            Err(Status::internal("revision diff producer task failed"))
         }
     }
 }
@@ -449,6 +469,7 @@ async fn run_three_way(
     let base =
         branch::resolve_diff3_base(repository.clone(), from_branch, from_sig, to_branch, to_sig)
             .await
+            .filter_slow_down()?
             .map_err(|err| {
                 warn!(
                     {REPOSITORY_ID} = %repository.id,
@@ -526,7 +547,7 @@ async fn run_three_way(
         let payload = match item {
             DiffItem::Change(change) => {
                 let index = match partitions
-                    .resolve_or_announce(surviving_repository_id(&change), tx)
+                    .resolve_or_announce(change.content_repository_id(), tx)
                     .await
                 {
                     Ok(index) => index,
@@ -535,11 +556,11 @@ async fn run_three_way(
                         unreachable!("resolve_or_announce returns Sent only via Ok")
                     }
                 };
-                Payload::Change(node_change_to_diff_change(&change, index))
+                Payload::Change(node_change_to_diff_change(&change, index).await)
             }
             DiffItem::Conflict(pair) => {
                 let index_from = match partitions
-                    .resolve_or_announce(surviving_repository_id(&pair.0), tx)
+                    .resolve_or_announce(pair.0.content_repository_id(), tx)
                     .await
                 {
                     Ok(index) => index,
@@ -549,7 +570,7 @@ async fn run_three_way(
                     }
                 };
                 let index_to = match partitions
-                    .resolve_or_announce(surviving_repository_id(&pair.1), tx)
+                    .resolve_or_announce(pair.1.content_repository_id(), tx)
                     .await
                 {
                     Ok(index) => index,
@@ -558,7 +579,7 @@ async fn run_three_way(
                         unreachable!("resolve_or_announce returns Sent only via Ok")
                     }
                 };
-                Payload::Conflict(diff_conflict_from_pair(&pair, index_from, index_to))
+                Payload::Conflict(diff_conflict_from_pair(&pair, index_from, index_to).await)
             }
         };
         match send_payload(tx, payload).await {
@@ -599,12 +620,10 @@ async fn run_three_way(
 /// typed variant lets us avoid string-matching the inner `StateError`
 /// across crate boundaries.
 fn map_branch_error_to_status(err: BranchError) -> Status {
-    if err.is_oversized() {
+    if err.is_slow_down() || err.is_oversized() || err.is_max_history_search_depth() {
         Status::resource_exhausted(err.to_string())
     } else if err.is_divergent() {
         Status::failed_precondition(err.to_string())
-    } else if err.is_max_history_search_depth() {
-        Status::resource_exhausted(err.to_string())
     } else {
         warn_error_to_status(&err, |e| Status::internal(e.to_string()))
     }
@@ -618,8 +637,12 @@ async fn load_state_pair(
     let from_fut = State::deserialize(repository.clone(), from_sig);
     let to_fut = State::deserialize(repository.clone(), to_sig);
     let (from_res, to_res) = tokio::join!(from_fut, to_fut);
-    let from_state = from_res.map_err(|err| state_status(repository, from_sig, err))?;
-    let to_state = to_res.map_err(|err| state_status(repository, to_sig, err))?;
+    let from_state = from_res
+        .filter_slow_down()?
+        .map_err(|err| state_status(repository, from_sig, err))?;
+    let to_state = to_res
+        .filter_slow_down()?
+        .map_err(|err| state_status(repository, to_sig, err))?;
     Ok((from_state, to_state))
 }
 
@@ -740,19 +763,8 @@ impl PartitionTable {
     }
 }
 
-/// Repository of the side that survives the change: `from` for a
-/// delete, `to` otherwise. This is the partition its content lives in.
-fn surviving_repository_id(change: &NodeChange) -> RepositoryId {
-    match change.action {
-        FileAction::Delete => change.from.repository.id,
-        _ => change.to.repository.id,
-    }
-}
-
 #[cfg(test)]
 mod test {
-    use std::str::FromStr;
-
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::types::BranchPoint;
     use lore_proto::lore::thin_client::v1::revision_diff_request::QueryFrom;
@@ -771,9 +783,15 @@ mod test {
     use tonic::Request;
 
     use super::*;
+    use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
     use crate::grpc::get_write_token;
     use crate::grpc::handlers::branch_push;
+    use crate::grpc::server::RevisionListAcceleration;
     use crate::store::test_store_create;
+
+    fn allow_all() -> Arc<dyn RepositoryAuthorizer> {
+        Arc::new(AllowAllRepositoryAuthorizer)
+    }
 
     fn make_request(
         repository: RepositoryId,
@@ -817,11 +835,10 @@ mod test {
         state.set_revision_number(revision_number);
         state.set_metadata_hash(metadata_hash);
         for (name, bytes) in files {
-            let buffer = bytes::Bytes::copy_from_slice(bytes);
             let address = lore_revision::immutable::write(
                 repository.clone(),
                 lore_storage::Context::default(),
-                buffer,
+                bytes::Bytes::copy_from_slice(bytes),
                 lore_storage::WriteOptions::default(),
             )
             .await
@@ -909,7 +926,10 @@ mod test {
                 request,
                 immutable_store,
                 mutable_store,
+                allow_all(),
                 RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             {
@@ -952,7 +972,10 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                allow_all(),
                 RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -1014,7 +1037,10 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                allow_all(),
                 RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -1107,7 +1133,10 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                allow_all(),
                 RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -1201,7 +1230,10 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                allow_all(),
                 RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -1259,7 +1291,10 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                allow_all(),
                 RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             {
@@ -1305,7 +1340,10 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                allow_all(),
                 RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -1375,7 +1413,10 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                allow_all(),
                 RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -1431,7 +1472,10 @@ mod test {
                 request,
                 immutable_store,
                 mutable_store,
+                allow_all(),
                 RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             {
@@ -1490,7 +1534,10 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                allow_all(),
                 RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -1586,7 +1633,10 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                allow_all(),
                 RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -1738,65 +1788,6 @@ mod test {
         assert!(
             !table.entries.contains_key(&linked),
             "failed announcement must not poison the table",
-        );
-    }
-
-    #[tokio::test]
-    async fn surviving_repository_id_picks_from_for_delete_to_otherwise() {
-        // Construct two contexts with distinct ids; place `from` and `to`
-        // in different repositories and verify the helper picks the
-        // correct side based on FileAction.
-        let parent_id = RepositoryId::from(uuid::Uuid::now_v7());
-        let linked_id = RepositoryId::from(uuid::Uuid::now_v7());
-        let (immutable_store, mutable_store, _) = test_store_create().await.expect("test stores");
-        let parent_ctx = Arc::new(RepositoryContext::new_server_context(
-            immutable_store.clone(),
-            mutable_store.clone(),
-            parent_id,
-        ));
-        let linked_ctx = Arc::new(RepositoryContext::new_server_context(
-            immutable_store,
-            mutable_store,
-            linked_id,
-        ));
-        let state = Arc::new(state::State::new());
-        let address = lore_storage::Address::default();
-
-        let make = |action: lore_revision::change::FileAction| NodeChange {
-            action,
-            path: lore_revision::util::path::RelativePath::from_str("p").unwrap(),
-            from_path: None,
-            flags: lore_revision::change::Flags::None,
-            from: lore_revision::change::NodeChangeState {
-                node: 1,
-                repository: linked_ctx.clone(),
-                state: state.clone(),
-                address,
-                flags: NodeFlags::File,
-            },
-            to: lore_revision::change::NodeChangeState {
-                node: 2,
-                repository: parent_ctx.clone(),
-                state: state.clone(),
-                address,
-                flags: NodeFlags::File,
-            },
-        };
-
-        assert_eq!(
-            surviving_repository_id(&make(lore_revision::change::FileAction::Delete)),
-            linked_id,
-            "Delete surfaces the from side",
-        );
-        assert_eq!(
-            surviving_repository_id(&make(lore_revision::change::FileAction::Add)),
-            parent_id,
-            "Add surfaces the to side",
-        );
-        assert_eq!(
-            surviving_repository_id(&make(lore_revision::change::FileAction::Keep)),
-            parent_id,
-            "Keep surfaces the to side",
         );
     }
 }

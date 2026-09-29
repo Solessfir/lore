@@ -65,18 +65,19 @@ impl From<&StoreError> for ReplicationServiceErrorCode {
 }
 
 #[repr(u8)]
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Command {
-    // 0 and 5 were `ExistsBatch` / `LocalExistsBatch`, superseded by `Query` (11) and
-    // `LocalQuery` (12). Left unused rather than reassigned, so a peer that still sends one is
+    // 0 and 5 were `ExistsBatch` / `LocalExistsBatch`, superseded by `Query` (17) and
+    // `LocalQuery` (18). Left unused rather than reassigned, so a peer that still sends one is
     // rejected instead of misread.
     ImmutablePut = 2,
     ImmutableObliterate = 3,
     // 4 and 7 were the single-address `Query`, whose operation no longer exists. Left unused rather
     // than reassigned, so a peer that still sends one is rejected instead of misread.
     ImmutableLocalPut = 8,
-    ImmutableQuery = 11,
-    ImmutableLocalQuery = 12,
+    // 11 and 12 were `Query` / `LocalQuery` under the old response shape (without context in each
+    // result). Left unused rather than reassigned, so a peer that still sends one is rejected
+    // instead of misread.
     // 1, 6, 9, 10 were `Get`, `LocalGet`, `GetMetadata`, `LocalGetMetadata` under the old response
     // shape. Left unused rather than reassigned, so a peer that still sends one is rejected instead
     // of misread.
@@ -84,6 +85,12 @@ pub enum Command {
     ImmutableLocalGet = 14,
     ImmutableGetMetadata = 15,
     ImmutableLocalGetMetadata = 16,
+    ImmutableQuery = 17,
+    ImmutableLocalQuery = 18,
+    ImmutableCopy = 19,
+    /// Announces the client's user agent; see
+    /// [`send_client_identify`](lore_transport::quic::client::send_client_identify).
+    ClientIdentify = 20,
 }
 
 impl From<Command> for QuicOpCode {
@@ -106,6 +113,8 @@ impl TryFrom<QuicOpCode> for Command {
             v if v == Command::ImmutableLocalPut as u8 => Ok(Command::ImmutableLocalPut),
             v if v == Command::ImmutableQuery as u8 => Ok(Command::ImmutableQuery),
             v if v == Command::ImmutableLocalQuery as u8 => Ok(Command::ImmutableLocalQuery),
+            v if v == Command::ImmutableCopy as u8 => Ok(Command::ImmutableCopy),
+            v if v == Command::ClientIdentify as u8 => Ok(Command::ClientIdentify),
             _ => Err(UnknownCommand(value)),
         }
     }

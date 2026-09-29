@@ -18,6 +18,7 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::auth::LoreAuthUrlEventData;
+use crate::errors::AddressNotFound;
 use crate::errors::Disconnected;
 use crate::errors::Maintenance;
 use crate::errors::NoRemote;
@@ -41,6 +42,7 @@ pub enum LoginError {
     NotAuthenticated,
     Maintenance,
     NotFound,
+    AddressNotFound,
     NoRemote,
     NotSupported,
     Oversized,
@@ -71,6 +73,7 @@ pub enum InteractiveLoginError {
     NotAuthenticated,
     Maintenance,
     NotFound,
+    AddressNotFound,
     NoRemote,
     NotSupported,
     Oversized,
@@ -154,7 +157,7 @@ async fn exchange_token(
     }
 }
 
-pub async fn with_token(
+pub(crate) async fn with_token(
     remote_url: &str,
     token: &str,
     token_type: &str,
@@ -222,6 +225,16 @@ pub async fn with_token(
     };
 
     Ok(user_info)
+}
+
+/// Boxed version of [`with_token`] for cross-crate use.
+pub fn with_token_boxed<'a>(
+    remote_url: &'a str,
+    token: &'a str,
+    token_type: &'a str,
+    explicit_auth_url: Option<&'a str>,
+) -> crate::BoxFuture<'a, Result<UserInfo, LoginError>> {
+    Box::pin(with_token(remote_url, token, token_type, explicit_auth_url))
 }
 
 /// Authenticates interactively via a browser-based login flow.

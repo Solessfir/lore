@@ -65,9 +65,6 @@ pub struct LoreRevisionCommitArgs {
     /// Array of messages corresponding to each layer path (parallel array with `layer_paths`)
     #[serde(default)]
     pub layer_messages: LoreArray<LoreString>,
-    /// Emit per-fragment write stats during the commit
-    #[serde(default)]
-    pub stats: u8,
 }
 
 /// Commits all staged changes to the current branch as a new revision.
@@ -94,7 +91,8 @@ pub struct LoreRevisionCommitArgs {
 /// | [`LoreEvent::RevisionCommitEnd`](crate::interface::LoreEvent::RevisionCommitEnd) | Emitted when commit file processing completes |
 /// | [`LoreEvent::RevisionCommitRevision`](crate::interface::LoreEvent::RevisionCommitRevision) | Emitted with the committed revision details (hash, branch, parents) |
 /// | [`LoreEvent::Metadata`](crate::interface::LoreEvent::Metadata) | Emitted for each metadata entry of the committed revision |
-/// | [`LoreEvent::FragmentWrite`](crate::interface::LoreEvent::FragmentWrite) | Emitted for each file fragment written or deduplicated |
+/// | [`LoreEvent::RevisionCommitStats`](crate::interface::LoreEvent::RevisionCommitStats) | Emitted once when the commit finishes, with per-action file counts and fragment write/dedup/upload totals. Requires `stats >= 1` on the global arguments |
+/// | [`LoreEvent::FragmentWrite`](crate::interface::LoreEvent::FragmentWrite) | Emitted for each file fragment written or deduplicated. Requires `stats >= 2` on the global arguments |
 pub async fn commit(
     globals: LoreGlobalArgs,
     args: LoreRevisionCommitArgs,
@@ -161,7 +159,6 @@ async fn commit_local(
                 link_messages,
                 layer,
                 layer_messages,
-                stats: args.stats != 0,
             };
 
             // Enable upload to remote during commit unless offline or local
@@ -170,7 +167,7 @@ async fn commit_local(
                 repository.set_disable_upload(false);
             }
 
-            lore_revision::commit::commit(repository, &token, options).await
+            lore_revision::commit::commit_boxed(repository, &token, options).await
         },
     )
     .await
@@ -208,7 +205,7 @@ pub async fn commit_with_metadata(
                 repository.set_disable_upload(false);
             }
 
-            lore_revision::commit::commit_with_metadata(
+            lore_revision::commit::commit_with_metadata_boxed(
                 repository,
                 &token,
                 options,
@@ -275,7 +272,7 @@ async fn amend_local(
             let options = AmendRevisionOptions {
                 message: Some(message),
             };
-            lore_revision::revision::amend::amend_revision(repository, &token, options).await
+            lore_revision::revision::amend::amend_revision_boxed(repository, &token, options).await
         },
     )
     .await
@@ -335,7 +332,7 @@ async fn info_local(
             delta: args.delta != 0,
             metadata: args.metadata != 0,
         };
-        lore_revision::revision::info::info(repository, options)
+        lore_revision::revision::info::info_boxed(repository, options)
     })
     .await
 }
@@ -385,7 +382,7 @@ async fn metadata_clear_local(
         args,
         metadata_clear,
         move |repository, token, _args| async move {
-            metadata::clear::clear_revision(repository, &token).await
+            metadata::clear::clear_revision_boxed(repository, &token).await
         },
     )
     .await
@@ -442,7 +439,7 @@ async fn metadata_get_impl(
     repository: Arc<RepositoryContext>,
     args: LoreRevisionMetadataGetArgs,
 ) -> Result<(), MetadataErrors> {
-    metadata::get::get_revision(repository, args.revision.into(), args.key.as_str()).await
+    metadata::get::get_revision_boxed(repository, args.revision.into(), args.key.as_str()).await
 }
 
 /// Arguments for listing all metadata key/value pairs of a revision.
@@ -586,7 +583,7 @@ async fn metadata_set_impl(
     }
     let values: Vec<&[u8]> = encoded_values.iter().map(|v| v.as_slice()).collect();
 
-    metadata::set::set_revision(repository, token, &keys, &values, &formats).await
+    metadata::set::set_revision_boxed(repository, token, &keys, &values, &formats).await
 }
 
 /// Arguments for retrieving the revision history of a branch or revision.
@@ -598,7 +595,8 @@ pub struct LoreRevisionHistoryArgs {
     pub revision: LoreString,
     /// Restrict to this branch; empty for current
     pub branch: LoreString,
-    /// Stop at revisions created before this date (Unix timestamp; 0 disables)
+    /// Stop at revisions created before this date (milliseconds since the
+    /// Unix epoch; 0 disables)
     pub date: u64,
     /// Maximum number of revisions to return; 0 for unlimited
     pub length: u32,
@@ -648,7 +646,7 @@ async fn history_local(
             length: args.length,
             only_branch: args.only_branch != 0,
         };
-        lore_revision::revision::history::history(repository, options)
+        lore_revision::revision::history::history_boxed(repository, options)
     })
     .await
 }
@@ -721,7 +719,7 @@ async fn restore_local(
             let options = RestoreOptions {
                 message: args.message.into(),
             };
-            lore_revision::revision::restore::restore(repository, &token, options).await
+            lore_revision::revision::restore::restore_boxed(repository, &token, options).await
         },
     )
     .await
@@ -746,6 +744,10 @@ pub struct LoreRevisionSyncArgs {
     pub dependency_recursive: u8,
     /// Maximum dependency traversal depth; 0 means unlimited
     pub dependency_depth_limit: u32,
+    /// View filter file to leave the working files materialized under; empty to keep the view the
+    /// instance holds
+    #[serde(default)]
+    pub view: LoreString,
 }
 
 /// Synchronizes the working directory to a target revision, optionally merging divergent branches.
@@ -771,7 +773,7 @@ pub struct LoreRevisionSyncArgs {
 /// | [`LoreEvent::RevisionSyncFile`](crate::interface::LoreEvent::RevisionSyncFile) | Emitted for each file deleted, modified, added, or merged during sync |
 /// | [`LoreEvent::RevisionSyncProgress`](crate::interface::LoreEvent::RevisionSyncProgress) | Emitted periodically during file realization and once at completion with cumulative counts |
 /// | [`LoreEvent::RevisionSyncRevision`](crate::interface::LoreEvent::RevisionSyncRevision) | Emitted with the resulting revision when a merge occurs and at the end of sync |
-/// | [`LoreEvent::RevisionResolve`](crate::interface::LoreEvent::RevisionResolve) | Emitted when resolving a partial or numbered revision reference |
+/// | [`LoreEvent::RevisionResolve`](crate::interface::LoreEvent::RevisionResolve) | Emitted when resolving a revision number |
 /// | [`LoreEvent::FilterExclude`](crate::interface::LoreEvent::FilterExclude) | Emitted for each path excluded by view or ignore filters |
 /// | [`LoreEvent::FileStageFile`](crate::interface::LoreEvent::FileStageFile) | Emitted for each file staged for deletion during merge realization |
 ///
@@ -824,6 +826,16 @@ async fn sync_local(
                 .iter()
                 .map(|s| s.to_string())
                 .collect();
+            let view = if args.view.length > 0 {
+                Some(
+                    lore_revision::util::path::make_absolute(args.view.as_str())
+                        .forward_with::<sync::SyncError, _>(|| {
+                            format!("Invalid path: {}", args.view)
+                        })?,
+                )
+            } else {
+                None
+            };
             let options = SyncOptions {
                 revision: args.revision.into(),
                 forward_changes: args.forward_changes != 0,
@@ -834,9 +846,10 @@ async fn sync_local(
                 dependency_tags,
                 dependency_recursive: args.dependency_recursive != 0,
                 dependency_depth_limit: args.dependency_depth_limit,
+                view,
             };
 
-            sync::sync(repository, &token, options).await
+            sync::sync_boxed(repository, &token, options).await
         },
     )
     .await
@@ -852,12 +865,14 @@ pub struct LoreRevisionBisectArgs {
     pub end: LoreString,
 }
 
-pub async fn bisect(
+/// Bisects the revision range between two revisions. Blocks on the runtime, so it is called from
+/// outside it.
+pub fn bisect(
     globals: LoreGlobalArgs,
     args: LoreRevisionBisectArgs,
     callback: LoreEventCallback,
 ) -> i32 {
-    repository_call_write(
+    crate::runtime().block_on(repository_call_write(
         globals,
         callback,
         args,
@@ -867,10 +882,9 @@ pub async fn bisect(
                 start: args.start.to_string(),
                 end: args.end.to_string(),
             };
-            bisect::bisect(repository, &token, options).await
+            bisect::bisect_boxed(repository, &token, options).await
         },
-    )
-    .await
+    ))
 }
 
 /// Arguments for finding revisions by metadata or revision number.
@@ -938,7 +952,7 @@ async fn find_impl(
         return Err(FindError::internal("no revision specified"));
     };
 
-    lore_revision::find::find_impl(repository, options).await
+    lore_revision::find::find_boxed(repository, options).await
 }
 
 /// Arguments for computing file-level differences between two revisions.
@@ -974,7 +988,7 @@ pub struct LoreRevisionDiffArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::RevisionDiffFile`](crate::interface::LoreEvent::RevisionDiffFile) | Emitted for each file that differs between the two revisions |
-/// | [`LoreEvent::RevisionResolve`](crate::interface::LoreEvent::RevisionResolve) | Emitted when resolving a partial or numbered revision reference |
+/// | [`LoreEvent::RevisionResolve`](crate::interface::LoreEvent::RevisionResolve) | Emitted when resolving a revision number |
 pub async fn diff(
     globals: LoreGlobalArgs,
     args: LoreRevisionDiffArgs,
@@ -1004,10 +1018,9 @@ async fn diff_impl(
         None
     };
 
-    let source_hash = revision::resolve(
+    let source_hash = revision::resolve_boxed(
         repository.clone(),
         args.revision_source.as_str(),
-        execution_context().globals().search_limit(),
         execution_context().globals().search_location(),
     )
     .await
@@ -1015,22 +1028,21 @@ async fn diff_impl(
 
     // No target provided, use current revision
     let target_hash = if args.revision_target.is_empty() {
-        lore_revision::instance::load_current_anchor(&repository)
+        lore_revision::instance::load_current_anchor_boxed(&repository)
             .await
             .map(|(revision, _branch)| revision)
             .unwrap_or_default()
     } else {
-        revision::resolve(
+        revision::resolve_boxed(
             repository.clone(),
             args.revision_target.as_str(),
-            execution_context().globals().search_limit(),
             execution_context().globals().search_location(),
         )
         .await
         .forward::<revision::diff::DiffError>("invalid revision")?
     };
 
-    lore_revision::revision::diff::diff(repository, source_hash, target_hash, paths).await
+    lore_revision::revision::diff::diff_boxed(repository, source_hash, target_hash, paths).await
 }
 
 /// Arguments for cherry-picking a revision onto the current branch.
@@ -1044,6 +1056,11 @@ pub struct LoreRevisionCherryPickArgs {
     pub message: LoreString,
     /// Disable auto-commit even if no conflicts arise
     pub no_commit: u8,
+    /// Metadata keys to carry from the picked revision onto the revision this
+    /// creates. Empty carries nothing; the single entry `*` carries every key
+    /// that is not reserved to the cherry-pick itself.
+    #[serde(default)]
+    pub inherit_metadata: LoreArray<LoreString>,
 }
 
 pub async fn cherry_pick(
@@ -1065,10 +1082,9 @@ pub async fn cherry_pick_local(
         args,
         cherry_pick,
         async move |repository, token, args| {
-            let target_revision = revision::resolve(
+            let target_revision = revision::resolve_boxed(
                 repository.clone(),
                 args.revision.as_str(),
-                execution_context().globals().search_limit(),
                 execution_context().globals().search_location(),
             )
             .await
@@ -1077,9 +1093,16 @@ pub async fn cherry_pick_local(
             let options = revision::cherry_pick::CherryPickOptions {
                 message: args.message.to_string(),
                 no_commit: args.no_commit != 0,
+                inherit_metadata: lore_revision::metadata::MetadataInherit::from_keys(
+                    args.inherit_metadata
+                        .as_slice()
+                        .iter()
+                        .map(LoreString::as_str),
+                ),
             };
 
-            revision::cherry_pick::cherry_pick(repository, &token, target_revision, options).await
+            revision::cherry_pick::cherry_pick_boxed(repository, &token, target_revision, options)
+                .await
         },
     )
     .await
@@ -1109,7 +1132,7 @@ async fn cherry_pick_abort_local(
         callback,
         args,
         cherry_pick_abort,
-        move |repository, _token, _args| revision::cherry_pick::cherry_pick_abort(repository),
+        move |repository, _token, _args| revision::cherry_pick::cherry_pick_abort_boxed(repository),
     )
     .await
 }
@@ -1142,7 +1165,7 @@ async fn cherry_pick_unresolve_local(
         args,
         cherry_pick_unresolve,
         move |repository, token, args| async move {
-            revision::cherry_pick::cherry_pick_unresolve(repository, &token, args.paths).await
+            revision::cherry_pick::cherry_pick_unresolve_boxed(repository, &token, args.paths).await
         },
     )
     .await
@@ -1176,7 +1199,7 @@ async fn cherry_pick_restart_local(
         args,
         cherry_pick_restart,
         move |repository, token, args| async move {
-            revision::cherry_pick::cherry_pick_restart(repository, &token, args.paths).await
+            revision::cherry_pick::cherry_pick_restart_boxed(repository, &token, args.paths).await
         },
     )
     .await
@@ -1210,7 +1233,7 @@ async fn cherry_pick_resolve_local(
         args,
         cherry_pick_resolve,
         move |repository, token, args| async move {
-            revision::cherry_pick::cherry_pick_resolve(repository, &token, args.paths).await
+            revision::cherry_pick::cherry_pick_resolve_boxed(repository, &token, args.paths).await
         },
     )
     .await
@@ -1244,7 +1267,7 @@ async fn cherry_pick_resolve_mine_local(
         args,
         cherry_pick_resolve_mine,
         move |repository, token, args| async move {
-            revision::cherry_pick::cherry_pick_resolve_mine(repository, &token, args.paths)
+            revision::cherry_pick::cherry_pick_resolve_mine_boxed(repository, &token, args.paths)
                 .await
                 .forward::<MergeError>("resolving cherry-pick with mine")
         },
@@ -1280,7 +1303,7 @@ async fn cherry_pick_resolve_theirs_local(
         args,
         cherry_pick_resolve_theirs,
         move |repository, token, args| async move {
-            revision::cherry_pick::cherry_pick_resolve_theirs(repository, &token, args.paths)
+            revision::cherry_pick::cherry_pick_resolve_theirs_boxed(repository, &token, args.paths)
                 .await
                 .forward::<MergeError>("resolving cherry-pick with theirs")
         },
@@ -1356,10 +1379,9 @@ pub async fn revert_local(
         args,
         revert,
         async move |repository, token, args| {
-            let target_revision = revision::resolve(
+            let target_revision = revision::resolve_boxed(
                 repository.clone(),
                 args.revision.as_str(),
-                execution_context().globals().search_limit(),
                 execution_context().globals().search_location(),
             )
             .await
@@ -1370,7 +1392,7 @@ pub async fn revert_local(
                 no_commit: args.no_commit != 0,
             };
 
-            revision::revert::revert(repository, &token, target_revision, options).await
+            revision::revert::revert_boxed(repository, &token, target_revision, options).await
         },
     )
     .await
@@ -1422,7 +1444,7 @@ async fn revert_abort_local(
         callback,
         args,
         revert_abort,
-        move |repository, _token, _args| revision::revert::revert_abort(repository),
+        move |repository, _token, _args| revision::revert::revert_abort_boxed(repository),
     )
     .await
 }
@@ -1476,7 +1498,7 @@ async fn revert_unresolve_local(
         args,
         revert_unresolve,
         move |repository, token, args| async move {
-            revision::revert::revert_unresolve(repository, &token, args.paths).await
+            revision::revert::revert_unresolve_boxed(repository, &token, args.paths).await
         },
     )
     .await
@@ -1532,7 +1554,7 @@ async fn revert_restart_local(
         args,
         revert_restart,
         move |repository, token, args| async move {
-            revision::revert::revert_restart(repository, &token, args.paths).await
+            revision::revert::revert_restart_boxed(repository, &token, args.paths).await
         },
     )
     .await
@@ -1587,7 +1609,7 @@ async fn revert_resolve_local(
         args,
         revert_resolve,
         move |repository, token, args| async move {
-            revision::revert::revert_resolve(repository, &token, args.paths).await
+            revision::revert::revert_resolve_boxed(repository, &token, args.paths).await
         },
     )
     .await
@@ -1642,7 +1664,7 @@ async fn revert_resolve_mine_local(
         args,
         revert_resolve_mine,
         move |repository, token, args| async move {
-            revision::revert::revert_resolve_mine(repository, &token, args.paths)
+            revision::revert::revert_resolve_mine_boxed(repository, &token, args.paths)
                 .await
                 .forward::<MergeError>("resolving revert with mine")
         },
@@ -1699,7 +1721,7 @@ async fn revert_resolve_theirs_local(
         args,
         revert_resolve_theirs,
         move |repository, token, args| async move {
-            revision::revert::revert_resolve_theirs(repository, &token, args.paths)
+            revision::revert::revert_resolve_theirs_boxed(repository, &token, args.paths)
                 .await
                 .forward::<MergeError>("resolving revert with theirs")
         },
@@ -1710,6 +1732,57 @@ async fn revert_resolve_theirs_local(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cherry_pick_args_old_payload_missing_inherit_metadata_uses_default() {
+        // Old IPC client payload with no inherit_metadata field. The new field
+        // must be `#[serde(default)]` so old clients keep working.
+        let full = LoreRevisionCherryPickArgs {
+            revision: "main@3".into(),
+            message: "pick".into(),
+            no_commit: 0,
+            inherit_metadata: LoreArray::from_vec(vec![LoreString::from("change-request")]),
+        };
+        let mut payload = serde_json::to_value(&full).expect("args must serialise");
+        payload
+            .as_object_mut()
+            .expect("args serialise to an object")
+            .remove("inherit_metadata")
+            .expect("the field must be present before it is removed");
+
+        let args: LoreRevisionCherryPickArgs =
+            serde_json::from_value(payload).expect("old payload must deserialise");
+
+        assert_eq!(args.revision.as_str(), "main@3");
+        assert_eq!(args.message.as_str(), "pick");
+        assert!(args.inherit_metadata.as_slice().is_empty());
+    }
+
+    #[test]
+    fn sync_args_old_payload_missing_view_uses_default() {
+        // Old IPC client payload with no view field. The new field must be
+        // `#[serde(default)]` so old clients keep working.
+        let full = LoreRevisionSyncArgs {
+            revision: "main@3".into(),
+            view: "views/engine.filter".into(),
+            ..Default::default()
+        };
+        let mut payload = serde_json::to_value(&full).expect("args must serialise");
+        payload
+            .as_object_mut()
+            .expect("args serialise to an object")
+            .remove("view")
+            .expect("the field must be present before it is removed");
+
+        let args: LoreRevisionSyncArgs =
+            serde_json::from_value(payload).expect("old payload must deserialise");
+
+        assert_eq!(args.revision.as_str(), "main@3");
+        assert!(
+            args.view.is_empty(),
+            "an omitted view keeps the view the instance holds"
+        );
+    }
 
     #[test]
     fn commit_args_old_payload_missing_layer_fields_uses_defaults() {

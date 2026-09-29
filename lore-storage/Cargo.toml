@@ -25,6 +25,7 @@ lz4-sys = { workspace = true }
 zstd-sys = { workspace = true }
 opentelemetry = { workspace = true }
 parking_lot = { workspace = true }
+pin-project = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 smallvec = { workspace = true }
@@ -43,6 +44,10 @@ default = []
 failure_generator = []
 oodle = []
 trace_log = []
+
+[dev-dependencies]
+# The shared test temp-directory helper, re-exported by src/test_util.rs.
+lore-base = { workspace = true, features = ["test-util"] }
 
 [target.'cfg(target_family = "windows")'.dependencies]
 # `Win32_Storage_FileSystem` does not imply `Win32_Foundation`, and the packstore reads its error

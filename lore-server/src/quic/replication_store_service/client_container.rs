@@ -45,6 +45,7 @@ pub struct QuicClientFactory {
     pub transport_config: TransportConfig,
     pub quic_max_reconnects: Option<u32>,
     pub sni_override: Option<String>,
+    pub user_agent: Option<String>,
 }
 
 impl QuicClientFactory {
@@ -64,6 +65,7 @@ impl QuicClientFactory {
             },
             quic_max_reconnects: None,
             sni_override: None,
+            user_agent: None,
         }
     }
 }
@@ -85,6 +87,7 @@ impl ClientFactory for QuicClientFactory {
             transport_config,
             self.command_behavior.clone(),
             self.quic_max_reconnects,
+            self.user_agent.clone(),
         )
         .await?;
         Ok(client)
@@ -254,6 +257,7 @@ mod tests {
     use tokio::sync::mpsc::Receiver;
 
     use super::*;
+    use crate::protocol::replication_store::copy::ImmutableCopy;
     use crate::protocol::replication_store::get::Get;
     use crate::protocol::replication_store::get_metadata::GetMetadata;
     use crate::protocol::replication_store::obliterate::Obliterate;
@@ -279,6 +283,7 @@ mod tests {
             async fn local_get_metadata(&self, request: GetMetadata) -> Result<StoreGetData, ReplicationStoreClientError>;
             async fn query(&self, request: Query) -> Result<QueryResponse, ReplicationStoreClientError>;
             async fn local_query(&self, request: Query) -> Result<QueryResponse, ReplicationStoreClientError>;
+            async fn copy(&self, request: ImmutableCopy) -> Result<(), ReplicationStoreClientError>;
         }
     }
 

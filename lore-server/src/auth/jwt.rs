@@ -18,26 +18,6 @@ use tracing::warn;
 use super::jwk::JWKServiceError;
 use crate::auth::jwk::JWKService;
 
-#[serde_as]
-#[derive(Debug, Deserialize, Clone, Serialize, PartialEq)]
-pub struct JWTUserInfo {
-    #[serde(rename = "sub")]
-    pub user_id: String,
-    #[serde(rename = "iss")]
-    pub issuer: String,
-    #[serde(rename = "iat")]
-    pub issued_at: u64,
-    #[serde_as(as = "OneOrMany<_, PreferMany>")]
-    #[serde(rename = "aud")]
-    pub audience: Vec<String>,
-    pub env: String,
-    pub name: String,
-    pub preferred_username: String,
-    pub is_service_account: Option<bool>,
-    #[serde(rename = "exp")]
-    pub expires: u64,
-}
-
 /// From Lore protos, but cannot derive deserialize on external type
 #[derive(Debug, Deserialize, Clone, Serialize, PartialEq)]
 pub struct ResourcePermission {
@@ -46,15 +26,101 @@ pub struct ResourcePermission {
 }
 
 impl ResourcePermission {
-    pub fn is_wildcard_resource(&self) -> bool {
-        self.resource_id == "urc-*"
+    pub fn is_wildcard_resource(&self, wildcard: &str) -> bool {
+        self.resource_id == wildcard
     }
 
-    pub fn matches_repository(&self, repository_id: &String) -> bool {
-        self.resource_id == *repository_id || self.is_wildcard_resource()
+    pub fn matches_resource(&self, resource_id: &str, wildcard: &str) -> bool {
+        self.resource_id == resource_id || self.is_wildcard_resource(wildcard)
     }
 }
 
+/// The legacy `UrcAuthApi` resource shape: the default for the
+/// `resource_id_template` setting and for the fixed matcher the legacy
+/// readers use.
+pub const DEFAULT_RESOURCE_ID_TEMPLATE: &str = "urc-{id}";
+/// The legacy wildcard, the `resource_wildcard` setting's default.
+pub const DEFAULT_RESOURCE_WILDCARD: &str = "urc-*";
+/// The `identity_claim` setting's default: the token's subject.
+pub const DEFAULT_IDENTITY_CLAIM: &str = "sub";
+
+/// Renders repository ids into resource names and matches grant entries
+/// against them. The defaults reproduce the legacy `UrcAuthApi` shape for
+/// backwards compatibility.
+#[derive(Clone, Debug)]
+pub struct ResourceMatcher {
+    resource_id_template: String,
+    resource_wildcard: String,
+}
+
+impl Default for ResourceMatcher {
+    fn default() -> Self {
+        Self::new(
+            DEFAULT_RESOURCE_ID_TEMPLATE.to_string(),
+            DEFAULT_RESOURCE_WILDCARD.to_string(),
+        )
+    }
+}
+
+impl ResourceMatcher {
+    pub fn new(resource_id_template: String, resource_wildcard: String) -> Self {
+        Self {
+            resource_id_template,
+            resource_wildcard,
+        }
+    }
+
+    /// The resource name `repository` renders to under the template.
+    pub fn resource_for(&self, repository: lore_base::types::RepositoryId) -> String {
+        self.resource_id_template
+            .replace("{id}", &repository.to_string())
+    }
+
+    /// Whether any entry matches `repository`, wildcard included.
+    pub fn any_match(
+        &self,
+        resources: &[ResourcePermission],
+        repository: lore_base::types::RepositoryId,
+    ) -> bool {
+        let resource_id = self.resource_for(repository);
+        resources
+            .iter()
+            .any(|entry| entry.matches_resource(&resource_id, &self.resource_wildcard))
+    }
+
+    /// Whether some entry matching `repository` grants `action`. The
+    /// per-question form of [`merged_permissions`](Self::merged_permissions):
+    /// it visits the entries in place rather than building the merged set.
+    pub fn permits(
+        &self,
+        resources: &[ResourcePermission],
+        repository: lore_base::types::RepositoryId,
+        action: &str,
+    ) -> bool {
+        let resource_id = self.resource_for(repository);
+        resources
+            .iter()
+            .filter(|entry| entry.matches_resource(&resource_id, &self.resource_wildcard))
+            .any(|entry| entry.permission.iter().any(|granted| granted == action))
+    }
+
+    /// The actions granted on `repository`, merged across every matching
+    /// entry, wildcard included.
+    pub fn merged_permissions(
+        &self,
+        resources: &[ResourcePermission],
+        repository: lore_base::types::RepositoryId,
+    ) -> Vec<String> {
+        let resource_id = self.resource_for(repository);
+        resources
+            .iter()
+            .filter(|entry| entry.matches_resource(&resource_id, &self.resource_wildcard))
+            .flat_map(|entry| entry.permission.iter().cloned())
+            .collect()
+    }
+}
+
+/// The required set is `iss`, `sub`, `aud`, `exp`, `iat`.
 #[serde_as]
 #[derive(Debug, Deserialize, Clone, Serialize, PartialEq, Default)]
 pub struct AuthorizationToken {
@@ -69,13 +135,66 @@ pub struct AuthorizationToken {
     #[serde_as(as = "OneOrMany<_, PreferMany>")]
     #[serde(rename = "aud")]
     pub audience: Vec<String>,
-    pub env: String,
-    pub name: String,
-    pub preferred_username: String,
+    pub env: Option<String>,
+    pub name: Option<String>,
+    pub preferred_username: Option<String>,
+    pub client_id: Option<String>,
     pub resources: Option<Vec<ResourcePermission>>,
     pub groups: Option<Vec<String>>,
     pub is_service_account: Option<bool>,
-    pub idp: String,
+    pub idp: Option<String>,
+    /// Every claim the named fields do not consume, kept so configurable
+    /// claim paths (`permission_claim = "realm_access.roles"`) can reach
+    /// claims this struct does not name.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+    /// The caller's identity, resolved from the claim that is configured
+    /// in `[server.auth].identity_claim`. Uses `sub` by default.
+    #[serde(skip)]
+    pub identity: Option<String>,
+}
+
+impl AuthorizationToken {
+    /// Token's unique identity: either the claim configured in
+    /// `[server.auth].identity_claim`, or the value of `sub`, if a custom
+    /// claim is not configured.
+    pub fn identity(&self) -> &str {
+        self.identity.as_deref().unwrap_or(&self.user_id)
+    }
+
+    /// Resolve a dotted claim path (`realm_access.roles`) against the named
+    /// fields first and then [`extra`](Self::extra). The value is returned by
+    /// clone: named fields are not stored as JSON values, so a borrowed
+    /// return cannot cover them.
+    pub fn claim_at(&self, dotted_path: &str) -> Option<serde_json::Value> {
+        let mut segments = dotted_path.split('.');
+        let root = self.root_claim(segments.next()?)?;
+        segments.try_fold(root, |value, segment| value.get(segment).cloned())
+    }
+
+    /// The value of a single top-level claim. Named fields shadow `extra`,
+    /// which mirrors decoding: a claim a named field consumes never lands in
+    /// `extra`, so the named field is the only truth for it.
+    fn root_claim(&self, claim: &str) -> Option<serde_json::Value> {
+        use serde_json::json;
+
+        match claim {
+            "sub" => Some(json!(self.user_id)),
+            "iss" => Some(json!(self.issuer)),
+            "iat" => Some(json!(self.issued_at)),
+            "exp" => Some(json!(self.expires)),
+            "aud" => Some(json!(self.audience)),
+            "env" => self.env.as_ref().map(|v| json!(v)),
+            "name" => self.name.as_ref().map(|v| json!(v)),
+            "preferred_username" => self.preferred_username.as_ref().map(|v| json!(v)),
+            "client_id" => self.client_id.as_ref().map(|v| json!(v)),
+            "resources" => self.resources.as_ref().map(|v| json!(v)),
+            "groups" => self.groups.as_ref().map(|v| json!(v)),
+            "is_service_account" => self.is_service_account.map(|v| json!(v)),
+            "idp" => self.idp.as_ref().map(|v| json!(v)),
+            other => self.extra.get(other).cloned(),
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -86,15 +205,35 @@ pub enum JwtVerifierError {
     KeyNotFound(#[from] JWKServiceError),
     #[error("JWT validation failed")]
     ValidationFailed(#[from] jsonwebtoken::errors::Error),
-    #[error("JWT authorization failed")]
-    NotAuthorized,
+    #[error("JWT carries no non-empty string at the identity claim `{claim}`")]
+    IdentityClaimMissing { claim: String },
+    #[error("JWT header `typ` is absent or not an accepted type")]
+    TypNotAccepted,
 }
 
 #[derive(Clone)]
 pub struct JwtVerifier {
     pub jwk_service: Arc<dyn JWKService>,
-    pub jwt_issuer: Option<String>,
+    /// Every `iss` value verification accepts. Two entries during an issuer's
+    /// cutover, one otherwise (see [`AuthSettings::jwt_issuer`](crate::settings::AuthSettings)).
+    pub jwt_issuer: Option<Vec<String>>,
     pub jwt_audience: Option<Vec<String>>,
+    /// Accepted `typ` header values.
+    /// `None` skips the check (see [`AuthSettings::jwt_typ`](crate::settings::AuthSettings)).
+    pub jwt_typ: Option<Vec<String>>,
+    /// Dotted path of the claim recorded and compared as the caller's
+    /// identity (see [`AuthSettings::identity_claim`](crate::settings::AuthSettings)).
+    pub identity_claim: String,
+}
+
+/// The comparison form of a `typ` header value. RFC 7515 §4.1.9 makes the
+/// value a media type, so it is case-insensitive and may omit the
+/// `application/` prefix: `at+jwt`, `application/at+jwt` and `AT+JWT` are
+/// all the same type. Nothing else is forgiven: surrounding whitespace is
+/// not part of a media type, so ` at+jwt ` is not `at+jwt`.
+fn normalize_typ(typ: &str) -> String {
+    let typ = typ.to_ascii_lowercase();
+    typ.strip_prefix("application/").unwrap_or(&typ).to_string()
 }
 
 /// Whether a verification failure could be the signing key's fault rather than the token's.
@@ -119,6 +258,7 @@ impl JwtVerifier {
     /// signed with the new material fails until the process restarts.
     pub async fn verify_token(&self, token: &str) -> Result<AuthorizationToken, JwtVerifierError> {
         let header = decode_header(token).map_err(JwtVerifierError::ValidationFailed)?;
+        self.check_typ(&header)?;
         let kid = header.kid.ok_or(JwtVerifierError::HeaderKIDMissing)?;
 
         let (key, alg) = self
@@ -159,6 +299,7 @@ impl JwtVerifier {
         token: &str,
     ) -> Result<Option<AuthorizationToken>, JwtVerifierError> {
         let header = decode_header(token).map_err(JwtVerifierError::ValidationFailed)?;
+        self.check_typ(&header)?;
         let kid = header.kid.ok_or(JwtVerifierError::HeaderKIDMissing)?;
 
         let Some((key, alg)) = self.jwk_service.get_cached_key(&kid) else {
@@ -179,7 +320,7 @@ impl JwtVerifier {
     ) -> Result<AuthorizationToken, JwtVerifierError> {
         let mut validation = Validation::new(*alg);
         if let Some(iss) = self.jwt_issuer.as_ref() {
-            validation.set_issuer(&[iss]);
+            validation.set_issuer(iss);
         }
         if let Some(aud) = self.jwt_audience.as_ref() {
             validation.set_audience(aud);
@@ -189,55 +330,63 @@ impl JwtVerifier {
 
         debug!("Decoding JWT token");
 
-        if let Ok(token_data) = decode::<AuthorizationToken>(token, key, &validation) {
-            debug!("Decoded user info: {:?}", token_data.claims);
-            Ok(token_data.claims)
-        } else {
-            let token_data = decode::<JWTUserInfo>(token, key, &validation).map_err(|error| {
+        let token_data =
+            decode::<AuthorizationToken>(token, key, &validation).map_err(|error| {
                 if matches!(
                     error.kind(),
                     jsonwebtoken::errors::ErrorKind::ExpiredSignature
                 ) {
-                    debug!(error = ?error, "Allowable error decoding JWT AuthN token");
+                    debug!(error = ?error, "Allowable error decoding JWT token");
                 } else {
-                    warn!(error = ?error, "Unexpected error decoding JWT AuthN token");
+                    warn!(error = ?error, "Unexpected error decoding JWT token");
                 }
                 JwtVerifierError::ValidationFailed(error)
             })?;
 
-            let token = token_data.claims;
-            Ok(AuthorizationToken {
-                user_id: token.user_id,
-                issuer: token.issuer,
-                issued_at: token.issued_at,
-                expires: token.expires,
-                audience: token.audience,
-                env: token.env,
-                name: token.name,
-                preferred_username: token.preferred_username,
-                resources: None,
-                groups: None,
-                is_service_account: token.is_service_account,
-                idp: String::default(),
-            })
-        }
+        debug!("Decoded user info: {:?}", token_data.claims);
+        let mut claims = token_data.claims;
+        claims.identity = self.resolve_identity(&claims)?;
+        Ok(claims)
     }
-}
 
-pub fn verify_authorization(
-    authorization: &AuthorizationToken,
-    repository: lore_revision::lore::RepositoryId,
-) -> Result<(), JwtVerifierError> {
-    if let Some(resources) = authorization.resources.as_ref() {
-        let checked_repository = format!("urc-{repository}");
-        for authorized_resource in resources.iter() {
-            if authorized_resource.matches_repository(&checked_repository) {
-                return Ok(());
+    fn check_typ(&self, header: &jsonwebtoken::Header) -> Result<(), JwtVerifierError> {
+        let Some(accepted) = self.jwt_typ.as_ref() else {
+            return Ok(());
+        };
+        let presented = header.typ.as_deref().map(normalize_typ);
+        let is_accepted = presented.is_some_and(|presented| {
+            accepted
+                .iter()
+                .any(|accepted| normalize_typ(accepted) == presented)
+        });
+        if is_accepted {
+            return Ok(());
+        }
+        warn!("Rejecting token: the `typ` header is absent or not an accepted type");
+        Err(JwtVerifierError::TypNotAccepted)
+    }
+
+    /// `None` when the configured claim is `sub`, which `user_id` holds.
+    fn resolve_identity(
+        &self,
+        claims: &AuthorizationToken,
+    ) -> Result<Option<String>, JwtVerifierError> {
+        if self.identity_claim == DEFAULT_IDENTITY_CLAIM {
+            return Ok(None);
+        }
+        match claims.claim_at(&self.identity_claim) {
+            Some(serde_json::Value::String(identity)) if !identity.is_empty() => Ok(Some(identity)),
+            _ => {
+                warn!(
+                    claim = self.identity_claim,
+                    "Rejecting token: the identity claim is absent or not a string"
+                );
+                Err(JwtVerifierError::IdentityClaimMissing {
+                    claim: self.identity_claim.clone(),
+                })
             }
         }
     }
-
-    Err(JwtVerifierError::NotAuthorized)
 }
 
 #[cfg(test)]
@@ -251,6 +400,38 @@ mod tests {
 
     use super::*;
 
+    /// The in-place action check agrees with the merged set it stands in for:
+    /// only entries matching the partition count, the wildcard included.
+    #[test]
+    fn permits_reads_only_matching_entries() {
+        let matcher = ResourceMatcher::default();
+        let repository: RepositoryId = Context::from_str("0194b726b34e72b0b45550b88a967076")
+            .unwrap()
+            .into();
+        let entry = |resource_id: &str, permissions: &[&str]| ResourcePermission {
+            resource_id: resource_id.to_string(),
+            permission: permissions.iter().map(ToString::to_string).collect(),
+        };
+        let resources = vec![
+            entry(&format!("urc-{repository}"), &["read"]),
+            entry("urc-somewhere-else", &["obliterate"]),
+            entry("urc-*", &["migrate"]),
+        ];
+        for action in ["read", "migrate", "obliterate", "presign"] {
+            assert_eq!(
+                matcher.permits(&resources, repository, action),
+                matcher
+                    .merged_permissions(&resources, repository)
+                    .iter()
+                    .any(|granted| granted == action),
+                "{action}"
+            );
+        }
+        assert!(matcher.permits(&resources, repository, "migrate"));
+        assert!(!matcher.permits(&resources, repository, "obliterate"));
+        assert!(!matcher.permits(&[], repository, "read"));
+    }
+
     #[test]
     fn resource_permission_matches_wildcard_resource() {
         let wildcard_resource_permission = ResourcePermission {
@@ -261,8 +442,10 @@ mod tests {
             permission: vec![],
             resource_id: "urc-123456".to_string(),
         };
-        assert!(wildcard_resource_permission.is_wildcard_resource());
-        assert!(!non_wildcard_resource_permission.is_wildcard_resource());
+        assert!(wildcard_resource_permission.is_wildcard_resource("urc-*"));
+        assert!(!non_wildcard_resource_permission.is_wildcard_resource("urc-*"));
+        // The wildcard is configuration, not a literal.
+        assert!(non_wildcard_resource_permission.is_wildcard_resource("urc-123456"));
     }
 
     #[test]
@@ -277,80 +460,175 @@ mod tests {
             permission: vec![],
             resource_id: test_repository_id.clone(),
         };
-        assert!(wildcard_resource_permission.matches_repository(&test_repository_id));
-        assert!(wildcard_resource_permission.matches_repository(&unrelated_repository_id));
-        assert!(regular_resource_permission.matches_repository(&test_repository_id));
-        assert!(!regular_resource_permission.matches_repository(&unrelated_repository_id));
+        assert!(wildcard_resource_permission.matches_resource(&test_repository_id, "urc-*"));
+        assert!(wildcard_resource_permission.matches_resource(&unrelated_repository_id, "urc-*"));
+        assert!(regular_resource_permission.matches_resource(&test_repository_id, "urc-*"));
+        assert!(!regular_resource_permission.matches_resource(&unrelated_repository_id, "urc-*"));
     }
 
-    #[test]
-    fn verify_authorization_allows_repo_from_token() {
-        let allowed_repository_id = "urc-0194b726b34e72b0b45550b88a967076".to_string();
-        let resource_permission = ResourcePermission {
-            permission: vec![],
-            resource_id: allowed_repository_id.clone(),
-        };
-        let authorization_token = AuthorizationToken {
-            audience: vec!["test".to_string()],
-            env: "test".to_string(),
-            expires: 1234,
-            user_id: "test".to_string(),
-            idp: "test".to_string(),
-            issuer: "test".to_string(),
-            name: "test".to_string(),
-            preferred_username: "test".to_string(),
-            groups: None,
-            is_service_account: Some(false),
-            issued_at: 123,
-            resources: Some(vec![resource_permission]),
-        };
-        let allowed_context: RepositoryId = Context::from_str("0194b726b34e72b0b45550b88a967076")
-            .unwrap()
-            .into();
-        let unexpected_context: RepositoryId =
-            Context::from_str("f6ca55437aa34198ba0f0fdc33154d51")
-                .unwrap()
-                .into();
-        verify_authorization(&authorization_token, allowed_context).expect("verify auth failed");
-        verify_authorization(&authorization_token, unexpected_context)
-            .expect_err("verify auth should have failed");
+    mod resource_matcher {
+        use super::*;
+
+        fn repository(id: &str) -> RepositoryId {
+            Context::from_str(id).unwrap().into()
+        }
+
+        fn entry(resource_id: &str, permissions: &[&str]) -> ResourcePermission {
+            ResourcePermission {
+                resource_id: resource_id.to_string(),
+                permission: permissions.iter().map(ToString::to_string).collect(),
+            }
+        }
+
+        #[test]
+        fn default_template_reproduces_the_legacy_matching() {
+            let repository_id = "0194b726b34e72b0b45550b88a967076";
+            let matcher = ResourceMatcher::default();
+            assert_eq!(
+                matcher.resource_for(repository(repository_id)),
+                format!("urc-{repository_id}")
+            );
+            let resources = vec![entry(&format!("urc-{repository_id}"), &["push"])];
+            assert!(matcher.any_match(&resources, repository(repository_id)));
+            assert!(!matcher.any_match(&resources, repository("0192ae48ccf17060bc1ba9d04f6acb2f")));
+        }
+
+        #[test]
+        fn a_configured_template_and_wildcard_are_honoured() {
+            let repository_id = "0194b726b34e72b0b45550b88a967076";
+            let matcher = ResourceMatcher::new("repo:{id}".to_string(), "repo:all".to_string());
+            let resources = vec![entry("repo:all", &["read"])];
+            assert!(matcher.any_match(&resources, repository(repository_id)));
+            assert_eq!(
+                matcher.merged_permissions(&resources, repository(repository_id)),
+                vec!["read".to_string()]
+            );
+            // The legacy literal is just another resource id under this config.
+            let legacy = vec![entry("urc-*", &["read"])];
+            assert!(!matcher.any_match(&legacy, repository(repository_id)));
+        }
+
+        #[test]
+        fn permissions_merge_across_all_matching_entries() {
+            let repository_id = "0194b726b34e72b0b45550b88a967076";
+            let matcher = ResourceMatcher::default();
+            let resources = vec![
+                entry(&format!("urc-{repository_id}"), &["push"]),
+                entry("urc-*", &["migrate"]),
+                entry(&format!("urc-{repository_id}"), &["obliterate"]),
+                entry("urc-0192ae48ccf17060bc1ba9d04f6acb2f", &["unrelated"]),
+            ];
+            let merged = matcher.merged_permissions(&resources, repository(repository_id));
+            assert_eq!(
+                merged,
+                vec![
+                    "push".to_string(),
+                    "migrate".to_string(),
+                    "obliterate".to_string()
+                ]
+            );
+        }
     }
 
-    #[test]
-    fn verify_authorization_allows_all_repos_for_wildcard_token() {
-        let resource_permission = ResourcePermission {
-            permission: vec![],
-            resource_id: "urc-*".to_string(),
-        };
-        let wildcard_authorization_token = AuthorizationToken {
-            audience: vec!["test".to_string()],
-            env: "test".to_string(),
-            expires: 1234,
-            user_id: "test".to_string(),
-            idp: "test".to_string(),
-            issuer: "test".to_string(),
-            name: "test".to_string(),
-            preferred_username: "test".to_string(),
-            groups: None,
-            is_service_account: Some(false),
-            issued_at: 123,
-            resources: Some(vec![resource_permission]),
-        };
-        let test_contexts: Vec<RepositoryId> = vec![
-            Context::from_str("0194b726b34e72b0b45550b88a967076")
-                .unwrap()
-                .into(),
-            Context::from_str("f6ca55437aa34198ba0f0fdc33154d51")
-                .unwrap()
-                .into(),
-            Context::from_str("54006a8ca619475881f7083d625a7947")
-                .unwrap()
-                .into(),
-        ];
+    mod claim_at {
+        use serde_json::json;
 
-        for context in test_contexts {
-            verify_authorization(&wildcard_authorization_token, context)
-                .expect("verify auth failed");
+        use super::*;
+
+        fn token_with_extra(extra: serde_json::Value) -> AuthorizationToken {
+            let serde_json::Value::Object(extra) = extra else {
+                panic!("extra claims must be a JSON object");
+            };
+            AuthorizationToken {
+                user_id: "the u".to_string(),
+                name: Some("the name".to_string()),
+                groups: Some(vec!["readers".to_string()]),
+                extra,
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn resolves_a_nested_path() {
+            let token = token_with_extra(json!({
+                "realm_access": { "roles": ["obliterate", "admin"] }
+            }));
+            assert_eq!(
+                token.claim_at("realm_access.roles"),
+                Some(json!(["obliterate", "admin"]))
+            );
+        }
+
+        #[test]
+        fn resolves_a_flat_named_field() {
+            let token = token_with_extra(json!({}));
+            assert_eq!(token.claim_at("groups"), Some(json!(["readers"])));
+        }
+
+        #[test]
+        fn a_missing_path_is_none() {
+            let token = token_with_extra(json!({}));
+            assert_eq!(token.claim_at("realm_access.roles"), None);
+            assert_eq!(token.claim_at("no_such_claim"), None);
+        }
+
+        #[test]
+        fn a_path_through_a_non_object_is_none() {
+            let token = token_with_extra(json!({ "realm_access": "a string" }));
+            assert_eq!(token.claim_at("realm_access.roles"), None);
+            assert_eq!(token.claim_at("name.first"), None);
+        }
+
+        #[test]
+        fn a_named_field_shadows_extra() {
+            // Decoding never puts a consumed claim into `extra`, but a
+            // constructed token can. The named field must win.
+            let token = token_with_extra(json!({ "name": "the impostor" }));
+            assert_eq!(token.claim_at("name"), Some(json!("the name")));
+        }
+
+        /// The `identity` field is the verifier's, not the token's: a claim
+        /// that happens to share the name is an unknown extra claim.
+        #[test]
+        fn a_claim_named_identity_does_not_populate_the_resolved_identity() {
+            let token: AuthorizationToken = serde_json::from_value(json!({
+                "iss": "the issuer",
+                "sub": "the u",
+                "aud": ["Lore"],
+                "iat": 1,
+                "exp": 2,
+                "identity": "the impostor",
+            }))
+            .expect("decodes");
+            assert_eq!(token.identity, None);
+            assert_eq!(token.identity(), "the u");
+            assert_eq!(token.claim_at("identity"), Some(json!("the impostor")));
+
+            let serialized = serde_json::to_value(&token).expect("serializes");
+            assert_eq!(serialized["identity"], json!("the impostor"));
+        }
+
+        /// Decode then re-serialize preserves unknown claims.
+        #[test]
+        fn unknown_claims_survive_a_round_trip() {
+            let claims = json!({
+                "iss": "the issuer",
+                "sub": "the u",
+                "aud": ["Lore"],
+                "iat": 1,
+                "exp": 2,
+                "realm_access": { "roles": ["obliterate"] },
+                "custom_scalar": 42,
+            });
+
+            let token: AuthorizationToken = serde_json::from_value(claims).unwrap();
+            let reserialized = serde_json::to_value(&token).unwrap();
+
+            assert_eq!(
+                reserialized.get("realm_access"),
+                Some(&json!({ "roles": ["obliterate"] }))
+            );
+            assert_eq!(reserialized.get("custom_scalar"), Some(&json!(42)));
         }
     }
 
@@ -486,6 +764,8 @@ mod tests {
                 jwk_service: service,
                 jwt_issuer: None,
                 jwt_audience: Some(vec!["Lore".to_string()]),
+                jwt_typ: None,
+                identity_claim: DEFAULT_IDENTITY_CLAIM.to_string(),
             }
         }
 
@@ -623,6 +903,8 @@ mod tests {
                 jwk_service: Arc::new(service),
                 jwt_issuer: None,
                 jwt_audience: Some(vec!["Lore".to_string()]),
+                jwt_typ: None,
+                identity_claim: DEFAULT_IDENTITY_CLAIM.to_string(),
             }
         }
 
@@ -697,6 +979,8 @@ mod tests {
                 jwk_service: Arc::new(service),
                 jwt_issuer: None,
                 jwt_audience: Some(vec!["Lore".to_string()]),
+                jwt_typ: None,
+                identity_claim: DEFAULT_IDENTITY_CLAIM.to_string(),
             };
 
             let forged = {
@@ -790,9 +1074,10 @@ mod tests {
                 issuer: "the issuer".to_string(),
                 issued_at: 1,
                 audience,
-                env: "the env".to_string(),
-                name: "the name".to_string(),
-                preferred_username: "pu".to_string(),
+                env: Some("the env".to_string()),
+                name: Some("the name".to_string()),
+                preferred_username: Some("pu".to_string()),
+                client_id: None,
                 resources: None,
                 groups: None,
                 is_service_account: Some(false),
@@ -801,36 +1086,14 @@ mod tests {
                     .unwrap()
                     .add(Duration::from_secs(5))
                     .as_secs(),
-                idp: "the idp".to_string(),
-            }
-        }
-
-        fn mock_authn_token(audience: Vec<String>) -> JWTUserInfo {
-            JWTUserInfo {
-                user_id: "the u".to_string(),
-                issuer: "the issuer".to_string(),
-                issued_at: 1,
-                audience,
-                env: "the env".to_string(),
-                name: "the name".to_string(),
-                preferred_username: "pu".to_string(),
-                is_service_account: Some(false),
-                expires: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .add(Duration::from_secs(5))
-                    .as_secs(),
+                idp: Some("the idp".to_string()),
+                extra: Default::default(),
+                identity: None,
             }
         }
 
         fn make_authz_token_with_audience(audience: Vec<String>) -> (AuthorizationToken, String) {
             let jwt_claims = mock_authz_token(audience);
-            let encoded = encode_jwt(&jwt_claims);
-            (jwt_claims, encoded)
-        }
-
-        fn make_authn_token_with_audience(audience: Vec<String>) -> (JWTUserInfo, String) {
-            let jwt_claims = mock_authn_token(audience);
             let encoded = encode_jwt(&jwt_claims);
             (jwt_claims, encoded)
         }
@@ -851,6 +1114,8 @@ mod tests {
                 jwk_service: Arc::new(service),
                 jwt_issuer: None,
                 jwt_audience: Some(vec!["urc.example.com".to_string(), "URC_test".to_string()]),
+                jwt_typ: None,
+                identity_claim: DEFAULT_IDENTITY_CLAIM.to_string(),
             };
 
             let authn_string_audience = json!({
@@ -890,6 +1155,8 @@ mod tests {
                 jwk_service: Arc::new(service),
                 jwt_issuer: None,
                 jwt_audience: Some(vec!["urc.example.com".to_string(), "URC_test".to_string()]),
+                jwt_typ: None,
+                identity_claim: DEFAULT_IDENTITY_CLAIM.to_string(),
             };
 
             let base_authz_token = mock_authz_token(vec!["URC_test".to_string()]);
@@ -926,19 +1193,125 @@ mod tests {
                 jwk_service: Arc::new(service),
                 jwt_issuer: None,
                 jwt_audience: Some(vec!["urc.example.com".to_string(), "Lore".to_string()]),
+                jwt_typ: None,
+                identity_claim: DEFAULT_IDENTITY_CLAIM.to_string(),
             };
             let (original_authz_token, encoded_authz_token) =
                 make_authz_token_with_audience(vec!["Lore".to_string()]);
-            let (original_authn_token, encoded_authn_token) =
-                make_authn_token_with_audience(vec!["Lore".to_string()]);
 
             let verified_authz_token = verifier.verify_token(&encoded_authz_token).await?;
-            let verified_authn_token = verifier.verify_token(&encoded_authn_token).await?;
             assert_eq!(original_authz_token, verified_authz_token);
-            assert_eq!(
-                original_authn_token.audience,
-                verified_authn_token.audience.clone()
-            );
+
+            Ok(())
+        }
+
+        fn verifier_with_issuers(issuers: Vec<String>) -> JwtVerifier {
+            let mut service = MockTestJWKService::new();
+            service.expect_get_key().returning(|_| {
+                Ok((
+                    DecodingKey::from_secret(AGREED_UPON_SIGNING_SECRET.as_ref()),
+                    AGREED_UPON_ALGORITHM,
+                ))
+            });
+
+            JwtVerifier {
+                jwk_service: Arc::new(service),
+                jwt_issuer: Some(issuers),
+                jwt_audience: Some(vec!["Lore".to_string()]),
+                jwt_typ: None,
+                identity_claim: DEFAULT_IDENTITY_CLAIM.to_string(),
+            }
+        }
+
+        fn token_with_issuer(issuer: &str) -> String {
+            let mut claims = mock_authz_token(vec!["Lore".to_string()]);
+            claims.issuer = issuer.to_string();
+            encode_jwt(&claims)
+        }
+
+        /// The test that makes an issuer's `iss` cutover a rollout rather than
+        /// an outage: with the old keyword and the new URL both configured,
+        /// tokens carrying either verify.
+        #[tokio::test]
+        async fn either_of_two_configured_issuers_verifies() -> Result<(), Box<dyn Error>> {
+            let verifier = verifier_with_issuers(vec![
+                "LEGACY_AUTH_KEYWORD".to_string(),
+                "https://auth.example.com/realms/lore".to_string(),
+            ]);
+
+            verifier
+                .verify_token(&token_with_issuer("LEGACY_AUTH_KEYWORD"))
+                .await?;
+            verifier
+                .verify_token(&token_with_issuer("https://auth.example.com/realms/lore"))
+                .await?;
+
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn an_issuer_in_neither_entry_is_refused() {
+            let verifier = verifier_with_issuers(vec![
+                "LEGACY_AUTH_KEYWORD".to_string(),
+                "https://auth.example.com/realms/lore".to_string(),
+            ]);
+
+            let error = verifier
+                .verify_token(&token_with_issuer("https://attacker.example.com"))
+                .await
+                .expect_err("an unlisted issuer is refused");
+            assert!(matches!(error, JwtVerifierError::ValidationFailed(_)));
+        }
+
+        #[tokio::test]
+        async fn a_single_configured_issuer_still_verifies() -> Result<(), Box<dyn Error>> {
+            let verifier = verifier_with_issuers(vec!["LEGACY_AUTH_KEYWORD".to_string()]);
+            verifier
+                .verify_token(&token_with_issuer("LEGACY_AUTH_KEYWORD"))
+                .await?;
+            Ok(())
+        }
+
+        /// A Keycloak-shaped token: only the required claims — `iss`, `sub`, `aud`, `exp`,
+        /// `iat` — no `name`, no `env`, no `idp`. Everything else must default, not
+        /// fail the decode.
+        #[tokio::test]
+        async fn verify_token_with_only_required_claims() -> Result<(), Box<dyn Error>> {
+            let mut service = MockTestJWKService::new();
+            service.expect_get_key().returning(|_| {
+                Ok((
+                    DecodingKey::from_secret(AGREED_UPON_SIGNING_SECRET.as_ref()),
+                    AGREED_UPON_ALGORITHM,
+                ))
+            });
+
+            let verifier = JwtVerifier {
+                jwk_service: Arc::new(service),
+                jwt_issuer: None,
+                jwt_audience: Some(vec!["Lore".to_string()]),
+                jwt_typ: None,
+                identity_claim: DEFAULT_IDENTITY_CLAIM.to_string(),
+            };
+
+            let minimal_claims = json!({
+                "iss": "https://keycloak.example.com/realms/lore",
+                "sub": "f7d3a1c2-0000-0000-0000-000000000000",
+                "aud": "Lore",
+                "iat": 1,
+                "exp": SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .add(Duration::from_secs(5))
+                    .as_secs(),
+            });
+            let encoded = encode_jwt(&minimal_claims);
+
+            let verified = verifier.verify_token(&encoded).await?;
+            assert_eq!(verified.user_id, "f7d3a1c2-0000-0000-0000-000000000000");
+            assert_eq!(verified.name, None);
+            assert_eq!(verified.env, None);
+            assert_eq!(verified.idp, None);
+            assert_eq!(verified.client_id, None);
 
             Ok(())
         }
@@ -960,6 +1333,8 @@ mod tests {
                 jwk_service: Arc::new(service),
                 jwt_issuer: None,
                 jwt_audience: Some(common_audience.clone()),
+                jwt_typ: None,
+                identity_claim: DEFAULT_IDENTITY_CLAIM.to_string(),
             };
 
             let (original_token, encoded_token) = make_authz_token_with_audience(common_audience);
@@ -985,6 +1360,8 @@ mod tests {
                 jwk_service: Arc::new(service),
                 jwt_issuer: None,
                 jwt_audience: Some(vec!["Lore".to_string()]),
+                jwt_typ: None,
+                identity_claim: DEFAULT_IDENTITY_CLAIM.to_string(),
             };
 
             let (original_token, encoded_token) = make_authz_token_with_audience(vec![
@@ -1012,6 +1389,8 @@ mod tests {
                 jwk_service: Arc::new(service),
                 jwt_issuer: None,
                 jwt_audience: Some(vec!["skein".to_string()]),
+                jwt_typ: None,
+                identity_claim: DEFAULT_IDENTITY_CLAIM.to_string(),
             };
 
             let (_, encoded_token) = make_authz_token_with_audience(vec!["Lore".to_string()]);
@@ -1023,6 +1402,269 @@ mod tests {
             ));
 
             Ok(())
+        }
+
+        mod identity_claim {
+            use super::*;
+
+            fn verifier_with_identity_claim(identity_claim: &str) -> JwtVerifier {
+                let mut service = MockTestJWKService::new();
+                service.expect_get_key().returning(|_| {
+                    Ok((
+                        DecodingKey::from_secret(AGREED_UPON_SIGNING_SECRET.as_ref()),
+                        AGREED_UPON_ALGORITHM,
+                    ))
+                });
+                JwtVerifier {
+                    jwk_service: Arc::new(service),
+                    jwt_issuer: None,
+                    jwt_audience: Some(vec!["Lore".to_string()]),
+                    jwt_typ: None,
+                    identity_claim: identity_claim.to_string(),
+                }
+            }
+
+            /// `mock_authz_token` carries `sub = "the u"` and
+            /// `preferred_username = "pu"`.
+            fn encoded_token() -> String {
+                encode_jwt(&mock_authz_token(vec!["Lore".to_string()]))
+            }
+
+            #[tokio::test]
+            async fn the_default_records_the_subject() {
+                let verified = verifier_with_identity_claim(DEFAULT_IDENTITY_CLAIM)
+                    .verify_token(&encoded_token())
+                    .await
+                    .expect("verifies");
+                assert_eq!(verified.identity, None);
+                assert_eq!(verified.identity(), "the u");
+            }
+
+            #[tokio::test]
+            async fn a_configured_claim_is_recorded_beside_the_subject() {
+                let verified = verifier_with_identity_claim("preferred_username")
+                    .verify_token(&encoded_token())
+                    .await
+                    .expect("verifies");
+                assert_eq!(verified.identity(), "pu");
+                assert_eq!(verified.user_id, "the u");
+                assert_eq!(verified.claim_at("sub"), Some(json!("the u")));
+            }
+
+            #[tokio::test]
+            async fn a_nested_claim_path_resolves() {
+                let mut claims = mock_authz_token(vec!["Lore".to_string()]);
+                claims.extra.insert(
+                    "profile".to_string(),
+                    json!({ "handle": "alice@example.com" }),
+                );
+                let verified = verifier_with_identity_claim("profile.handle")
+                    .verify_token(&encode_jwt(&claims))
+                    .await
+                    .expect("verifies");
+                assert_eq!(verified.identity(), "alice@example.com");
+            }
+
+            #[tokio::test]
+            async fn a_token_without_the_claim_is_refused() {
+                let error = verifier_with_identity_claim("oid")
+                    .verify_token(&encoded_token())
+                    .await
+                    .expect_err("no `oid` claim");
+                assert!(matches!(
+                    error,
+                    JwtVerifierError::IdentityClaimMissing { ref claim } if claim == "oid"
+                ));
+            }
+
+            #[tokio::test]
+            async fn a_claim_that_is_not_a_string_is_refused() {
+                verifier_with_identity_claim("is_service_account")
+                    .verify_token(&encoded_token())
+                    .await
+                    .expect_err("a boolean is no identity");
+            }
+
+            #[tokio::test]
+            async fn an_empty_claim_is_refused() {
+                let mut claims = mock_authz_token(vec!["Lore".to_string()]);
+                claims.preferred_username = Some(String::new());
+                verifier_with_identity_claim("preferred_username")
+                    .verify_token(&encode_jwt(&claims))
+                    .await
+                    .expect_err("an empty identity cannot be attributed");
+            }
+
+            /// The cached path resolves the identity as the async path does.
+            #[test]
+            fn the_cached_path_resolves_the_identity_too() {
+                let mut service = MockTestJWKService::new();
+                service.expect_get_cached_key().returning(|_| {
+                    Some((
+                        DecodingKey::from_secret(AGREED_UPON_SIGNING_SECRET.as_ref()),
+                        AGREED_UPON_ALGORITHM,
+                    ))
+                });
+                let verifier = JwtVerifier {
+                    jwk_service: Arc::new(service),
+                    jwt_issuer: None,
+                    jwt_audience: Some(vec!["Lore".to_string()]),
+                    jwt_typ: None,
+                    identity_claim: "preferred_username".to_string(),
+                };
+                let verified = verifier
+                    .try_verify_token_cached(&encoded_token())
+                    .expect("verifies")
+                    .expect("the cache answers");
+                assert_eq!(verified.identity(), "pu");
+            }
+        }
+
+        mod jwt_typ {
+            use super::*;
+
+            fn accepted(types: &[&str]) -> Option<Vec<String>> {
+                Some(types.iter().map(ToString::to_string).collect())
+            }
+
+            fn verifier_with_typ(jwt_typ: Option<Vec<String>>) -> JwtVerifier {
+                let mut service = MockTestJWKService::new();
+                service.expect_get_key().returning(|_| {
+                    Ok((
+                        DecodingKey::from_secret(AGREED_UPON_SIGNING_SECRET.as_ref()),
+                        AGREED_UPON_ALGORITHM,
+                    ))
+                });
+                JwtVerifier {
+                    jwk_service: Arc::new(service),
+                    jwt_issuer: None,
+                    jwt_audience: Some(vec!["Lore".to_string()]),
+                    jwt_typ,
+                    identity_claim: DEFAULT_IDENTITY_CLAIM.to_string(),
+                }
+            }
+
+            /// A verifier whose key service must never be asked, on either path.
+            fn verifier_expecting_no_key_lookup(jwt_typ: Option<Vec<String>>) -> JwtVerifier {
+                let mut service = MockTestJWKService::new();
+                service.expect_get_key().times(0);
+                service.expect_get_cached_key().times(0);
+                service.expect_refresh_key().times(0);
+                JwtVerifier {
+                    jwk_service: Arc::new(service),
+                    jwt_issuer: None,
+                    jwt_audience: Some(vec!["Lore".to_string()]),
+                    jwt_typ,
+                    identity_claim: DEFAULT_IDENTITY_CLAIM.to_string(),
+                }
+            }
+
+            /// `Header::new` sets `typ: "JWT"`; `None` here clears it, as a
+            /// header with no `typ` at all.
+            fn encode_jwt_with_typ(typ: Option<&str>) -> String {
+                let mut header = Header::new(AGREED_UPON_ALGORITHM);
+                header.kid = Some("the kid".into());
+                header.typ = typ.map(str::to_string);
+                encode(
+                    &header,
+                    &mock_authz_token(vec!["Lore".to_string()]),
+                    &EncodingKey::from_secret(AGREED_UPON_SIGNING_SECRET.as_ref()),
+                )
+                .unwrap()
+            }
+
+            /// Off by default: the legacy auth service's tokens carry `typ: JWT`,
+            /// and a token with no `typ` is a valid JWS.
+            #[tokio::test]
+            async fn unset_accepts_any_typ_and_none() {
+                let verifier = verifier_with_typ(None);
+                for typ in [None, Some("JWT"), Some("at+jwt")] {
+                    verifier
+                        .verify_token(&encode_jwt_with_typ(typ))
+                        .await
+                        .unwrap_or_else(|error| panic!("{typ:?} must verify: {error}"));
+                }
+            }
+
+            /// The RFC 9068 §4 rule: no `typ` and `typ: JWT` are refused,
+            /// `at+jwt` is accepted.
+            #[tokio::test]
+            async fn at_jwt_refuses_a_missing_or_plain_jwt_typ_without_a_key_lookup() {
+                let verifier = verifier_expecting_no_key_lookup(accepted(&["at+jwt"]));
+                for typ in [None, Some("JWT")] {
+                    let Err(error) = verifier.verify_token(&encode_jwt_with_typ(typ)).await else {
+                        panic!("{typ:?} must be refused");
+                    };
+                    assert!(matches!(error, JwtVerifierError::TypNotAccepted));
+                }
+            }
+
+            #[tokio::test]
+            async fn at_jwt_verifies_under_the_rfc_9068_rule() {
+                verifier_with_typ(accepted(&["at+jwt"]))
+                    .verify_token(&encode_jwt_with_typ(Some("at+jwt")))
+                    .await
+                    .expect("at+jwt verifies");
+            }
+
+            /// RFC 7515 §4.1.9: `typ` is a media type, so the `application/`
+            /// prefix is optional on either side and case does not matter.
+            #[tokio::test]
+            async fn typ_compares_as_a_media_type() {
+                let bare = verifier_with_typ(accepted(&["at+jwt"]));
+                for typ in ["application/at+jwt", "AT+JWT", "Application/AT+JWT"] {
+                    bare.verify_token(&encode_jwt_with_typ(Some(typ)))
+                        .await
+                        .unwrap_or_else(|error| panic!("{typ} must verify: {error}"));
+                }
+                verifier_with_typ(accepted(&["application/at+jwt"]))
+                    .verify_token(&encode_jwt_with_typ(Some("at+jwt")))
+                    .await
+                    .expect("a prefixed configuration accepts the bare header");
+            }
+
+            /// Case and the prefix are the only tolerated variations. A header
+            /// padded with whitespace names no media type and is refused, so
+            /// this verifier agrees with a consumer reading `typ` strictly.
+            #[tokio::test]
+            async fn whitespace_around_the_typ_is_not_forgiven() {
+                let verifier = verifier_expecting_no_key_lookup(accepted(&["at+jwt"]));
+                for typ in [" at+jwt", "at+jwt ", " at+jwt ", "at+jwt\t"] {
+                    let Err(error) = verifier.verify_token(&encode_jwt_with_typ(Some(typ))).await
+                    else {
+                        panic!("{typ:?} must be refused");
+                    };
+                    assert!(matches!(error, JwtVerifierError::TypNotAccepted));
+                }
+            }
+
+            /// A provider with its own convention lists what it emits, and the
+            /// list is exhaustive: anything else is refused.
+            #[tokio::test]
+            async fn a_listed_convention_is_accepted_and_nothing_else() {
+                let verifier = verifier_with_typ(accepted(&["JWT", "at+jwt"]));
+                for typ in ["JWT", "at+jwt"] {
+                    verifier
+                        .verify_token(&encode_jwt_with_typ(Some(typ)))
+                        .await
+                        .unwrap_or_else(|error| panic!("{typ} must verify: {error}"));
+                }
+                let error = verifier_expecting_no_key_lookup(accepted(&["JWT", "at+jwt"]))
+                    .verify_token(&encode_jwt_with_typ(Some("id+jwt")))
+                    .await
+                    .expect_err("an unlisted type is refused");
+                assert!(matches!(error, JwtVerifierError::TypNotAccepted));
+            }
+
+            /// The interceptor's synchronous path refuses outright rather than
+            /// deferring: no key could change the verdict.
+            #[test]
+            fn the_cached_path_refuses_the_typ_too() {
+                let error = verifier_expecting_no_key_lookup(accepted(&["at+jwt"]))
+                    .try_verify_token_cached(&encode_jwt_with_typ(Some("JWT")))
+                    .expect_err("refused, not deferred");
+                assert!(matches!(error, JwtVerifierError::TypNotAccepted));
+            }
         }
     }
 }

@@ -164,11 +164,23 @@ pub struct LoreBranchListEndEventData {
 
 /// Event data reported at the start of a branch diff.
 #[repr(C)]
-#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchDiffBeginEventData {
-    /// Unused placeholder field.
-    pub _unused: u32,
+    /// Identifier of the source branch of the diff.
+    pub source_branch: BranchId,
+    /// Name of the source branch.
+    pub source_branch_name: LoreString,
+    /// Revision of the source branch used in the diff.
+    pub source_revision: Hash,
+    /// Identifier of the target branch of the diff.
+    pub target_branch: BranchId,
+    /// Name of the target branch.
+    pub target_branch_name: LoreString,
+    /// Revision of the target branch used in the diff.
+    pub target_revision: Hash,
+    /// Base revision the 3-way diff was resolved against.
+    pub base_revision: Hash,
 }
 
 /// Event data describing a single changed node in a branch diff.
@@ -183,23 +195,32 @@ pub struct LoreBranchDiffNodeData {
     /// Set when the change was merged automatically.
     #[serde(with = "u8_as_bool")]
     pub automerged: u8,
+    /// Previous path of the node when it was moved or copied. Empty otherwise.
+    pub from_path: LoreString,
 }
 
 impl LoreBranchDiffNodeData {
     fn new(node_change: &NodeChange) -> Self {
-        let is_directory_or_module = if node_change.action == FileAction::Delete {
+        let is_directory_or_link = if node_change.action == FileAction::Delete {
             !node_change.from.flags.contains(NodeFlags::File)
         } else {
             !node_change.to.flags.contains(NodeFlags::File)
         };
+        let display_path = |path: &str| -> LoreString {
+            if is_directory_or_link {
+                format!("{path}/").into()
+            } else {
+                path.into()
+            }
+        };
         Self {
             action: LoreFileAction::from(node_change.action),
-            path: if is_directory_or_module {
-                format!("{}/", node_change.path.as_str()).into()
-            } else {
-                node_change.path.as_str().into()
-            },
+            path: display_path(node_change.path().as_str()),
             automerged: node_change.flags.is_conflict_automerged().into(),
+            from_path: node_change
+                .move_source()
+                .map(|path| display_path(path.as_str()))
+                .unwrap_or_default(),
         }
     }
 }
@@ -383,7 +404,7 @@ pub const LATEST_STATUS: &str = "branch-head-status";
 pub const LATEST_HISTORY: &str = "branch-head-history";
 pub const LAST_SYNC: &str = "branch-last-sync";
 pub const METADATA: &str = "branch-metadata";
-pub const REVISION_NUMBER_STEP: &str = "branch-revision-number-step";
+pub const REVISION_NUMBER_STEP: &str = "branch-revision-number-step-v2";
 pub const REVISION_LIST_STEP: &str = "branch-revision-list-step";
 pub const DEFAULT_HISTORY_STEP_SIZE: u64 = 100;
 
@@ -398,6 +419,17 @@ pub const CACHED_REVISION_LIST_MAGIC: u32 = u32::from_le_bytes(*b"RLSC");
 /// are discarded on load and rebuilt via backfill — there is no
 /// in-place migration.
 pub const CACHED_REVISION_LIST_VERSION: u32 = 1;
+
+/// "functions" passed to `mutable_key_type` that may exist in the Mutable Store that are no longer
+/// referenced by the codebase, and can be removed without data loss.
+///
+/// These are not guaranteed to exist and depend on the versions of `lore-server` that have been
+/// used against the Mutable Store
+pub const ORPHANED_MUTABLE_STORE_KEY_TYPE_FUNCTIONS: [&str; 1] = [
+    // a revision step acceleration key, that had a bug which meant step boundaries were prematurely
+    // sealed and legitimate revisions could not be found in boundaries where they should have been
+    "branch-revision-number-step",
+];
 
 /// Fixed-size header at the start of every cached revision-list blob.
 /// The remainder of the blob is a packed array of `CachedRevisionItem`.
@@ -476,7 +508,12 @@ pub fn revision_step_key(
     revision_number: u64,
     step_size: u64,
 ) -> (Hash, KeyType) {
-    let key_revision_number = revision_number.div_ceil(step_size) * step_size;
+    // Saturating: a revision number within a step of `u64::MAX` cannot exist, so the
+    // clamped bucket is a key that never matches rather than an overflow panic on a
+    // number taken straight from a request.
+    let key_revision_number = revision_number
+        .div_ceil(step_size)
+        .saturating_mul(step_size);
     let key_type = mutable_key_type(REVISION_NUMBER_STEP);
     let key = hash::hash_function_strs_slice(
         salt,
@@ -500,7 +537,12 @@ pub fn revision_list_step_key(
     revision_number: u64,
     step_size: u64,
 ) -> (Hash, KeyType) {
-    let key_revision_number = revision_number.div_ceil(step_size) * step_size;
+    // Saturating: a revision number within a step of `u64::MAX` cannot exist, so the
+    // clamped bucket is a key that never matches rather than an overflow panic on a
+    // number taken straight from a request.
+    let key_revision_number = revision_number
+        .div_ceil(step_size)
+        .saturating_mul(step_size);
     let key_type = mutable_key_type(REVISION_LIST_STEP);
     let key = hash::hash_function_strs_slice(
         salt,
@@ -1744,7 +1786,7 @@ async fn create_linked_branches(
 
     for (link_id, mounts) in link_groups {
         lore_spawn!(link_tasks, {
-            let link = Arc::new(repository.to_link_context(link_id).await);
+            let link = repository.to_link_context(link_id).await;
             let link_remote = link.remote().await.forward_with::<BranchError, _>(|| {
                 format!("Failed to connect to link repository {link_id}")
             })?;
@@ -2575,7 +2617,7 @@ pub async fn diff3_with_source_cap(
     graft_view: Option<Arc<crate::filter::Filter>>,
     tx: mpsc::Sender<Result<DiffItem, BranchError>>,
 ) -> Result<Diff3Summary, BranchError> {
-    lore_info!(
+    lore_debug!(
         "Branch diff branch {source_branch} revision {source_revision} -> branch {target_branch} revision {target_revision}"
     );
 
@@ -2598,7 +2640,7 @@ pub async fn diff3_with_source_cap(
         return Err(BranchError::from(Divergent));
     }
 
-    lore_info!(
+    lore_debug!(
         "Revision diff base {base_revision} source {source_revision} target {target_revision}"
     );
 
@@ -2608,12 +2650,46 @@ pub async fn diff3_with_source_cap(
         target: target_revision,
     };
 
+    relay_revision_diff3(
+        repository,
+        summary,
+        path,
+        include_same,
+        auto_resolve,
+        source_cap,
+        history_walk_concurrency,
+        graft_view,
+        &tx,
+    )
+    .await?;
+
+    Ok(summary)
+}
+
+/// Drives `revision::diff3` from the resolved base and relays its items through
+/// [`emit_diff_item_with_auto_resolve`].
+///
+/// A function of its own because its stream and items live across several
+/// awaits: kept in [`diff3_with_source_cap`] they would take space in its
+/// future while the base is resolved as well.
+#[allow(clippy::too_many_arguments)]
+async fn relay_revision_diff3(
+    repository: Arc<RepositoryContext>,
+    summary: Diff3Summary,
+    path: Option<RelativePath>,
+    include_same: bool,
+    auto_resolve: bool,
+    source_cap: Option<usize>,
+    history_walk_concurrency: Option<usize>,
+    graft_view: Option<Arc<crate::filter::Filter>>,
+    tx: &mpsc::Sender<Result<DiffItem, BranchError>>,
+) -> Result<(), BranchError> {
     let (inner_tx, mut inner_rx) = mpsc::channel::<Result<DiffItem, StateError>>(256);
     let mut driver = std::pin::pin!(revision::diff3_with_source_cap(
-        repository.clone(),
-        base_revision,
-        source_revision,
-        target_revision,
+        repository,
+        summary.base,
+        summary.source,
+        summary.target,
         path,
         include_same,
         source_cap,
@@ -2626,7 +2702,7 @@ pub async fn diff3_with_source_cap(
             biased;
             item = inner_rx.recv() => if let Some(item) = item {
                 let item = item.forward::<BranchError>("Failed to calculate branch diff")?;
-                emit_diff_item_with_auto_resolve(item, auto_resolve, &tx).await?;
+                emit_diff_item_with_auto_resolve(item, auto_resolve, tx).await?;
             } else {
                 (&mut driver).await.forward::<BranchError>("Failed to calculate branch diff")?;
                 break;
@@ -2635,14 +2711,14 @@ pub async fn diff3_with_source_cap(
                 result.forward::<BranchError>("Failed to calculate branch diff")?;
                 while let Some(item) = inner_rx.recv().await {
                     let item = item.forward::<BranchError>("Failed to calculate branch diff")?;
-                    emit_diff_item_with_auto_resolve(item, auto_resolve, &tx).await?;
+                    emit_diff_item_with_auto_resolve(item, auto_resolve, tx).await?;
                 }
                 break;
             }
         }
     }
 
-    Ok(summary)
+    Ok(())
 }
 
 /// Per-`DiffItem` step of `branch::diff3`'s auto-resolve drain. Kept
@@ -2650,31 +2726,29 @@ pub async fn diff3_with_source_cap(
 /// streaming pipeline's memory bound — each in-flight conflict pins
 /// two `NodeChange`s and three open temp files until the text-merge
 /// completes.
+///
+/// The text merge is boxed. Only a conflict with auto-resolve on reaches it,
+/// and inline it would make the step as large as the merge for every item.
 async fn emit_diff_item_with_auto_resolve(
     item: DiffItem,
     auto_resolve: bool,
     tx: &mpsc::Sender<Result<DiffItem, BranchError>>,
 ) -> Result<(), BranchError> {
-    match item {
-        DiffItem::Change(c) => tx
-            .send(Ok(DiffItem::Change(c)))
-            .await
-            .map_err(|_send_err| Internal::msg("diff3 channel closed").into()),
-        DiffItem::Conflict(pair) => {
-            let (change_from, change_to) = *pair;
-            if auto_resolve
-                && let Some(resolved) = try_auto_resolve_conflict(&change_from, &change_to).await?
-            {
-                return tx
-                    .send(Ok(DiffItem::Change(resolved)))
-                    .await
-                    .map_err(|_send_err| Internal::msg("diff3 channel closed").into());
+    let item = match item {
+        DiffItem::Conflict(pair) if auto_resolve => {
+            match Box::pin(try_auto_resolve_conflict(&pair.0, &pair.1)).await? {
+                Some(resolved) => DiffItem::Change(resolved),
+                None => DiffItem::Conflict(pair),
             }
-            tx.send(Ok(DiffItem::Conflict(Box::new((change_from, change_to)))))
-                .await
-                .map_err(|_send_err| Internal::msg("diff3 channel closed").into())
         }
-    }
+        item => item,
+    };
+    let permit = tx
+        .reserve()
+        .await
+        .map_err(|_closed| Internal::msg("diff3 channel closed"))?;
+    permit.send(Ok(item));
+    Ok(())
 }
 
 /// Realises the three sides of one conflict into temp files and runs
@@ -2685,7 +2759,7 @@ async fn try_auto_resolve_conflict(
     change_from: &NodeChange,
     change_to: &NodeChange,
 ) -> Result<Option<NodeChange>, BranchError> {
-    if change_from.path != change_to.path {
+    if change_from.path() != change_to.path() {
         return Ok(None);
     }
     let theirs_path: PathBuf = util::fs::generate_temppath("theirs");
@@ -2707,22 +2781,23 @@ async fn try_auto_resolve_conflict(
         .to_string_lossy()
         .into_owned();
 
-    if change_from.to.node.is_valid_node_id() {
+    if change_from.to.mapping.node.is_valid_node_id() {
         lore_trace!("Change from theirs has valid to node, realize theirs file {theirs_file}");
         let node = change_from
             .to
+            .mapping
             .state
             .block(
-                change_from.to.repository.clone(),
-                NodeBlock::index(change_from.to.node),
+                change_from.to.mapping.repository.clone(),
+                NodeBlock::index(change_from.to.mapping.node),
             )
             .await
             .forward::<BranchError>("Failed to deserialize revisions state")?
-            .node(Node::index(change_from.to.node));
+            .node(Node::index(change_from.to.mapping.node));
         // TODO(vri): UCS-19228 - Links: Realize link node files during branch sync
         if node.is_file() {
             if sync::realize_scratch_file(
-                change_from.to.repository.clone(),
+                change_from.to.mapping.repository.clone(),
                 &theirs_path,
                 node,
                 Arc::default(),
@@ -2744,7 +2819,7 @@ async fn try_auto_resolve_conflict(
             .await;
     }
 
-    if !crate::infer::infer_is_diffable_by_path(&theirs_path)
+    if !crate::infer::infer_is_diffable(&lore_storage::ContentSource::file(&theirs_path))
         .await
         .unwrap_or(false)
     {
@@ -2752,22 +2827,23 @@ async fn try_auto_resolve_conflict(
         return Ok(None);
     }
 
-    if change_from.from.node.is_valid_node_id() {
+    if change_from.from.mapping.node.is_valid_node_id() {
         lore_trace!("Change from base has valid from node, realize base file {base_file}");
         let node = change_from
             .from
+            .mapping
             .state
             .block(
-                change_from.from.repository.clone(),
-                NodeBlock::index(change_from.from.node),
+                change_from.from.mapping.repository.clone(),
+                NodeBlock::index(change_from.from.mapping.node),
             )
             .await
             .forward::<BranchError>("Failed to deserialize revisions state")?
-            .node(Node::index(change_from.from.node));
+            .node(Node::index(change_from.from.mapping.node));
         // TODO(vri): UCS-19228 - Links: Realize link node files during branch sync
         if node.is_file() {
             if sync::realize_scratch_file(
-                change_from.from.repository.clone(),
+                change_from.from.mapping.repository.clone(),
                 &base_path,
                 node,
                 Arc::default(),
@@ -2789,22 +2865,23 @@ async fn try_auto_resolve_conflict(
             .await;
     }
 
-    if change_to.to.node.is_valid_node_id() {
+    if change_to.to.mapping.node.is_valid_node_id() {
         lore_trace!("Change to mine has valid from node, realize mine file {mine_file}");
         let node = change_to
             .to
+            .mapping
             .state
             .block(
-                change_to.to.repository.clone(),
-                NodeBlock::index(change_to.to.node),
+                change_to.to.mapping.repository.clone(),
+                NodeBlock::index(change_to.to.mapping.node),
             )
             .await
             .forward::<BranchError>("Failed to deserialize revisions state")?
-            .node(Node::index(change_to.to.node));
+            .node(Node::index(change_to.to.mapping.node));
         // TODO(vri): UCS-19228 - Links: Realize link node files during branch sync
         if node.is_file() {
             if sync::realize_scratch_file(
-                change_to.to.repository.clone(),
+                change_to.to.mapping.repository.clone(),
                 &mine_path,
                 node,
                 Arc::default(),
@@ -2865,8 +2942,6 @@ async fn try_auto_resolve_conflict(
             flags: change_to.flags | change::Flags::ConflictAutomerged,
             from: change_to.from.clone(),
             to: change_to.to.clone(),
-            path: change_to.path.clone(),
-            from_path: change_to.from_path.clone(),
         }))
     } else {
         Ok(None)
@@ -3834,8 +3909,26 @@ async fn find_common_ancestor_from_merges(
     }
 }
 
-pub fn dispatch_diff_events(diff: &DiffResult) {
-    event::LoreEvent::BranchDiffBegin(LoreBranchDiffBeginEventData::default()).send();
+/// Send the event that begins a branch diff, reporting the resolved branches
+/// and revisions being compared. Sent before the diff runs, so it precedes
+/// the diff's own diagnostics in the event stream.
+pub fn dispatch_diff_events(
+    diff: &DiffResult,
+    source_branch: BranchId,
+    source_branch_name: &str,
+    target_branch: BranchId,
+    target_branch_name: &str,
+) {
+    event::LoreEvent::BranchDiffBegin(LoreBranchDiffBeginEventData {
+        source_branch,
+        source_branch_name: source_branch_name.into(),
+        source_revision: diff.source,
+        target_branch,
+        target_branch_name: target_branch_name.into(),
+        target_revision: diff.target,
+        base_revision: diff.base,
+    })
+    .send();
 
     event::LoreEvent::BranchDiffChangeBegin(LoreBranchDiffChangeBeginEventData {
         changes_count: diff.changes.len(),
@@ -3872,6 +3965,7 @@ pub fn dispatch_diff_events(diff: &DiffResult) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::path::RelativePathBuf;
 
     fn branch_id(byte: u8) -> BranchId {
         BranchId::from([byte; 16])
@@ -4076,6 +4170,48 @@ mod tests {
             .expect("a null context carries a write token");
         let state = State::new();
         state.set_parent_self(parent);
+        state.set_revision_number(revision_number);
+        state
+            .serialize(repository.clone(), token)
+            .await
+            .expect("serializing the revision state")
+    }
+
+    /// Write a revision on a branch of its own. Without a distinguishing metadata
+    /// hash it would be addressed as, and so be, the revision the parent's own line
+    /// holds at that number.
+    async fn write_branch_revision(
+        repository: &Arc<RepositoryContext>,
+        parent: Hash,
+        revision_number: u64,
+        distinguisher: u8,
+    ) -> Hash {
+        let token = repository
+            .try_write_token()
+            .expect("a null context carries a write token");
+        let state = State::new();
+        state.set_parent_self(parent);
+        state.set_revision_number(revision_number);
+        state.set_metadata_hash(revision(distinguisher));
+        state
+            .serialize(repository.clone(), token)
+            .await
+            .expect("serializing the revision state")
+    }
+
+    /// Write a merge revision, carrying the revision merged in as its other parent.
+    async fn write_merge_revision(
+        repository: &Arc<RepositoryContext>,
+        parent_self: Hash,
+        parent_other: Hash,
+        revision_number: u64,
+    ) -> Hash {
+        let token = repository
+            .try_write_token()
+            .expect("a null context carries a write token");
+        let state = State::new();
+        state.set_parent_self(parent_self);
+        state.set_parent_other(parent_other);
         state.set_revision_number(revision_number);
         state
             .serialize(repository.clone(), token)
@@ -4407,6 +4543,249 @@ mod tests {
         .await;
     }
 
+    /// A trunk 2000 revisions past the branch point, against a search depth of 500,
+    /// with the branch having merged the trunk once in between. The base is the
+    /// revision that merge carried across, which only the merge search can find.
+    #[tokio::test]
+    async fn common_ancestor_finds_an_earlier_merge_beyond_the_search_depth() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            // Numbers chosen to sit either side of the search depth the way the
+            // reported case does: 2000 revisions of trunk since the branch point,
+            // against a depth of 500.
+            let trunk = write_line(&repository, Hash::default(), 1, 3000).await;
+            let branch_point = trunk[999];
+            let merged_in = trunk[1499];
+            let trunk_tip = *trunk.last().expect("the trunk has revisions");
+
+            let branch_first = write_branch_revision(&repository, branch_point, 1001, 200).await;
+            let branch_merge =
+                write_merge_revision(&repository, branch_first, merged_in, 1501).await;
+
+            let target_stack = [BranchPoint {
+                branch: branch_id(9),
+                revision: branch_point,
+            }];
+
+            let from_points = Box::pin(find_common_ancestor_from_branch_points(
+                repository.clone(),
+                branch_id(9),
+                trunk_tip,
+                &[],
+                branch_id(1),
+                branch_merge,
+                &target_stack,
+            ))
+            .await
+            .expect("exhausting the depth is not a failure");
+
+            assert_eq!(
+                from_points,
+                Some(branch_point),
+                "Out of depth, the branch points can only offer the branch point"
+            );
+
+            let from_merges = find_common_ancestor_from_merges(
+                repository,
+                branch_id(9),
+                trunk_tip,
+                branch_id(1),
+                branch_merge,
+                branch_point,
+            )
+            .await
+            .expect("the walk must not fail on readable history");
+
+            assert_eq!(
+                from_merges,
+                Some(merged_in),
+                "The revision the earlier merge carried across is the base, not the branch point"
+            );
+        }))
+        .await;
+    }
+
+    /// The trunk merged the branch 1499 revisions below its tip, three times the
+    /// search depth. The base is the branch revision the trunk holds, reached through
+    /// the trunk's merge revision.
+    #[tokio::test]
+    async fn common_ancestor_is_what_the_trunk_already_merged_of_the_branch() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            let trunk_below = write_line(&repository, Hash::default(), 1, 1500).await;
+            let branch_point = trunk_below[999];
+
+            let branch_first = write_branch_revision(&repository, branch_point, 1001, 220).await;
+            let branch_merged = write_branch_revision(&repository, branch_first, 1002, 221).await;
+            // The branch carried on after the trunk took it, so its tip is not what
+            // the trunk holds.
+            let branch_tip = write_branch_revision(&repository, branch_merged, 1003, 222).await;
+
+            let trunk_merge = write_merge_revision(
+                &repository,
+                *trunk_below.last().expect("the trunk has revisions"),
+                branch_merged,
+                1501,
+            )
+            .await;
+            let trunk_above = write_line(&repository, trunk_merge, 1502, 1499).await;
+            let trunk_tip = *trunk_above.last().expect("the trunk has revisions");
+
+            let target_stack = [BranchPoint {
+                branch: branch_id(9),
+                revision: branch_point,
+            }];
+
+            let from_points = Box::pin(find_common_ancestor_from_branch_points(
+                repository.clone(),
+                branch_id(9),
+                trunk_tip,
+                &[],
+                branch_id(1),
+                branch_tip,
+                &target_stack,
+            ))
+            .await
+            .expect("exhausting the depth is not a failure");
+
+            assert_eq!(
+                from_points,
+                Some(branch_point),
+                "Out of depth, the branch points can only offer the branch point"
+            );
+
+            let from_merges = find_common_ancestor_from_merges(
+                repository,
+                branch_id(9),
+                trunk_tip,
+                branch_id(1),
+                branch_tip,
+                branch_point,
+            )
+            .await
+            .expect("the walk must not fail on readable history");
+
+            assert_eq!(
+                from_merges,
+                Some(branch_merged),
+                "The base is the branch revision the trunk already merged, not the branch point"
+            );
+        }))
+        .await;
+    }
+
+    /// The source carries the earlier merge, and the revision it took sits 1500
+    /// revisions below the target tip. Reaching it means walking the target's line
+    /// three times past the search depth, which the merge search is not bound by.
+    #[tokio::test]
+    async fn common_ancestor_finds_a_merge_the_source_took_far_below_the_target_tip() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            let trunk = write_line(&repository, Hash::default(), 1, 3000).await;
+            let branch_point = trunk[999];
+            let merged_in = trunk[1499];
+            let trunk_tip = *trunk.last().expect("the trunk has revisions");
+
+            let source_first = write_branch_revision(&repository, branch_point, 1001, 210).await;
+            let source_merge =
+                write_merge_revision(&repository, source_first, merged_in, 1501).await;
+
+            let source_stack = [BranchPoint {
+                branch: branch_id(9),
+                revision: branch_point,
+            }];
+
+            let from_points = Box::pin(find_common_ancestor_from_branch_points(
+                repository.clone(),
+                branch_id(1),
+                source_merge,
+                &source_stack,
+                branch_id(9),
+                trunk_tip,
+                &[],
+            ))
+            .await
+            .expect("exhausting the depth is not a failure");
+
+            assert_eq!(
+                from_points,
+                Some(branch_point),
+                "Out of depth, the branch points can only offer the branch point"
+            );
+
+            let from_merges = find_common_ancestor_from_merges(
+                repository,
+                branch_id(1),
+                source_merge,
+                branch_id(9),
+                trunk_tip,
+                branch_point,
+            )
+            .await
+            .expect("the walk must not fail on readable history");
+
+            assert_eq!(
+                from_merges,
+                Some(merged_in),
+                "The walk has to follow the target's line 1500 revisions down to the revision the source already took"
+            );
+        }))
+        .await;
+    }
+
+    /// A branch of two commits that never merged the trunk, with the trunk 1417
+    /// revisions further on. The branch point is the answer, and the merge search
+    /// confirms it rather than leaving it a guess.
+    #[tokio::test]
+    async fn common_ancestor_of_a_branch_that_never_merged_is_its_branch_point() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            let trunk = write_line(&repository, Hash::default(), 1, 2624).await;
+            let branch_point = trunk[1206];
+            let trunk_tip = *trunk.last().expect("the trunk has revisions");
+
+            let branch_first = write_branch_revision(&repository, branch_point, 1208, 201).await;
+            let branch_tip = write_branch_revision(&repository, branch_first, 1209, 202).await;
+
+            let target_stack = [BranchPoint {
+                branch: branch_id(9),
+                revision: branch_point,
+            }];
+
+            let from_points = Box::pin(find_common_ancestor_from_branch_points(
+                repository.clone(),
+                branch_id(9),
+                trunk_tip,
+                &[],
+                branch_id(1),
+                branch_tip,
+                &target_stack,
+            ))
+            .await
+            .expect("exhausting the depth is not a failure");
+
+            assert_eq!(from_points, Some(branch_point));
+
+            let from_merges = find_common_ancestor_from_merges(
+                repository,
+                branch_id(9),
+                trunk_tip,
+                branch_id(1),
+                branch_tip,
+                branch_point,
+            )
+            .await
+            .expect("the walk must not fail on readable history");
+
+            assert_eq!(
+                from_merges,
+                Some(branch_point),
+                "The walk reaches the branch point from both sides, which is what makes it the answer rather than a guess"
+            );
+        }))
+        .await;
+    }
+
     /// Stacks naming no branch in common are the one case with no answer, which
     /// the caller reports as an invalid branch configuration.
     #[tokio::test]
@@ -4521,6 +4900,139 @@ mod tests {
                 "There is nothing to extend an empty line from"
             );
             assert!(empty.is_empty());
+        }))
+        .await;
+    }
+
+    /// A change between two nodes of one kind, carrying the path a move or copy
+    /// came from.
+    fn node_change(
+        repository: &Arc<RepositoryContext>,
+        state: &Arc<State>,
+        action: FileAction,
+        flags: NodeFlags,
+        path: &str,
+        from_path: Option<&str>,
+    ) -> NodeChange {
+        let side = |node, side_path: &str| change::NodeChangeState {
+            mapping: state::NodeMapping {
+                repository: repository.clone(),
+                state: state.clone(),
+                path: RelativePathBuf::new().push_and_freeze(side_path),
+                node,
+            },
+            observed: None,
+            flags,
+            address: Address::default(),
+            mode: 0,
+        };
+        NodeChange {
+            action,
+            flags: change::Flags::None,
+            from: side(1, from_path.unwrap_or_default()),
+            to: side(2, path),
+        }
+    }
+
+    /// Without the source path a receiver reads a move as an add at the new path
+    /// and cannot tell where the content came from.
+    #[tokio::test]
+    async fn diff_change_carries_the_move_source_path() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            let state = State::new();
+            let change = node_change(
+                &repository,
+                &state,
+                FileAction::Move,
+                NodeFlags::File,
+                "new.txt",
+                Some("old.txt"),
+            );
+
+            let data = LoreBranchDiffNodeData::new(&change);
+
+            assert_eq!(data.path.as_str(), "new.txt");
+            assert_eq!(data.from_path.as_str(), "old.txt");
+        }))
+        .await;
+    }
+
+    /// A change that moved nothing maps to the empty string the C API documents,
+    /// not to a dangling pointer a receiver would read past.
+    #[tokio::test]
+    async fn diff_change_without_a_move_reports_no_source_path() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            let state = State::new();
+            let change = node_change(
+                &repository,
+                &state,
+                FileAction::Add,
+                NodeFlags::File,
+                "new.txt",
+                None,
+            );
+
+            let data = LoreBranchDiffNodeData::new(&change);
+
+            assert!(data.from_path.is_empty());
+            assert_eq!(data.from_path.as_str(), "");
+        }))
+        .await;
+    }
+
+    /// Both paths of a moved directory get the trailing separator that tells a
+    /// directory from a file, so the two can be compared as they are reported.
+    #[tokio::test]
+    async fn diff_change_marks_a_moved_directory_on_both_paths() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            let state = State::new();
+            let change = node_change(
+                &repository,
+                &state,
+                FileAction::Move,
+                NodeFlags::NoFlags,
+                "new",
+                Some("old"),
+            );
+
+            let data = LoreBranchDiffNodeData::new(&change);
+
+            assert_eq!(data.path.as_str(), "new/");
+            assert_eq!(data.from_path.as_str(), "old/");
+        }))
+        .await;
+    }
+
+    /// Every three-way diff item passes through the auto-resolve step and few reach the text
+    /// merge, so the step does not hold the merge.
+    #[tokio::test]
+    async fn the_auto_resolve_step_does_not_hold_the_text_merge() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            let state = State::new();
+            let change = node_change(
+                &repository,
+                &state,
+                FileAction::Add,
+                NodeFlags::File,
+                "file.txt",
+                None,
+            );
+            let (tx, _rx) = mpsc::channel(1);
+
+            let merge = try_auto_resolve_conflict(&change, &change);
+            let step =
+                emit_diff_item_with_auto_resolve(DiffItem::Change(change.clone()), true, &tx);
+
+            assert!(
+                size_of_val(&step) < size_of_val(&merge),
+                "the step holds {} bytes, the merge {}",
+                size_of_val(&step),
+                size_of_val(&merge)
+            );
         }))
         .await;
     }

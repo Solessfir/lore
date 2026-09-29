@@ -21,8 +21,6 @@ use zerocopy::IntoBytes;
 
 use crate::bitflagsops;
 use crate::change;
-use crate::change::FileAction;
-use crate::change::NodeChange;
 use crate::errors::InvalidArguments;
 use crate::errors::InvalidNodeHierarchy;
 use crate::errors::Oversized;
@@ -31,6 +29,7 @@ use crate::immutable;
 use crate::immutable::ImmutableError;
 use crate::immutable::ReadBoxFromImmutable;
 use crate::interface::LoreNodeStagedAction;
+use crate::interface::LoreNodeType;
 use crate::lore::Address;
 use crate::lore::CloneHeapAlloc;
 use crate::lore::Hash;
@@ -211,6 +210,16 @@ bitflagsops!(NodeFlags, u16);
 impl NodeFlags {
     pub fn is_directory(&self) -> bool {
         !(self.contains(NodeFlags::File) || self.contains(NodeFlags::Link))
+    }
+
+    pub fn node_type(&self) -> LoreNodeType {
+        if self.contains(NodeFlags::File) {
+            LoreNodeType::File
+        } else if self.contains(NodeFlags::Link) {
+            LoreNodeType::Link
+        } else {
+            LoreNodeType::Directory
+        }
     }
 }
 
@@ -454,6 +463,10 @@ impl Node {
     /// Check if the node is a directory
     pub fn is_directory(&self) -> bool {
         !self.is_file() && !self.is_link()
+    }
+
+    pub fn node_type(&self) -> LoreNodeType {
+        NodeFlags::from_bits_retain(self.flags).node_type()
     }
 
     /// Check if node is marked as discarded
@@ -1356,7 +1369,7 @@ impl NodeBlock {
             return Ok(());
         }
 
-        Box::pin(async move { self.deserialize_nametable_impl(repository).await }).await
+        Box::pin(self.deserialize_nametable_impl(repository)).await
     }
 
     async fn deserialize_nametable_impl(
@@ -1376,7 +1389,7 @@ impl NodeBlock {
                 .with_max_content_size(NODE_NAME_MAX_SIZE as u64),
         )
         .await
-        .internal("Deserialize deprecated name table failed")?;
+        .forward::<StateError>("Deserialize deprecated name table failed")?;
 
         let nametable = HeapBuf::from_slice_in(&bytes, node_block_allocator());
 
@@ -1442,9 +1455,7 @@ impl NodeBlock {
             match NodeBlockDataV2::read_box_from_immutable(repository.clone(), address, true).await
             {
                 Ok(data) => Ok(data),
-                Err(err) => Err(err)
-                    .internal("Deserialize node block failed")
-                    .map_err(StateError::from),
+                Err(err) => Err(err).forward::<StateError>("Deserialize node block failed"),
             }?;
 
         lore_debug!("Converting v2 block data format when deserializing block");
@@ -1857,7 +1868,7 @@ impl NodeLink {
         if self.is_valid_or_root()
             && (repository.id != self.repository || state.revision() != self.revision)
         {
-            let repository = Arc::new(repository.to_link_context(self.repository).await);
+            let repository = repository.to_link_context(self.repository).await;
             let state = State::deserialize(repository.clone(), self.revision).await?;
             Ok((repository, state))
         } else {
@@ -1895,23 +1906,6 @@ impl NodeDelta {
             _unused: 0,
             action: change::FileAction::from_node_flags(node_flags) as u16,
             flags: change_flags.bits(),
-        }
-    }
-
-    pub fn from_node_change(change: NodeChange) -> Self {
-        let node = match change.action {
-            FileAction::Delete => change.from.node,
-            FileAction::Add
-            | FileAction::Move
-            | FileAction::Copy
-            | FileAction::Graft
-            | FileAction::Keep => change.to.node,
-        };
-        NodeDelta {
-            node,
-            _unused: 0,
-            action: change.action as u16,
-            flags: change.flags.bits(),
         }
     }
 }
@@ -1976,9 +1970,10 @@ pub const BLOCK_NODE_FILE_METADATA_COUNT: usize = BLOCK_NODE_COUNT;
 /// Old block count before the metadata block was extended to 512 elements
 const BLOCK_NODE_FILE_METADATA_COUNT_V0: usize = 511;
 
-/// Block of file metadata, 65568 bytes, 32 bytes metadata, 512 blocks of 128 bytes each
+/// Block of file metadata, 65568 bytes, 32 bytes metadata, 512 blocks of 128 bytes each.
+/// Not `Copy`: at 64 KiB, an implicit copy puts the whole block on the stack.
 #[repr(C)]
-#[derive(Clone, Copy, IntoBytes, FromBytes, Immutable)]
+#[derive(Clone, IntoBytes, FromBytes, Immutable)]
 pub struct NodeFileMetadataBlockData {
     /// Block flags
     pub flags: u32,
@@ -1993,9 +1988,10 @@ pub struct NodeFileMetadataBlockData {
 impl ReadBoxFromImmutable for NodeFileMetadataBlockData {}
 block_payload_on_tree_heap!(NodeFileMetadataBlockData, ZeroHeapAlloc, CloneHeapAlloc);
 
-/// Legacy block of file metadata with 511 elements (old format before extension to 512)
+/// Legacy block of file metadata with 511 elements (old format before extension to 512).
+/// Not `Copy`: at 64 KiB, an implicit copy puts the whole block on the stack.
 #[repr(C)]
-#[derive(Clone, Copy, IntoBytes, FromBytes, Immutable)]
+#[derive(IntoBytes, FromBytes, Immutable)]
 struct NodeFileMetadataBlockDataV0 {
     flags: u32,
     version: u32,
@@ -2009,7 +2005,7 @@ block_payload_on_tree_heap!(NodeFileMetadataBlockDataV0, ZeroHeapAlloc);
 impl NodeFileMetadataBlockDataV0 {
     /// Convert the old 511-element block into the current 512-element format.
     /// The last element is zero-initialized.
-    fn into_current(self) -> HeapBox<NodeFileMetadataBlockData> {
+    fn to_current(&self) -> HeapBox<NodeFileMetadataBlockData> {
         let mut block = NodeFileMetadataBlockData::new_from_heap_zeroed();
         block.flags = self.flags;
         block.version = self.version;
@@ -2035,7 +2031,7 @@ impl NodeFileMetadataBlockData {
                 )
                 .await
                 {
-                    Ok(old_block) => Ok(old_block.into_current()),
+                    Ok(old_block) => Ok(old_block.to_current()),
                     Err(_) => Err(original_err),
                 }
             }
@@ -2176,6 +2172,34 @@ impl NodeFileMetadataBlockWriter<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A legacy block keeps its flags, version and 511 entries, and the entry the
+    /// current format adds is zero.
+    #[test]
+    fn a_legacy_file_metadata_block_converts_to_the_current_format() {
+        let mut legacy = NodeFileMetadataBlockDataV0::new_from_heap_zeroed();
+        legacy.flags = 3;
+        legacy.version = 7;
+        for (index, entry) in legacy.node.iter_mut().enumerate() {
+            entry.node = [index as u32 + 1, 0];
+        }
+
+        let current = legacy.to_current();
+
+        assert_eq!((current.flags, current.version), (3, 7));
+        for (index, entry) in current.node[..BLOCK_NODE_FILE_METADATA_COUNT_V0]
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(entry.node, [index as u32 + 1, 0], "entry {index}");
+        }
+        assert!(
+            current.node[BLOCK_NODE_FILE_METADATA_COUNT_V0..]
+                .iter()
+                .all(|entry| entry.as_bytes().iter().all(|&byte| byte == 0)),
+            "the added entry is zero"
+        );
+    }
 
     fn node_with_flags(flags: u16) -> Node {
         Node {
@@ -2333,6 +2357,23 @@ mod tests {
         assert_eq!(
             node.action_bits(),
             NodeFlags::StagedMove.bits() & NodeFlags::ActionBits.bits()
+        );
+    }
+
+    #[test]
+    fn node_type_reads_the_kind_bits_and_ignores_the_rest() {
+        assert_eq!(Node::default().node_type(), LoreNodeType::Directory);
+        assert_eq!(
+            node_with_flags(NodeFlags::File.bits()).node_type(),
+            LoreNodeType::File
+        );
+        assert_eq!(
+            node_with_flags(NodeFlags::Link.bits() | NodeFlags::StagedAdd.bits()).node_type(),
+            LoreNodeType::Link
+        );
+        assert_eq!(
+            node_with_flags(NodeFlags::DirtyModify.bits()).node_type(),
+            LoreNodeType::Directory
         );
     }
 }

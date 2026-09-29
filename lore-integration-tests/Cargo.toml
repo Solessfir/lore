@@ -3,6 +3,26 @@ name = "lore-integration-tests"
 version = "0.1.0"
 edition = "2024"
 publish = false
+# One target for the whole suite, declared below. Autodiscovery would compile
+# every file in tests/ as a test binary of its own, and each is a module of that
+# suite rather than a crate root.
+autotests = false
+
+# The suite runs against the services in compose.yaml, so every test in it is
+# behind `integration_tests`. Naming the feature here keeps a build that does not
+# enable it from linking the target at all, rather than linking a harness that
+# holds no tests.
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+required-features = ["integration_tests"]
+
+# Its own target rather than a module of the suite: it installs a process-wide GC event sink
+# provider, which takes the first registration and would otherwise race the suite's own.
+# Needs no service from compose.yaml, so it is not behind `integration_tests`.
+[[test]]
+name = "store_gc_trigger"
+path = "tests/store_gc_trigger_test.rs"
 
 [dependencies]
 anyhow = { workspace = true }
@@ -18,7 +38,6 @@ serde_json = { workspace = true }
 rs-consul = "0.13.0"
 rustls = { workspace = true, optional = true }
 serde_dynamo = { version = "4.2.14", features = ["aws-sdk-dynamodb+1"] }
-tempfile = "3.21"
 tokio = { workspace = true }
 tokio-stream = { workspace = true, optional = true }
 tonic = { workspace = true, optional = true }
@@ -35,7 +54,10 @@ lore-proto = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+ctor = { workspace = true }
+lore-base = { workspace = true, features = ["test-util"] }
 lore-server = { workspace = true }
+lore-transport = { workspace = true }
 rcgen = { workspace = true }
 
 [features]

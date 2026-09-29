@@ -295,7 +295,7 @@ fn verify_staged_directory_recurse(
     Box::pin(verify_staged_directory(repository, state, node_id))
 }
 
-pub async fn verify(
+pub(crate) async fn verify(
     repository: Arc<RepositoryContext>,
     path: Option<RelativePath>,
     heal: bool,
@@ -304,8 +304,6 @@ pub async fn verify(
         .send();
 
     lore_debug!("Verifying local immutable store");
-
-    repository.immutable_store().compact_stop().await;
 
     repository
         .immutable_store()
@@ -380,6 +378,15 @@ pub async fn verify(
     }
 
     Ok(())
+}
+
+/// Boxed version of [`verify`] for cross-crate use.
+pub fn verify_boxed(
+    repository: Arc<RepositoryContext>,
+    path: Option<RelativePath>,
+    heal: bool,
+) -> crate::BoxFuture<'static, Result<(), RepositoryError>> {
+    Box::pin(verify(repository, path, heal))
 }
 
 async fn verify_node(
@@ -577,7 +584,7 @@ fn verify_node_recurse(
     ))
 }
 
-pub async fn verify_fragment(
+pub(crate) async fn verify_fragment(
     repository: Arc<RepositoryContext>,
     args: VerifyFragmentArgs,
 ) -> Result<(), RepositoryError> {
@@ -598,6 +605,14 @@ pub async fn verify_fragment(
     } else {
         verify_fragment_remote(repository, address, args.heal).await
     }
+}
+
+/// Boxed version of [`verify_fragment`] for cross-crate use.
+pub fn verify_fragment_boxed(
+    repository: Arc<RepositoryContext>,
+    args: VerifyFragmentArgs,
+) -> crate::BoxFuture<'static, Result<(), RepositoryError>> {
+    Box::pin(verify_fragment(repository, args))
 }
 
 async fn verify_fragment_local(

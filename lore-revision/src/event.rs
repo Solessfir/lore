@@ -60,11 +60,13 @@ use crate::branch::push::LoreBranchPushRevisionPushEndEventData;
 use crate::branch::push::LoreBranchPushRevisionPushUpdateEventData;
 use crate::branch::push::LoreBranchPushRevisionUpdateBeginEventData;
 use crate::branch::push::LoreBranchPushRevisionUpdateEndEventData;
+use crate::branch::push::LoreBranchPushStatsEventData;
 use crate::branch::reset::LoreBranchResetEventData;
 use crate::commit::LoreRevisionCommitBeginEventData;
 use crate::commit::LoreRevisionCommitEndEventData;
 use crate::commit::LoreRevisionCommitProgressEventData;
 use crate::commit::LoreRevisionCommitRevisionEventData;
+use crate::commit::LoreRevisionCommitStatsEventData;
 use crate::dependency::LoreDependencyResolveBeginEventData;
 use crate::dependency::LoreDependencyResolveEndEventData;
 use crate::dependency::LoreDependencyResolveItemEventData;
@@ -217,6 +219,7 @@ use crate::revision::sync::LoreRevisionSyncRevisionEventData;
 use crate::revision::sync::LoreRevisionSyncTargetEventData;
 use crate::shared_store::LoreSharedStoreCreateEventData;
 use crate::shared_store::LoreSharedStoreInfoEventData;
+use crate::shared_store::LoreSharedStoreListEventData;
 use crate::stage::LoreFileStageBeginEventData;
 use crate::stage::LoreFileStageEndEventData;
 use crate::stage::LoreFileStageFileEventData;
@@ -400,18 +403,97 @@ impl<'de> serde::Deserialize<'de> for LoreBytes {
     }
 }
 
-/// Small discriminator enum for per-item terminal events in the
-/// content-addressed storage API.
+/// Borrowed writable byte slice the caller hands to the library. The counterpart of
+/// `lore_bytes_t`: the caller owns the memory and the library fills it.
 ///
-/// Narrower than the general library error code — events emitted per
-/// put/get/copy/etc. item embed this code so a caller can branch on the
-/// common cases cheaply without parsing the companion `LORE_EVENT_ERROR`
-/// detail.
+/// A null pointer or zero length means no buffer is supplied, which is what a zero-initialized
+/// value says, as does a length no allocation can have.
 ///
-/// Numbered independently of the general library error code that a `Complete`
-/// event's status carries: `NONE`, `INVALID_ARGUMENTS` and `ADDRESS_NOT_FOUND`
-/// happen to share its values, `INTERNAL` (3 against -1) and `SLOW_DOWN`
-/// (4 against 5) do not. Compare a code from an event only against this enum.
+/// The memory must stay valid, and reach nobody else, for the duration of the call it is passed to.
+/// The buffers supplied by the items of one call must not overlap: the items run alongside each
+/// other, so two covering the same byte would write it at once.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct LoreBytesMut {
+    /// Pointer to the start of the writable slice.
+    pub ptr: *mut core::ffi::c_void,
+    /// Number of bytes available behind `ptr`.
+    pub len: usize,
+}
+
+// SAFETY: as `LoreBytes`, with the caller owning the memory; the call it is handed to bounds the
+// lifetime.
+unsafe impl Send for LoreBytesMut {}
+unsafe impl Sync for LoreBytesMut {}
+
+impl Default for LoreBytesMut {
+    fn default() -> Self {
+        LoreBytesMut {
+            ptr: core::ptr::null_mut(),
+            len: 0,
+        }
+    }
+}
+
+impl LoreBytesMut {
+    /// Whether a buffer is supplied.
+    ///
+    /// A length above `isize::MAX` describes no allocation Rust can address, and reading it as one
+    /// is undefined rather than merely wrong, so such a value is taken as no buffer at all and the
+    /// item is answered the way it is answered without one.
+    pub fn is_supplied(&self) -> bool {
+        !self.ptr.is_null() && self.len > 0 && isize::try_from(self.len).is_ok()
+    }
+}
+
+impl PartialEq for LoreBytesMut {
+    fn eq(&self, other: &Self) -> bool {
+        // Compared as a destination rather than as contents: nothing has written the bytes yet.
+        self.ptr == other.ptr && self.len == other.len
+    }
+}
+
+impl core::fmt::Debug for LoreBytesMut {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LoreBytesMut")
+            .field("supplied", &self.is_supplied())
+            .field("len", &self.len)
+            .finish()
+    }
+}
+
+impl serde::Serialize for LoreBytesMut {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // Only the capacity is part of the request; the library writes the contents.
+        serializer.serialize_u64(self.len as u64)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for LoreBytesMut {
+    fn deserialize<D: serde::Deserializer<'de>>(_deserializer: D) -> Result<Self, D::Error> {
+        Err(serde::de::Error::custom(
+            "LoreBytesMut cannot be deserialized — it names caller memory",
+        ))
+    }
+}
+
+/// Small discriminator enum for the per-item terminal events of the revision-tree API.
+///
+/// Narrower than the general library error code: an event embeds this so a caller can branch on
+/// the common cases cheaply, without reading a message. The cost is that it names only five
+/// outcomes, so errors outside them arrive as `Internal`. The storage API carries a full
+/// [`LoreErrorDetail`] on its per-item events instead, and no longer uses this enum.
+///
+/// The values are the error codes themselves, taken from the registry in
+/// `lore_base::error`, so a code read from a per-item event means the same
+/// thing as the code on `Complete.status`. This enum names the subset a
+/// per-item event can carry; it is not a second numbering.
+///
+/// The variant order is the serialized wire format, not the numbering. Serde
+/// encodes a variant by its declaration index in a non-self-describing format,
+/// and `LoreEvent` crosses the service boundary in one, so reordering these
+/// would silently redecode old payloads as different errors. Add new variants
+/// at the end and change discriminants in place.
 ///
 /// cbindgen:prefix-with-name
 /// cbindgen:rename-all=ScreamingSnakeCase
@@ -422,14 +504,26 @@ pub enum LoreErrorCode {
     #[default]
     None = 0,
     /// The arguments supplied to the operation were invalid.
-    InvalidArguments = 1,
+    InvalidArguments = 3,
     /// A content-addressable object could not be found in any store.
-    AddressNotFound = 2,
+    AddressNotFound = 80,
     /// An internal error occurred.
-    Internal = 3,
+    Internal = -1,
     /// The backing store is overloaded; the caller should retry later.
-    SlowDown = 4,
+    SlowDown = 31,
 }
+
+// cbindgen cannot evaluate a const in a discriminant position — it drops the
+// enum and emits an incomplete type — so the codes above are written out.
+// These tie them back to the registry at compile time: a code that moves in
+// `lore-base` fails the build here rather than silently leaving this enum
+// describing the old numbering.
+const _: () = assert!(LoreErrorCode::Internal as i32 == lore_error_set::Internal::FFI_CODE);
+const _: () =
+    assert!(LoreErrorCode::InvalidArguments as i32 == lore_base::error::InvalidArguments::FFI_CODE);
+const _: () = assert!(LoreErrorCode::SlowDown as i32 == lore_base::error::SlowDown::FFI_CODE);
+const _: () =
+    assert!(LoreErrorCode::AddressNotFound as i32 == lore_base::error::AddressNotFound::FFI_CODE);
 
 /// Data for an error event.
 #[repr(C)]
@@ -1130,6 +1224,8 @@ pub enum LoreEvent {
     SharedStoreCreate(LoreSharedStoreCreateEventData),
     /// Information about a shared store.
     SharedStoreInfo(LoreSharedStoreInfoEventData),
+    /// List of all shared stores.
+    SharedStoreList(LoreSharedStoreListEventData),
     /// One staged entry in a link listing.
     LinkStagedEntry(LoreLinkStagedEntryEventData),
     // Content-addressed storage API
@@ -1211,6 +1307,10 @@ pub enum LoreEvent {
     RevisionTreeBatchComplete(LoreRevisionTreeBatchCompleteEventData),
     /// A metadata-clear entry completed.
     RevisionTreeMetadataClearComplete(LoreRevisionTreeMetadataClearCompleteEventData),
+    /// What a commit has cost so far, or in total once it has drained its writes.
+    RevisionCommitStats(LoreRevisionCommitStatsEventData),
+    /// What a push has cost so far, or in total once it has finished.
+    BranchPushStats(LoreBranchPushStatsEventData),
 }
 
 impl LoreEvent {
@@ -1319,7 +1419,7 @@ mod error_detail_tests {
 
     // A concrete `#[error_set]` error used to exercise the constructor. Its
     // `NotFound` variant wraps `lore_base::error::NotFound`, which carries FFI
-    // code 13, so the detail's `error_code` has a known, non-internal value to
+    // code 79, so the detail's `error_code` has a known, non-internal value to
     // assert against.
     #[error_set]
     enum SampleError {
@@ -1553,5 +1653,36 @@ mod metadata_event_tests {
             decoded.value,
             LoreMetadata::String(crate::interface::LoreString::from("text"))
         );
+    }
+}
+
+#[cfg(test)]
+mod wire_format_tests {
+    use super::LoreErrorCode;
+
+    /// Serde encodes an enum variant by its declaration index, not by its
+    /// explicit discriminant, and `LoreEvent` crosses the service boundary in
+    /// bitcode — a non-self-describing format. These bytes are the wire
+    /// contract: reorder the variants and a peer on an older build has its
+    /// payloads decode as different errors, silently. The discriminants are
+    /// free to change; the order is not. New variants go at the end.
+    #[test]
+    fn variant_order_is_pinned_to_the_wire_format() {
+        for (variant, encoded) in [
+            (LoreErrorCode::None, [0u8]),
+            (LoreErrorCode::InvalidArguments, [1]),
+            (LoreErrorCode::AddressNotFound, [2]),
+            (LoreErrorCode::Internal, [3]),
+            (LoreErrorCode::SlowDown, [4]),
+        ] {
+            assert_eq!(
+                bitcode::serialize(&variant).expect("serialize"),
+                encoded,
+                "{variant:?} moved in declaration order; a payload from an \
+                 older peer would decode as a different error"
+            );
+            let decoded: LoreErrorCode = bitcode::deserialize(&encoded).expect("deserialize");
+            assert_eq!(decoded, variant, "decoding {encoded:?} must be stable");
+        }
     }
 }

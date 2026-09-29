@@ -20,9 +20,10 @@ use tonic::Response;
 use tonic::Status;
 
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
-use crate::grpc::extract_authorization_header;
+use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_user_id;
+use crate::grpc::get_verified_token;
 use crate::grpc::get_write_token;
 use crate::grpc::no_repository_access_status;
 use crate::grpc::warn_error_to_status;
@@ -48,8 +49,7 @@ pub async fn handler(
 ) -> Result<Response<RepositoryMetadataSetResponse>, Status> {
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
-    let authorization = extract_authorization_header(&request);
-    let req = request.into_inner();
+    let (_, extensions, req) = request.into_parts();
 
     let repository_id: Context = req.id.into();
     if repository_id == Context::default() {
@@ -69,13 +69,18 @@ pub async fn handler(
     LORE_CONTEXT
         .scope(execution, async move {
             authorizer
-                .check_repository_access(authorization, repository_id.into())
+                .check_repository_access(
+                    get_verified_token(&extensions).as_ref(),
+                    repository_id.into(),
+                    None,
+                )
                 .await
                 .map_err(|_err| no_repository_access_status())?;
 
             let current_metadata = if !expected.is_zero() {
                 Metadata::deserialize(repository.clone(), expected)
                     .await
+                    .filter_slow_down()?
                     .map_err(|err| {
                         warn_error_to_status(&err, |err| {
                             Status::invalid_argument(format!(
@@ -89,6 +94,7 @@ pub async fn handler(
 
             let proposed_metadata = Metadata::deserialize(repository.clone(), updated)
                 .await
+                .filter_slow_down()?
                 .map_err(|err| {
                     warn_error_to_status(&err, |err| {
                         Status::invalid_argument(format!(
@@ -116,6 +122,7 @@ pub async fn handler(
                     KeyType::RepositoryMetadata,
                 )
                 .await
+                .filter_slow_down()?
                 .map_err(|err| {
                     warn_error_to_status(&err, |err| {
                         Status::internal(format!("failed to update metadata: {err}"))
@@ -181,6 +188,7 @@ async fn validate_binary_blobs(
         let options = lore_revision::immutable::read_options_from_repository(&repo).with_cache();
         if lore_revision::immutable::read(repo.clone(), address, None, options)
             .await
+            .filter_slow_down()?
             .is_err()
         {
             return Err(Status::not_found(format!(
@@ -202,16 +210,38 @@ mod tests {
         use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
         use crate::store::test_store_create;
 
-        mockall::mock! {
-            pub Authorizer {}
+        /// Denies every request.
+        struct DenyAllRepositoryAuthorizer;
 
-            #[async_trait::async_trait]
-            impl RepositoryAuthorizer for Authorizer {
-                async fn check_repository_access(
-                    &self,
-                    authorization: Option<String>,
-                    repository_id: RepositoryId,
-                ) -> Result<(), Status>;
+        #[async_trait::async_trait]
+        impl RepositoryAuthorizer for DenyAllRepositoryAuthorizer {
+            async fn check_repository_access(
+                &self,
+                _token: Option<&crate::authnz::repository_authorizer::VerifiedToken<'_>>,
+                _repository_id: RepositoryId,
+                _action: Option<&str>,
+            ) -> Result<(), Status> {
+                Err(Status::permission_denied("denied"))
+            }
+        }
+
+        /// Permits, recording that the handler asked with `action: None`.
+        #[derive(Default)]
+        struct RecordingPermitAuthorizer {
+            called_with_action_none: std::sync::atomic::AtomicBool,
+        }
+
+        #[async_trait::async_trait]
+        impl RepositoryAuthorizer for RecordingPermitAuthorizer {
+            async fn check_repository_access(
+                &self,
+                _token: Option<&crate::authnz::repository_authorizer::VerifiedToken<'_>>,
+                _repository_id: RepositoryId,
+                action: Option<&str>,
+            ) -> Result<(), Status> {
+                self.called_with_action_none
+                    .store(action.is_none(), std::sync::atomic::Ordering::SeqCst);
+                Ok(())
             }
         }
 
@@ -265,17 +295,19 @@ mod tests {
         #[tokio::test]
         async fn auth_configured_no_access_returns_permission_denied() {
             let (immutable, mutable, _) = test_store_create().await.unwrap();
-            let mut mock = MockAuthorizer::new();
-            mock.expect_check_repository_access()
-                .returning(|_, _| Err(Status::permission_denied("denied")));
             let request = Request::new(RepositoryMetadataSetRequest {
                 id: REPOSITORY_ID.to_vec().into(),
                 expected: vec![0u8; 32].into(),
                 updated: vec![1u8; 32].into(),
             });
-            let err = handler(request, Arc::new(mock), immutable, mutable)
-                .await
-                .unwrap_err();
+            let err = handler(
+                request,
+                Arc::new(DenyAllRepositoryAuthorizer),
+                immutable,
+                mutable,
+            )
+            .await
+            .unwrap_err();
             assert_eq!(err.code(), Code::PermissionDenied);
             assert_eq!(err.message(), "Unauthorized");
         }
@@ -286,17 +318,20 @@ mod tests {
             LORE_CONTEXT
                 .scope(execution, async move {
                     let hash = seed_metadata_blob(immutable.clone(), mutable.clone()).await;
-                    let mut mock = MockAuthorizer::new();
-                    mock.expect_check_repository_access()
-                        .returning(|_, _| Ok(()));
+                    let authorizer = Arc::new(RecordingPermitAuthorizer::default());
                     let request = Request::new(RepositoryMetadataSetRequest {
                         id: REPOSITORY_ID.to_vec().into(),
                         expected: vec![0u8; 32].into(),
                         updated: hash.into(),
                     });
-                    handler(request, Arc::new(mock), immutable, mutable)
+                    handler(request, authorizer.clone(), immutable, mutable)
                         .await
                         .unwrap();
+                    assert!(
+                        authorizer
+                            .called_with_action_none
+                            .load(std::sync::atomic::Ordering::SeqCst)
+                    );
                 })
                 .await;
         }

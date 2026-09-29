@@ -40,6 +40,7 @@ use lore_error_set::prelude::*;
 use lore_transport::Connection;
 use lore_transport::ProtocolError;
 use lore_transport::RepositoryData;
+use lore_transport::SessionPool;
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::task::JoinHandle;
@@ -56,8 +57,10 @@ use crate::filter::Filter;
 use crate::find;
 use crate::fs::filesystem_provider::FilesystemProvider;
 use crate::fs::os::OsFilesystem;
+use crate::fs::swfs::mount_manager_state::MountManagerState;
 use crate::global::GlobalConfig;
 use crate::hash;
+use crate::instance::InstanceId;
 use crate::interface::LoreBranchLocation;
 use crate::interface::LoreError;
 use crate::interface::LoreGlobalArgs;
@@ -185,6 +188,32 @@ pub struct RepositoryConfig {
     pub shared_store_to_use: Option<SharedStoreToUseConfig>,
     pub store: Option<StoreConfig>,
     pub file: Option<FileConfig>,
+    pub vfs: Option<VfsConfig>,
+}
+
+impl RepositoryConfig {
+    pub fn validate(&self) -> Result<(), RepositoryError> {
+        if self.is_swfs()
+            && !matches!(
+                self.shared_store_to_use.as_ref(),
+                Some(SharedStoreToUseConfig {
+                    use_shared_store: Some(true),
+                    ..
+                })
+            )
+        {
+            return Err(RepositoryError::internal(
+                "Using SWFS without using a shared store",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn is_swfs(&self) -> bool {
+        self.vfs
+            .as_ref()
+            .is_some_and(|vfs_config| vfs_config.vfs_type.is_swfs())
+    }
 }
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
@@ -235,14 +264,35 @@ impl StoreConfig {
     }
 }
 
+#[derive(Serialize, Deserialize, Default, Debug, Clone)]
+pub enum VfsType {
+    #[default]
+    None,
+    Swfs,
+}
+
+impl VfsType {
+    pub fn is_swfs(&self) -> bool {
+        matches!(self, VfsType::Swfs)
+    }
+}
+
+#[error_set]
+pub enum VfsConfigError {}
+
+#[derive(Serialize, Deserialize, Default, Debug, Clone)]
+pub struct VfsConfig {
+    pub vfs_type: VfsType,
+}
+
 /// Decides whether the automatic incremental background GC (evictor + compactor) is
 /// spawned for a freshly opened store, returning the caps to spawn it with or
 /// [`ImmutableStoreCreateOptions::none`] to leave it unspawned.
 ///
 /// Incremental GC is the default on write operations (`!read_only`). It is
 /// suppressed by `--no-gc` and on dry-run commands (`suppress_incremental`, which
-/// the caller folds together), since a dry run persists nothing and its background
-/// tasks would otherwise race the dry run's own teardown. Read-only opens never
+/// the caller folds together), since a dry run adds no content to collect and its
+/// background tasks would otherwise race its own teardown. Read-only opens never
 /// spawn it. When enabled but the repository has no `[store]` config, the built-in
 /// [`StoreConfig::client_default`] caps apply.
 fn incremental_gc_options(
@@ -346,7 +396,7 @@ pub enum LoreSharedStoreMode {
 lore_base::carries_no_text!(LoreSharedStoreMode);
 
 impl SharedStoreToUseConfig {
-    pub fn from_cli_args(
+    pub fn from_api_args(
         global_config: &GlobalConfig,
         use_shared_store: LoreSharedStoreMode,
         path: &LoreString,
@@ -552,29 +602,72 @@ pub enum RemoteStatus {
     Failed(ProtocolError),
 }
 
+#[derive(Debug, Clone)]
+pub struct RepositoryPaths {
+    path: PathBuf,
+    dot_path: PathBuf,
+}
+
+/// Refuses a working-copy root that is not valid text.
+///
+/// Every path Lore reports, resolves from a user argument or keys a cache on is built from
+/// this root, and each of those needs one spelling that survives a round trip. A root
+/// without one could only be spelled approximately, so a path parsed back from a report
+/// could name a different file than the one on disk. Refusing once, where a working copy is
+/// opened or created, is what lets every path built from it be spelled losslessly.
+pub fn require_text_root(path: &Path) -> Result<(), RepositoryError> {
+    if path.to_str().is_some() {
+        return Ok(());
+    }
+    Err(RepositoryError::from(InvalidPath {
+        path: path.to_string_lossy().into_owned(),
+    }))
+}
+
+impl RepositoryPaths {
+    pub fn new(path: PathBuf, dot_path: PathBuf) -> Self {
+        Self { path, dot_path }
+    }
+}
+
 pub struct RepositoryContext {
     /// Working-tree path for this repository. `None` for path-less contexts
     /// (server-side handlers, in-memory revision-tree handles) that operate
     /// only on the underlying stores. Code that walks the working tree calls
     /// [`RepositoryContext::require_path`] to fail with
     /// [`RepositoryError::InvalidArguments`] when the path is absent.
-    pub path: Option<PathBuf>,
+    pub paths: Option<RepositoryPaths>,
     immutable_store: Arc<dyn ImmutableStore>,
     mutable_store: Arc<dyn MutableStore>,
     file_system: Arc<dyn FilesystemProvider>,
     pub id: RepositoryId,
+    /// The root top level repository ID.
+    root_id: RepositoryId,
     pub instance_id: crate::instance::InstanceId,
     remote: Arc<tokio::sync::RwLock<RemoteState>>,
     pub filter: Arc<Filter>,
     /// Defaults to allowing every repository; server handlers replace it with
     /// the requester's authorization.
     link_read: CanReadRepository,
-    pub format: RepositoryFormat,
     settings: RepositoryRuntimeSettings,
     is_link: bool,
     is_layer: bool,
     write_token: Option<RepositoryWriteToken>,
     repo_lock: Option<Arc<RepositoryLock>>,
+    /// The storage session pool this repository's reads and writes pick from,
+    /// resolved on first use.
+    ///
+    /// Weak on purpose. The strong reference lives in the connection's session
+    /// cache, and `StorageSession::invalidate` clears that cache when the server
+    /// reports a stale session id — after a reconnect that rotated its session
+    /// map, say. An invalidated pool then stops upgrading here, so the next caller
+    /// resolves a fresh one rather than handing out sessions the server has
+    /// forgotten.
+    session_pool: parking_lot::RwLock<Weak<SessionPool>>,
+    /// The lazy storage session this context's reads and writes carry, built on first
+    /// use. Held strongly: a pending session re-resolves after invalidation, so one
+    /// serves every operation against this context's partition for its lifetime.
+    lazy_session: parking_lot::RwLock<Option<Arc<lore_transport::StorageSession>>>,
 }
 
 impl std::fmt::Debug for RepositoryContext {
@@ -600,61 +693,65 @@ fn remote_arc(state: RemoteState) -> Arc<tokio::sync::RwLock<RemoteState>> {
 }
 
 pub struct RepositoryContextCreationArgs {
-    pub path: Option<PathBuf>,
+    pub paths: Option<RepositoryPaths>,
     pub immutable_store: Arc<dyn ImmutableStore>,
     pub mutable_store: Arc<dyn MutableStore>,
     pub id: RepositoryId,
     pub instance_id: crate::instance::InstanceId,
     pub remote: Result<Arc<Connection>, ProtocolError>,
     pub filter: Arc<Filter>,
-    pub format: RepositoryFormat,
     pub filesystem_provider: Option<Arc<dyn FilesystemProvider>>,
 }
 
 impl RepositoryContext {
     pub fn new(create_args: RepositoryContextCreationArgs) -> Self {
         Self::new_with_state(
-            create_args.path,
+            create_args.paths,
             create_args.immutable_store,
             create_args.mutable_store,
             create_args.id,
             create_args.instance_id,
             RemoteState::from_result(create_args.remote),
             create_args.filter,
-            create_args.format,
             create_args.filesystem_provider,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_state(
-        path: Option<PathBuf>,
+        paths: Option<RepositoryPaths>,
         immutable_store: Arc<dyn ImmutableStore>,
         mutable_store: Arc<dyn MutableStore>,
         id: RepositoryId,
         instance_id: crate::instance::InstanceId,
         remote: RemoteState,
         filter: Arc<Filter>,
-        format: RepositoryFormat,
         filesystem_provider: Option<Arc<dyn FilesystemProvider>>,
     ) -> Self {
-        let file_system = filesystem_provider
-            .unwrap_or_else(|| Self::default_filesystem(path.as_deref().unwrap_or(Path::new(""))));
+        let file_system = filesystem_provider.unwrap_or_else(|| {
+            Self::default_filesystem(
+                paths
+                    .as_ref()
+                    .map_or(Path::new(""), |paths| paths.path.as_ref()),
+            )
+        });
         RepositoryContext {
             link_read: allow_all_repositories(),
-            path,
+            paths,
             immutable_store,
             mutable_store,
             id,
+            root_id: id,
             instance_id,
             remote: remote_arc(remote),
             filter,
-            format,
             settings: RepositoryRuntimeSettings::default(),
             is_link: false,
             is_layer: false,
             write_token: None,
             repo_lock: None,
+            session_pool: Default::default(),
+            lazy_session: Default::default(),
             file_system,
         }
     }
@@ -669,6 +766,10 @@ impl RepositoryContext {
         (self.link_read)(id)
     }
 
+    pub fn path(&self) -> Option<&Path> {
+        self.paths.as_ref().map(|paths| paths.path.as_ref())
+    }
+
     /// Borrow the working-tree path required by filesystem-backed operations.
     /// Returns [`crate::errors::InvalidArguments`] for path-less contexts
     /// (server-side handlers, in-memory revision-tree handles); see the
@@ -676,25 +777,37 @@ impl RepositoryContext {
     /// error directly lets `?` propagate into any caller `error_set` that
     /// carries an `InvalidArguments` variant.
     pub fn require_path(&self) -> Result<&Path, crate::errors::InvalidArguments> {
-        self.path
-            .as_deref()
-            .ok_or_else(|| crate::errors::InvalidArguments {
-                reason: "repository context has no working-tree path".to_string(),
+        self.path().ok_or_else(|| crate::errors::InvalidArguments {
+            reason: "repository context has no working-tree path".to_string(),
+        })
+    }
+
+    pub fn dot_dir_path(&self) -> Result<&Path, crate::errors::InvalidArguments> {
+        if let Some(paths) = &self.paths {
+            Ok(paths.dot_path.as_ref())
+        } else {
+            Err(InvalidArguments {
+                reason: "repository context has no dot lore path".to_string(),
             })
+        }
     }
 
     /// Display the working-tree path for logging and error messages. Renders
     /// `<unset>` for path-less contexts so log lines remain readable when the
     /// working tree is intentionally absent.
     pub fn path_for_display(&self) -> std::path::Display<'_> {
-        self.path
-            .as_deref()
+        self.path()
             .unwrap_or_else(|| Path::new("<unset>"))
             .display()
     }
 
+    /// The root top level repository ID.
+    pub fn root_id(&self) -> RepositoryId {
+        self.root_id
+    }
+
     pub fn salt(&self) -> &'static [u8] {
-        self.format.salt()
+        SALT_LORE
     }
 
     /// Attach a process-local repository `FSLock` holder to this context. The
@@ -756,9 +869,6 @@ impl RepositoryContext {
                 as Arc<dyn std::any::Any + Send + Sync>,
             || {
                 lore_spawn_guarded!(async move {
-                    // Let the store compaction run one step
-                    immutable_store.clone().compact_stop().await;
-
                     let _ = immutable_store.flush(sync_data).await;
                     if let Some(mutable_store) = mutable_store {
                         let _ = mutable_store.flush(sync_data).await;
@@ -863,38 +973,42 @@ impl RepositoryContext {
         RepositoryContext {
             link_read: allow_all_repositories(),
             file_system: Self::default_filesystem(Path::new("")),
-            path: None,
+            paths: None,
             immutable_store,
             mutable_store,
             id,
+            root_id: id,
             instance_id: crate::instance::InstanceId::default(),
             remote: remote_arc(RemoteState::Offline),
             filter: Arc::default(),
-            format: RepositoryFormat::Lore,
             settings: RepositoryRuntimeSettings::default(),
             is_link: false,
             is_layer: false,
             write_token: Some(RepositoryWriteToken::server(&INTERNAL_SERVER_CONTEXT)),
             repo_lock: None,
+            session_pool: Default::default(),
+            lazy_session: Default::default(),
         }
     }
 
     pub fn to_server_context(&self, id: RepositoryId) -> Self {
         RepositoryContext {
             link_read: self.link_read.clone(),
-            path: self.path.clone(),
+            paths: self.paths.clone(),
             immutable_store: self.immutable_store.clone(),
             mutable_store: self.mutable_store.clone(),
             id,
+            root_id: id,
             instance_id: self.instance_id,
             remote: remote_arc(RemoteState::Offline),
             filter: self.filter.clone(),
-            format: self.format,
             settings: self.settings.clone(),
             is_link: false,
             is_layer: false,
             write_token: Some(RepositoryWriteToken::server(&INTERNAL_SERVER_CONTEXT)),
             repo_lock: None,
+            session_pool: Default::default(),
+            lazy_session: Default::default(),
             file_system: self.file_system.clone(),
         }
     }
@@ -906,38 +1020,42 @@ impl RepositoryContext {
         RepositoryContext {
             link_read: allow_all_repositories(),
             file_system: Self::default_filesystem(Path::new("")),
-            path: None,
+            paths: None,
             immutable_store,
             mutable_store,
             id: RepositoryId::default(),
+            root_id: RepositoryId::default(),
             instance_id: crate::instance::InstanceId::default(),
             remote: remote_arc(RemoteState::Offline),
             filter: Arc::default(),
-            format: RepositoryFormat::Lore,
             settings: RepositoryRuntimeSettings::default(),
             is_link: false,
             is_layer: false,
             write_token: Some(RepositoryWriteToken::server(&INTERNAL_SERVER_CONTEXT)),
             repo_lock: None,
+            session_pool: Default::default(),
+            lazy_session: Default::default(),
         }
     }
 
     pub fn to_null_context(&self) -> Self {
         RepositoryContext {
             link_read: self.link_read.clone(),
-            path: self.path.clone(),
+            paths: self.paths.clone(),
             immutable_store: self.immutable_store.clone(),
             mutable_store: self.mutable_store.clone(),
             id: RepositoryId::default(),
+            root_id: RepositoryId::default(),
             instance_id: self.instance_id,
             remote: remote_arc(RemoteState::Offline),
             filter: self.filter.clone(),
-            format: self.format,
             settings: self.settings.clone(),
             is_link: false,
             is_layer: false,
             write_token: None,
             repo_lock: None,
+            session_pool: Default::default(),
+            lazy_session: Default::default(),
             file_system: self.file_system.clone(),
         }
     }
@@ -958,24 +1076,39 @@ impl RepositoryContext {
     ) -> Self {
         RepositoryContext {
             link_read: self.link_read.clone(),
-            path: self.path.clone(),
+            paths: self.paths.clone(),
             immutable_store: self.immutable_store.clone(),
             mutable_store: self.mutable_store.clone(),
             id: self.id,
+            root_id: self.root_id,
             instance_id: self.instance_id,
             remote: remote_arc(RemoteState::from_result(remote)),
             filter,
-            format: self.format,
             settings: self.settings.clone(),
             is_link: self.is_link,
             is_layer: self.is_layer,
             write_token: self.write_token.as_ref().map(|t| t.share()),
             repo_lock: self.repo_lock.clone(),
+            session_pool: Default::default(),
+            lazy_session: Default::default(),
             file_system: self.file_system.clone(),
         }
     }
 
-    pub async fn to_link_context(&self, id: RepositoryId) -> Self {
+    /// This context aimed at the repository a link mounts, keeping the working tree it is
+    /// materialized into.
+    ///
+    /// The mounted repository holds its own tree of nodes, and a node in it is named by the
+    /// state and node id a caller already holds. Every path in a working tree is spelled
+    /// relative to the root this keeps, so the paths a walk carries across a mount stay the
+    /// paths the filesystem, the filter and the modified-time keys answer for. A path within
+    /// the mounted tree is derived from its node where one is called for, by
+    /// [`State::node_path`](crate::state::State::node_path).
+    ///
+    /// The filter is carried over as the same handle, not rebuilt. A diff tells one view from two
+    /// by pointer identity on it, so a fresh handle holding the same rules would leave every diff
+    /// across the mount doing two-view work for a view that has not changed.
+    pub async fn to_link_context(&self, id: RepositoryId) -> Arc<Self> {
         let remote = self.remote().await;
         let remote = if let Ok(remote) = remote {
             remote.connect_module(id).await
@@ -983,25 +1116,29 @@ impl RepositoryContext {
             remote
         };
         let settings = self.settings.clone();
-        RepositoryContext {
+        Arc::new(RepositoryContext {
             link_read: self.link_read.clone(),
-            path: self.path.clone(),
+            paths: self.paths.clone(),
             immutable_store: self.immutable_store.clone(),
             mutable_store: self.mutable_store.clone(),
             id,
+            root_id: self.root_id,
             instance_id: self.instance_id,
             remote: remote_arc(RemoteState::from_result(remote)),
             filter: self.filter.clone(),
-            format: self.format,
             settings,
             is_link: true,
             is_layer: false,
             write_token: self.write_token.as_ref().map(|t| t.share()),
             repo_lock: self.repo_lock.clone(),
+            session_pool: Default::default(),
+            lazy_session: Default::default(),
             file_system: self.file_system.clone(),
-        }
+        })
     }
 
+    /// This context aimed at the repository a layer draws from, keeping the working tree it is
+    /// materialized into, as [`Self::to_link_context`] does for a link.
     pub async fn to_layer_context(&self, id: RepositoryId) -> Self {
         let remote = self.remote().await;
         let remote = if let Ok(remote) = remote {
@@ -1012,39 +1149,53 @@ impl RepositoryContext {
         let settings = self.settings.clone();
         RepositoryContext {
             link_read: self.link_read.clone(),
-            path: self.path.clone(),
+            paths: self.paths.clone(),
             immutable_store: self.immutable_store.clone(),
             mutable_store: self.mutable_store.clone(),
             id,
+            root_id: self.root_id,
             instance_id: self.instance_id,
             remote: remote_arc(RemoteState::from_result(remote)),
             filter: self.filter.clone(),
-            format: self.format,
             settings,
             is_link: false,
             is_layer: true,
             write_token: self.write_token.as_ref().map(|t| t.share()),
             repo_lock: self.repo_lock.clone(),
+            session_pool: Default::default(),
+            lazy_session: Default::default(),
             file_system: self.file_system.clone(),
         }
     }
 
+    /// This context reading the same repository through `filter`, inheriting everything else as
+    /// the same handles, the connection state cell included.
+    ///
+    /// The write token travels, as it does through every other builder here. Writes deep in a read
+    /// path are gated on it and skip themselves without one — chiefly
+    /// [`state::file_modified_against_node`](crate::state::file_modified_against_node), which
+    /// records the modified time of a file a hash check just established as unmodified — so a
+    /// context without one leaves every later pass to pay the hash again. Sharing grants no
+    /// authority the caller does not already hold: the guard is the one `self` holds, and it is
+    /// released once every sibling drops.
     pub fn to_filter_context(&self, filter: Arc<Filter>) -> Self {
         RepositoryContext {
             link_read: self.link_read.clone(),
-            path: self.path.clone(),
+            paths: self.paths.clone(),
             immutable_store: self.immutable_store.clone(),
             mutable_store: self.mutable_store.clone(),
             id: self.id,
+            root_id: self.root_id,
             instance_id: self.instance_id,
             remote: self.remote.clone(),
             filter,
-            format: self.format,
             settings: self.settings.clone(),
             is_link: self.is_link,
             is_layer: self.is_layer,
-            write_token: None,
+            write_token: self.write_token.as_ref().map(|t| t.share()),
             repo_lock: self.repo_lock.clone(),
+            session_pool: Default::default(),
+            lazy_session: Default::default(),
             file_system: self.file_system.clone(),
         }
     }
@@ -1120,6 +1271,72 @@ impl RepositoryContext {
             };
         }
         result
+    }
+
+    /// The storage session pool for this repository, resolved once and reused for
+    /// as long as it lives.
+    ///
+    /// `correlation_id` is only read when the pool has to be resolved. It belongs
+    /// to the command being executed and a context belongs to one command, so a
+    /// cached pool is always the one this context's correlation id asked for.
+    pub(crate) async fn session_pool(
+        &self,
+        correlation_id: &str,
+    ) -> Result<Arc<SessionPool>, ProtocolError> {
+        if let Some(pool) = self.cached_session_pool() {
+            return Ok(pool);
+        }
+        let remote = self.remote().await?;
+        let pool = remote.session_pool(self.id, correlation_id).await?;
+        *self.session_pool.write() = Arc::downgrade(&pool);
+        Ok(pool)
+    }
+
+    /// The lazy storage session for this context, built once and shared. Partition-scoped,
+    /// so a derived context for a link or a layer resolves its own rather than borrowing one
+    /// started for another partition.
+    pub(crate) fn lazy_session(
+        &self,
+        build: impl FnOnce() -> Arc<lore_transport::StorageSession>,
+    ) -> Arc<lore_transport::StorageSession> {
+        if let Some(session) = self.lazy_session.read().as_ref() {
+            return session.clone();
+        }
+        self.lazy_session.write().get_or_insert_with(build).clone()
+    }
+
+    /// The session pool if one is already resolved and still live, without
+    /// touching the remote. `None` means "resolve it", not "there is none".
+    ///
+    /// Private so the pool is only ever reached through [`Self::session_pool`]. A
+    /// caller handed the pool directly would pick from it eagerly, and an eager
+    /// session cannot be invalidated and retried — see [`crate::immutable`]'s
+    /// session resolution.
+    fn cached_session_pool(&self) -> Option<Arc<SessionPool>> {
+        self.session_pool.read().upgrade()
+    }
+
+    /// Hold `pool` as resolved, standing in for a resolution against a live remote.
+    /// The caller keeps the strong reference, as the connection's session cache
+    /// does.
+    #[cfg(test)]
+    pub(crate) fn set_session_pool(&self, pool: &Arc<SessionPool>) {
+        *self.session_pool.write() = Arc::downgrade(pool);
+    }
+
+    /// Whether this context is known to hold no remote, answered without waiting
+    /// on the state lock or driving a pending connect.
+    ///
+    /// [`RemoteState::Offline`] is terminal, so a `true` answer stands for the life
+    /// of the context and a caller can skip building a storage session outright.
+    /// Everything else answers `false`, a state lock held elsewhere included: that
+    /// costs only the session the caller would have built anyway. A failed connect
+    /// is not offline — a session built on one reports the failure, which is the
+    /// answer that belongs to it.
+    pub(crate) fn is_offline(&self) -> bool {
+        self.remote
+            .try_read()
+            .is_ok_and(|state| matches!(&*state, RemoteState::Offline))
     }
 
     /// Snapshot of the remote state. Awaits the state lock (cheap — only contended
@@ -1246,43 +1463,6 @@ pub const SALT_URC: &[u8] = b"urc";
 pub const SALT_LORE: &[u8] = b"urc";
 //pub const SALT_LORE: &[u8] = b"lore";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RepositoryFormat {
-    /// Legacy: .urc/, .urcignore, salt b"urc"
-    Urc,
-    /// Current: .lore/, .loreignore, salt b"urc"
-    Lore,
-}
-
-impl RepositoryFormat {
-    pub fn salt(&self) -> &'static [u8] {
-        match self {
-            Self::Urc => SALT_URC,
-            Self::Lore => SALT_LORE,
-        }
-    }
-
-    pub fn dot_dir(&self) -> &'static str {
-        match self {
-            Self::Urc => DOT_URC,
-            Self::Lore => DOT_LORE,
-        }
-    }
-
-    /// Primary ignore file. Both formats use `.loreignore`; legacy
-    /// `.urcignore` is honored only as a fallback (see [`load_filter`]).
-    pub fn ignore_file(&self) -> &'static str {
-        DOT_LOREIGNORE
-    }
-
-    pub fn detect(path: &std::path::Path) -> Self {
-        if path.join(DOT_URC).is_dir() {
-            Self::Urc
-        } else {
-            Self::Lore
-        }
-    }
-}
 pub const VIEW_FILTER: &str = "view";
 pub const LAYER: &str = "layer.toml";
 pub const TEMP_FILE_EXTENSION: &str = ".~loretemp";
@@ -1290,12 +1470,50 @@ pub const BASE_SUFFIX: &str = "~base";
 pub const THEIRS_SUFFIX: &str = "~theirs";
 pub const MINE_SUFFIX: &str = "~mine";
 
-pub fn parse_url(url: &str, offline: bool) -> Result<(String, String), RepositoryError> {
+/// The suffixes a conflicted merge names its copies of a file with, beside the file itself in
+/// the working tree.
+///
+/// A conflict writes only the sides it has, so fewer than three may be present, and a clean
+/// automerge removes the ones it wrote.
+pub const MERGE_ARTIFACT_SUFFIXES: [&str; 3] = [MINE_SUFFIX, THEIRS_SUFFIX, BASE_SUFFIX];
+
+pub fn get_dot_lore_path(path: &std::path::Path) -> Result<PathBuf, InvalidPath> {
+    if let Some(mount_manager) = MountManagerState::mount_manager() {
+        match mount_manager.check_for_external_lore_dir(path) {
+            Ok(Some(path)) => {
+                return Ok(path);
+            }
+            Ok(None) => {}
+            Err(_) => {
+                return Err(InvalidPath {
+                    path: format!("{}", path.display()),
+                });
+            }
+        }
+    };
+    let legacy = path.join(DOT_URC);
+    Ok(if legacy.is_dir() {
+        legacy
+    } else {
+        path.join(DOT_LORE)
+    })
+}
+
+/// Splits a repository URL into its remote URL and repository name.
+///
+/// With `allow_no_remote`, an argument carrying no URL scheme is a repository name and
+/// yields an empty remote URL, naming a repository that has no remote at all. Callers
+/// that require a reachable remote — clone, delete, info, link — pass `false` so a
+/// missing host is an error rather than a silently local repository.
+pub fn parse_url(url: &str, allow_no_remote: bool) -> Result<(String, String), RepositoryError> {
     let url = if url.contains("://") {
         url::Url::parse(url).internal("Invalid URL")?
     } else {
-        // Offline support for just a name
-        if offline && !url.contains('/') {
+        // No scheme means no host to find, so the whole argument is the name. That
+        // includes a slash-separated one such as `org/project`, which `is_valid_name`
+        // supports: reading the first segment as a host would both truncate the name and
+        // record a remote the caller never configured. Naming a remote takes a scheme.
+        if allow_no_remote {
             return Ok((String::default(), url.to_string()));
         }
         let mut protocol_url = lore_transport::DEFAULT_PROTOCOL.to_string();
@@ -1329,24 +1547,29 @@ pub fn parse_url(url: &str, offline: bool) -> Result<(String, String), Repositor
 /// remote URL, so defaulting past a read failure presents a repository that merely could not be
 /// opened as one with no remote, and the next save writes that back.
 fn load_config(config_path: impl AsRef<Path>) -> Result<RepositoryConfig, RepositoryError> {
-    Ok(util::config::load_blocking(config_path).internal("Failed to load config file")?)
+    util::config::load_blocking(config_path)
+        .forward::<RepositoryError>("Failed to load config file")
 }
 
 async fn save_config(
     config_path: impl AsRef<Path>,
     config: &RepositoryConfig,
 ) -> Result<(), RepositoryError> {
-    Ok(util::config::save(config, config_path)
+    util::config::save(config, config_path)
         .await
-        .internal("Failed to save config file")?)
+        .forward::<RepositoryError>("Failed to save config file")
 }
 
-pub fn load_repository_config(path: impl AsRef<Path>) -> Result<RepositoryConfig, RepositoryError> {
-    let path = path.as_ref();
-    let dot_path = path.join(RepositoryFormat::detect(path).dot_dir());
+pub fn load_repository_config_from_dot_dir(
+    dot_path: &Path,
+) -> Result<RepositoryConfig, RepositoryError> {
     let config_path = dot_path.join(CONFIG);
 
     load_config(config_path.as_path())
+}
+
+pub fn load_repository_config(path: impl AsRef<Path>) -> Result<RepositoryConfig, RepositoryError> {
+    load_repository_config_from_dot_dir(&get_dot_lore_path(path.as_ref())?)
 }
 
 /// Process-local holder for the repository directory `FSLock`. Lifetime is
@@ -1500,6 +1723,27 @@ pub fn cache_in_memory_stores(
         .insert(path, mutable);
 }
 
+/// Stop garbage collection for good on every store still live in the caches, so a pass in
+/// flight gives up at its next packfile rather than holding shutdown open until it has
+/// rewritten the rest of the group, and none follows it. For shutdown, where no further
+/// call will be made; a caller that will use the store again wants
+/// [`lore_storage::ImmutableStore::stop_gc`] without `terminate`.
+pub async fn stop_store_gc() {
+    // Collected before awaiting: a `DashMap` guard held across an await blocks every other
+    // reader of the cache.
+    let mut stores: Vec<Arc<dyn ImmutableStore>> = Vec::new();
+    if let Some(cache) = IMMUTABLE_STORE_CACHE.get() {
+        stores.extend(cache.iter().filter_map(|entry| entry.value().upgrade()));
+    }
+    if let Some(cache) = IN_MEMORY_IMMUTABLE_CACHE.get() {
+        stores.extend(cache.iter().map(|entry| entry.value().clone()));
+    }
+
+    // Driven together so every store is asked to stop on the first poll, rather than each
+    // waiting out the one before it.
+    futures::future::join_all(stores.into_iter().map(|store| store.stop_gc(true))).await;
+}
+
 /// Release all cached store references for the given repository path.
 /// Any active `RepositoryContext` instances for this path remain valid
 /// (they hold their own `Arc` to the stores), but once they are dropped
@@ -1597,11 +1841,22 @@ pub async fn create_client_immutable_store(
     create_options: ImmutableStoreCreateOptions,
     verify_write: bool,
 ) -> Result<Arc<dyn ImmutableStore>, RepositoryError> {
-    let path = get_shared_store_path_for_repo(config)
-        .await
-        .forward::<RepositoryError>("Failed to access shared store")?
-        .unwrap_or_else(|| dotpath.as_ref().to_owned());
+    create_immutable_store_at_path(
+        get_shared_store_path_for_repo(config)
+            .await
+            .forward::<RepositoryError>("Failed to access shared store")?
+            .unwrap_or_else(|| dotpath.as_ref().to_owned()),
+        create_options,
+        verify_write,
+    )
+    .await
+}
 
+pub async fn create_immutable_store_at_path(
+    path: PathBuf,
+    create_options: ImmutableStoreCreateOptions,
+    verify_write: bool,
+) -> Result<Arc<dyn ImmutableStore>, RepositoryError> {
     // Fast path: upgrade an existing weak reference.
     if let Some(store) = get_cached_immutable_store(&path) {
         lore_debug!("Reusing cached immutable store");
@@ -1638,7 +1893,6 @@ pub async fn create_client_immutable_store(
         create_options,
         false, /* Don't deserialize all buckets on load */
         ImmutableStoreSettings {
-            allow_partial_fragment: true, /* Client store can have partial fragments */
             protect_local_fragment: true, /* Protect local fragments from eviction */
             verify_write,
             ..Default::default()
@@ -1683,6 +1937,13 @@ pub async fn create_client_mutable_store(
         dotpath
     };
 
+    create_mutable_store_at_path(path, immutable_store).await
+}
+
+pub async fn create_mutable_store_at_path(
+    path: PathBuf,
+    immutable_store: Arc<dyn ImmutableStore>,
+) -> Result<Arc<crate::store::mutable::MutableStore>, RepositoryError> {
     // Fast path: upgrade an existing weak reference.
     if let Some(store) = get_cached_mutable_store(&path) {
         lore_debug!("Reusing cached mutable store");
@@ -1733,7 +1994,6 @@ pub async fn create_client_memory_stores()
         ImmutableStoreCreateOptions::none(),
         false, /* Client does not deserialize all buckets on startup */
         ImmutableStoreSettings {
-            allow_partial_fragment: true, /* Client store can have partial fragments */
             protect_local_fragment: true, /* Protect local fragments from eviction */
             ..Default::default()
         },
@@ -1775,9 +2035,9 @@ fn connect(
     let handle: JoinHandle<Result<Arc<Connection>, ProtocolError>> = lore_spawn!(async move {
         let connection =
             protocol::connect(remote_url.as_str(), identity.as_str(), repository).await?;
-        // Pre-warm session so it's ready when the command runs
+        // Pre-warm the session pool so it's ready when the command runs
         if !repository.is_zero() {
-            let _ = connection.session(repository, &correlation_id).await;
+            let _ = connection.session_pool(repository, &correlation_id).await;
         }
         Ok(connection)
     });
@@ -1792,7 +2052,7 @@ fn connect(
     .shared())
 }
 
-fn read_id_from_file(path: PathBuf) -> io::Result<RepositoryId> {
+pub fn read_id_from_file(path: PathBuf) -> io::Result<RepositoryId> {
     let mut id = RepositoryId::default();
     // Synchronous read: tiny file, avoids thread hop and queuing behind
     // any store flush tasks still in flight from the previous command.
@@ -1838,11 +2098,16 @@ pub async fn load_and_connect(
 /// command and hand siblings (via [`RepositoryWriteToken::share`]) to each
 /// construction, keeping the per-path write mutex held across the whole
 /// flow without deadlocking on re-acquisition.
+///
+/// Instance ID recovery and instance registration are boxed. They run only for
+/// an instance missing its ID file or its registration, and inline they would
+/// make every command's future as large as theirs.
 pub async fn load_and_connect_with_token(
     path: &Path,
     access: RepositoryAccess,
     write_token: Option<RepositoryWriteToken>,
 ) -> Result<Arc<RepositoryContext>, RepositoryError> {
+    require_text_root(path)?;
     debug_assert!(
         matches!(
             (&access, &write_token),
@@ -1865,8 +2130,7 @@ pub async fn load_and_connect_with_token(
         },
     );
 
-    let format = RepositoryFormat::detect(path);
-    let dot_path = path.join(format.dot_dir());
+    let dot_path = get_dot_lore_path(path)?;
 
     // Acquire (or reuse) the process-local repository flock. NoStore commands
     // skip this — they don't touch repository files.
@@ -1985,7 +2249,7 @@ pub async fn load_and_connect_with_token(
         (immutable_store, mutable_store as Arc<dyn MutableStore>)
     };
 
-    let filter = load_filter(path).unwrap_or_default();
+    let filter = load_filter(path)?;
 
     // Resolve the remote eagerly only when we need it for the mutable store upgrade.
     // Otherwise keep it pending so local-only commands never block on the connect.
@@ -2062,12 +2326,12 @@ pub async fn load_and_connect_with_token(
     // Recover or generate instance ID if the instance file was missing.
     // A zero instance_id means recovery is needed.
     let instance_id = if instance_id.is_zero() {
-        let recovered = crate::instance::recover_instance_id(
+        let recovered = Box::pin(crate::instance::recover_instance_id(
             repository,
             mutable_store.clone(),
             immutable_store.clone(),
             &path.display().to_string(),
-        )
+        ))
         .await;
         let id = recovered.unwrap_or_else(|| {
             lore_debug!("No matching instance found, generating new instance ID");
@@ -2082,6 +2346,20 @@ pub async fn load_and_connect_with_token(
         instance_id
     };
 
+    // Load the mounted filesystem if this is a SWFS-backed instance
+    let filesystem: Option<Arc<dyn FilesystemProvider + 'static>> = if config.is_swfs() {
+        let mount_manager = MountManagerState::mount_manager().ok_or(RepositoryError::internal(
+            "Loading a SWFS repository without using the service",
+        ))?;
+        Some(
+            mount_manager
+                .get_mount_filesystem_provider(path)
+                .forward::<RepositoryError>("Unable to find mount for SWFS repository")?,
+        )
+    } else {
+        None
+    };
+
     // Keep the remote pending so local-only commands finish without waiting on the
     // background connect. The upgrade path above already forced resolution when needed.
     let remote_state = match (resolved_remote_for_upgrade, remote) {
@@ -2090,15 +2368,14 @@ pub async fn load_and_connect_with_token(
         (None, Err(err)) => RemoteState::from_result(Err(err)),
     };
     let repository = RepositoryContext::new_with_state(
-        Some(path.to_path_buf()),
+        Some(RepositoryPaths::new(path.to_path_buf(), dot_path.clone())),
         immutable_store,
         mutable_store,
         repository,
         instance_id,
         remote_state,
         filter,
-        format,
-        None,
+        filesystem,
     );
     let repository = match repo_lock {
         Some(lock) => repository.with_repository_lock(lock),
@@ -2113,9 +2390,9 @@ pub async fn load_and_connect_with_token(
     // Commit command will look at the global flag and set this explicitly
     repository.set_disable_upload(true);
 
+    repository.set_disable_cache(!(global.cache() || config.is_swfs()));
     let config_file = config.file.unwrap_or_default();
     repository.set_direct_file_write(config_file.direct_write.unwrap_or_default());
-    repository.set_disable_cache(!global.cache());
 
     if global.local() {
         repository.set_disable_upload(true);
@@ -2128,98 +2405,127 @@ pub async fn load_and_connect_with_token(
     // load_and_connect. A read-only invocation that hits a repository needing
     // registration/migration simply defers the work to the next write command.
     if repository.try_write_token().is_some() {
-        // Register instance if not already present in the mutable store.
-        // This covers both newly generated IDs and pre-existing instances
-        // upgrading from a version before instance registration was added.
-        let (instance_key, instance_key_type) =
-            crate::instance::instance_key(repository.salt(), instance_id);
-        let needs_registration = repository
-            .read_mutable_store()
-            .load(repository.id, instance_key, instance_key_type)
-            .await
-            .map_or(true, |h| h.is_zero());
-        if needs_registration
-            && let Err(err) = crate::instance::register_instance(
-                &repository,
-                instance_id,
-                &path.display().to_string(),
-            )
-            .await
-        {
-            lore_warn!("Failed to register instance: {err}");
-        }
-
-        // Lazy migration: move file-based anchors to the mutable store.
-        //
-        // Order matters for crash safety: write the new keys, flush the mutable
-        // store, then remove the old files. If a crash occurred after removing
-        // a file but before the new keys reached disk, the anchor would be lost
-        // entirely — file gone, mutable store unchanged. Keeping the old files
-        // until the flush returns means a crash mid-migration is recoverable:
-        // the next write-mode load reruns the migration from the file.
-        let current_anchor_path = dot_path.join(crate::anchor::CURRENT);
-        let staged_anchor_path = dot_path.join(crate::anchor::STAGED);
-        let mut migrated_current = false;
-        let mut migrated_staged = false;
-
-        if current_anchor_path.exists() {
-            let (revision, branch) = crate::anchor::deserialize_migrate_old(&current_anchor_path)
-                .await
-                .internal("Failed to deserialize repository anchor")?;
-            crate::instance::store_current_anchor_branch(&repository, branch)
-                .await
-                .forward::<RepositoryError>("Failed to serialize repository anchor")?;
-            crate::instance::store_current_anchor(&repository, revision)
-                .await
-                .forward::<RepositoryError>("Failed to serialize repository anchor")?;
-            migrated_current = true;
-        }
-        if staged_anchor_path.exists() {
-            match crate::anchor::deserialize_migrate_old(&staged_anchor_path).await {
-                Ok((revision, _branch)) => {
-                    match crate::instance::store_staged_anchor(&repository, revision).await {
-                        Ok(()) => migrated_staged = true,
-                        Err(err) => {
-                            lore_warn!("Failed to migrate staged anchor revision: {err}");
-                        }
-                    }
-                }
-                Err(err) => {
-                    lore_warn!("Failed to read file-based staged anchor for migration: {err}");
-                }
-            }
-        }
-
-        if migrated_current || migrated_staged {
-            repository.flush(true).await?;
-        }
-
-        if migrated_current {
-            if let Err(err) = lore_io::IoDriver::global()
-                .remove_file(&current_anchor_path)
-                .await
-            {
-                lore_warn!("Failed to remove old current anchor file: {err}");
-            }
-            lore_debug!("Migrated file-based current anchor to mutable store");
-        }
-        if migrated_staged {
-            if let Err(err) = lore_io::IoDriver::global()
-                .remove_file(&staged_anchor_path)
-                .await
-            {
-                lore_warn!("Failed to remove old staged anchor file: {err}");
-            }
-            lore_debug!("Migrated file-based staged anchor to mutable store");
-        }
+        register_instance_and_migrate_anchors(&repository, instance_id, path, &dot_path).await?;
     }
 
     Ok(repository)
 }
 
+/// The write-mode part of [`load_and_connect_with_token`]: registers the
+/// instance if needed and moves file-based anchors to the mutable store.
+///
+/// A function of its own because its locals live across several awaits: kept
+/// in [`load_and_connect_with_token`] they would take space in its future while
+/// the stores are created as well.
+async fn register_instance_and_migrate_anchors(
+    repository: &Arc<RepositoryContext>,
+    instance_id: crate::instance::InstanceId,
+    path: &Path,
+    dot_path: &Path,
+) -> Result<(), RepositoryError> {
+    // Register instance if not already present in the mutable store.
+    // This covers both newly generated IDs and pre-existing instances
+    // upgrading from a version before instance registration was added.
+    // Registration also retires any registration another instance left
+    // at this path, so a re-created checkout is listed once.
+    let (instance_key, instance_key_type) =
+        crate::instance::instance_key(repository.salt(), instance_id);
+    let needs_registration = repository
+        .read_mutable_store()
+        .load(repository.id, instance_key, instance_key_type)
+        .await
+        .map_or(true, |h| h.is_zero());
+    if needs_registration
+        && let Err(err) = Box::pin(crate::instance::register_instance(
+            repository,
+            instance_id,
+            &path.display().to_string(),
+        ))
+        .await
+    {
+        lore_warn!("Failed to register instance: {err}");
+    }
+
+    // Lazy migration: move file-based anchors to the mutable store.
+    //
+    // Order matters for crash safety: write the new keys, flush the mutable
+    // store, then remove the old files. If a crash occurred after removing
+    // a file but before the new keys reached disk, the anchor would be lost
+    // entirely — file gone, mutable store unchanged. Keeping the old files
+    // until the flush returns means a crash mid-migration is recoverable:
+    // the next write-mode load reruns the migration from the file.
+    let current_anchor_path = dot_path.join(crate::anchor::CURRENT);
+    let staged_anchor_path = dot_path.join(crate::anchor::STAGED);
+    let mut migrated_current = false;
+    let mut migrated_staged = false;
+
+    if current_anchor_path.exists() {
+        let (revision, branch) = crate::anchor::deserialize_migrate_old(&current_anchor_path)
+            .await
+            .internal("Failed to deserialize repository anchor")?;
+        crate::instance::store_current_anchor_branch(repository, branch)
+            .await
+            .forward::<RepositoryError>("Failed to serialize repository anchor")?;
+        crate::instance::store_current_anchor(repository, revision)
+            .await
+            .forward::<RepositoryError>("Failed to serialize repository anchor")?;
+        migrated_current = true;
+    }
+    if staged_anchor_path.exists() {
+        match crate::anchor::deserialize_migrate_old(&staged_anchor_path).await {
+            Ok((revision, _branch)) => {
+                match crate::instance::store_staged_anchor(repository, revision).await {
+                    Ok(()) => migrated_staged = true,
+                    Err(err) => {
+                        lore_warn!("Failed to migrate staged anchor revision: {err}");
+                    }
+                }
+            }
+            Err(err) => {
+                lore_warn!("Failed to read file-based staged anchor for migration: {err}");
+            }
+        }
+    }
+
+    if migrated_current || migrated_staged {
+        repository.flush(true).await?;
+    }
+
+    if migrated_current {
+        if let Err(err) = lore_io::IoDriver::global()
+            .remove_file(&current_anchor_path)
+            .await
+        {
+            lore_warn!("Failed to remove old current anchor file: {err}");
+        }
+        lore_debug!("Migrated file-based current anchor to mutable store");
+    }
+    if migrated_staged {
+        if let Err(err) = lore_io::IoDriver::global()
+            .remove_file(&staged_anchor_path)
+            .await
+        {
+            lore_warn!("Failed to remove old staged anchor file: {err}");
+        }
+        lore_debug!("Migrated file-based staged anchor to mutable store");
+    }
+
+    Ok(())
+}
+
 pub const MAX_NAME_LEN: usize = 1000;
 pub const MAX_DESCRIPTION_LEN: usize = 65536;
 
+/// A name is a `/`-separated path of segments, each holding only ASCII
+/// alphanumerics, `-`, `_` and `.`.
+///
+/// Empty and dot-leading segments are rejected because names round-trip through
+/// URLs (see [`parse_url`]), and URL parsing rewrites them: `host/.` and
+/// `host/..` lose the name entirely, `host/org/../other` silently resolves to
+/// `other`, and a trailing `/` is trimmed. The server stores such names fine, so
+/// without this they produce repositories no client can address, or names that
+/// resolve to a different repository than the one written. Dot-leading segments
+/// also carry filesystem meaning for tooling that maps a name onto a directory.
 pub fn is_valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_NAME_LEN
@@ -2228,6 +2534,9 @@ pub fn is_valid_name(name: &str) -> bool {
                 !c.is_ascii_alphanumeric() && (c != '/') && (c != '-') && (c != '_') && (c != '.')
             })
             .is_none()
+        && name
+            .split('/')
+            .all(|segment| !segment.is_empty() && !segment.starts_with('.'))
 }
 
 pub async fn create_local(
@@ -2239,15 +2548,35 @@ pub async fn create_local(
     config: RepositoryConfig,
     no_tracking: bool,
 ) -> Result<Arc<RepositoryContext>, RepositoryError> {
-    // Check both formats for pre-existence
-    if path.join(DOT_URC).exists() || path.join(DOT_LORE).exists() {
+    require_text_root(path)?;
+    let instance_id = InstanceId::generate();
+
+    let dotpath;
+    let filesystem_provider: Option<Arc<dyn FilesystemProvider + 'static>>;
+    if config.is_swfs() {
+        let mount_manager = MountManagerState::mount_manager().ok_or(RepositoryError::internal(
+            "Attempting to create an SWFS instance outside the service",
+        ))?;
+        dotpath = mount_manager
+            .create_mount(path, &config, repository, instance_id)
+            .await
+            .forward::<RepositoryError>("Failed to create mount for SWFS instance")?;
+        filesystem_provider = Some(
+            mount_manager
+                .get_mount_filesystem_provider(path)
+                .forward::<RepositoryError>("Failed to get filesystem provider for fresh mount")?,
+        );
+    } else {
+        dotpath = path.join(DOT_LORE);
+        filesystem_provider = None;
+    };
+    let idpath = dotpath.join(ID);
+
+    /*if dotpath.exists() {
         return Err(RepositoryError::from(RepositoryAlreadyExists {
             path: path.display().to_string(),
         }));
-    }
-    let format = RepositoryFormat::Lore;
-    let dotpath = path.join(format.dot_dir());
-    let idpath = dotpath.join(ID);
+    }*/
 
     let dotpath_display = dotpath.display().to_string();
     lore_io::IoDriver::global()
@@ -2271,7 +2600,6 @@ pub async fn create_local(
             )
         })?;
 
-    let instance_id = crate::instance::InstanceId::generate();
     let instance_path = dotpath.join(INSTANCE);
     instance_id
         .write_to_file(instance_path)
@@ -2314,15 +2642,14 @@ pub async fn create_local(
     // write mutex held for the duration of setup.
     let repository = Arc::new(
         RepositoryContext::new(RepositoryContextCreationArgs {
-            path: Some(path.to_path_buf()),
+            paths: Some(RepositoryPaths::new(path.to_path_buf(), dotpath.clone())),
             immutable_store,
             mutable_store,
             id: repository,
             instance_id,
             remote: Err(ProtocolError::from(NoRemote)),
             filter: Arc::default(),
-            format: RepositoryFormat::Lore,
-            filesystem_provider: None,
+            filesystem_provider,
         })
         .with_write_token(token.share()),
     );
@@ -2355,7 +2682,7 @@ pub async fn create_local(
     }
 
     // Set the current branch so that subsequent commands know which branch
-    // we are on, even though there are no commits yet (zero revision).
+    // we are on, even though there are no revisions yet (zero revision).
     crate::instance::store_current_anchor_branch(&repository, default_branch)
         .await
         .forward::<RepositoryError>("Failed to serialize repository anchor")?;
@@ -2369,9 +2696,13 @@ pub async fn create_local(
     Ok(repository)
 }
 
-pub fn load_filter(root_path: &Path) -> Option<Arc<filter::Filter>> {
-    let format = RepositoryFormat::detect(root_path);
-    let mut ignore_path = root_path.join(format.ignore_file());
+/// Loads the ignore and view filters for the repository rooted at `root_path`.
+///
+/// A filter file that cannot be understood fails the load rather than yielding
+/// an empty filter: an empty one excludes nothing, so the caller would go on to
+/// walk and stage everything the file meant to keep out.
+pub fn load_filter(root_path: &Path) -> Result<Arc<filter::Filter>, RepositoryError> {
+    let mut ignore_path = root_path.join(DOT_LOREIGNORE);
 
     // Both formats use .loreignore as the primary ignore file; fall back to
     // legacy .urcignore whenever .loreignore is not present.
@@ -2382,13 +2713,10 @@ pub fn load_filter(root_path: &Path) -> Option<Arc<filter::Filter>> {
         }
     }
 
-    let view_path = root_path.join(format.dot_dir()).join(VIEW_FILTER);
-
-    if let Ok(filter) = filter::load(&ignore_path, &view_path) {
-        Some(Arc::new(filter))
-    } else {
-        None
-    }
+    let view_path = get_dot_lore_path(root_path)?.join(VIEW_FILTER);
+    let filter = filter::load(&ignore_path, &view_path)
+        .forward::<RepositoryError>("Failed to load repository filter")?;
+    Ok(Arc::new(filter))
 }
 
 fn branch_switch_create_recurse(
@@ -2520,266 +2848,16 @@ pub async fn branch_switch(
         branch_stack[0].revision
     };
 
-    let (branch_latest_local, branch_latest_remote, branch_location, branch_signature) = {
-        let signature = if let Some(revision) = options.signature.as_ref() {
-            let revision = revision::resolve(
-                repository.clone(),
-                revision,
-                global.search_limit(),
-                global.search_location(),
-            )
-            .await
-            .forward::<RepositoryError>("Invalid revision")?;
-
-            let state = state::State::deserialize(repository.clone(), revision)
-                .await
-                .forward::<RepositoryError>("Invalid revision")?;
-            if state.branch(repository.clone()).await != branch.id && revision != branch_point {
-                return Err(RepositoryError::internal(
-                    "Given revision is not on the target branch",
-                ));
-            }
-
-            revision
-        } else {
-            Hash::default()
-        };
-
-        lore_debug!(
-            "Resolved signature {:?} to {}",
-            options.signature,
-            signature
-        );
-
-        let local_head = branch::load_latest(repository.clone(), branch.id)
-            .await
-            .ok();
-
-        let remote_branch = if options.local {
-            lore_debug!("Using local latest revision");
-            None
-        } else {
-            match repository.remote().await {
-                Ok(remote) => {
-                    lore_debug!("Loading remote latest revision");
-                    match branch::load_remote(remote, repository.id, branch.id).await {
-                        Ok(remote_head) => Some(remote_head),
-                        Err(err) if err.is_branch_not_found() => None,
-                        Err(err) => {
-                            if local_head.is_some() {
-                                lore_debug!(
-                                    "Failed to load remote branch latest revision, falling back to local: {err}"
-                                );
-                                None
-                            } else {
-                                return Err(err).forward::<RepositoryError>(
-                                    "Failed to load remote branch latest revision",
-                                );
-                            }
-                        }
-                    }
-                }
-                Err(err) => {
-                    if local_head.is_some() {
-                        lore_debug!(
-                            "Remote unavailable, switching using local branch state: {err}"
-                        );
-                        None
-                    } else {
-                        return Err(err).forward::<RepositoryError>(
-                            "Failed to load remote branch latest revision",
-                        );
-                    }
-                }
-            }
-        };
-
-        if local_head.is_none() && remote_branch.is_none() {
-            return Err(RepositoryError::from(BranchNotFound {
-                branch: branch_name.to_string(),
-            }));
-        }
-
-        if let Some(local_head) = local_head {
-            let signature_if_local = if signature.is_zero() {
-                local_head
-            } else {
-                signature
-            };
-            let (latest_local, latest_remote, location, signature) = if let Some(remote_status) =
-                remote_branch
-            {
-                let remote_head = remote_status.latest;
-                let signature_if_remote = if signature.is_zero() {
-                    remote_head
-                } else {
-                    signature
-                };
-                // Check if remote is ahead of local and local is not diverged
-                lore_debug!(
-                    "Check if remote revision {remote_head} is ahead of local revision {local_head}"
-                );
-                if let Ok(remote_state) =
-                    state::State::deserialize(repository.clone(), remote_head).await
-                {
-                    if let Ok(local_state) =
-                        state::State::deserialize(repository.clone(), local_head).await
-                    {
-                        if remote_state.revision_number() > local_state.revision_number() {
-                            // Check for divergence
-                            lore_debug!(
-                                "Remote revision {} is ahead of local revision {}, check for divergence",
-                                remote_state.revision_number(),
-                                local_state.revision_number()
-                            );
-                            if find::find_revision(
-                                repository.clone(),
-                                branch.id,
-                                remote_head,
-                                false,
-                                None,
-                                |state, _metadata| {
-                                    if state.revision() == local_head
-                                        || state.parent_other() == local_head
-                                    {
-                                        find::FindMatchResult::Match
-                                    } else if state.revision_number()
-                                        < local_state.revision_number()
-                                    {
-                                        // Divergence, the remote branch history passed the point
-                                        // where local revision should have been found
-                                        find::FindMatchResult::Abort
-                                    } else {
-                                        find::FindMatchResult::Continue
-                                    }
-                                },
-                            )
-                            .await
-                            .is_ok()
-                            {
-                                lore_debug!("Branch is coherent, sync to remote LATEST");
-                                (
-                                    remote_head,
-                                    remote_head,
-                                    LoreBranchLocation::Remote,
-                                    signature_if_remote,
-                                )
-                            } else {
-                                lore_debug!("Branch is divergent, sync to local LATEST");
-                                (
-                                    local_head,
-                                    remote_head,
-                                    LoreBranchLocation::Local,
-                                    signature_if_local,
-                                )
-                            }
-                        } else if remote_state.revision() == local_state.revision() {
-                            lore_debug!(
-                                "Remote and local revision are equal, treat as remote sync"
-                            );
-                            (
-                                remote_head,
-                                remote_head,
-                                LoreBranchLocation::Remote,
-                                signature_if_remote,
-                            )
-                        } else {
-                            lore_debug!("Local revision is ahead, sync to local latest");
-                            (
-                                local_head,
-                                remote_head,
-                                LoreBranchLocation::Local,
-                                signature_if_local,
-                            )
-                        }
-                    } else {
-                        lore_debug!(
-                            "Failed to load local latest revision state, sync to remote latest"
-                        );
-                        (
-                            remote_head,
-                            remote_head,
-                            LoreBranchLocation::Remote,
-                            signature_if_remote,
-                        )
-                    }
-                } else {
-                    lore_debug!(
-                        "Failed to load remote latest revision state, sync to local latest"
-                    );
-                    (
-                        local_head,
-                        remote_head,
-                        LoreBranchLocation::Local,
-                        signature_if_local,
-                    )
-                }
-            } else {
-                lore_debug!("No remote branch available, sync to local latest");
-                (
-                    local_head,
-                    Hash::default(),
-                    LoreBranchLocation::Local,
-                    signature_if_local,
-                )
-            };
-
-            event::LoreEvent::BranchSwitchBegin(LoreBranchSwitchBeginEventData {
-                branch: LoreBranchSwitchData::new(
-                    branch.id,
-                    branch_name,
-                    latest_local,
-                    latest_remote,
-                    signature,
-                    location,
-                ),
-            })
-            .send();
-
-            (latest_local, latest_remote, location, signature)
-        } else {
-            let Some(remote_status) = remote_branch else {
-                return Err(RepositoryError::from(BranchNotFound {
-                    branch: branch_name.to_string(),
-                }));
-            };
-
-            let signature = if signature.is_zero() {
-                remote_status.latest
-            } else {
-                signature
-            };
-
-            event::LoreEvent::BranchSwitchBegin(LoreBranchSwitchBeginEventData {
-                branch: LoreBranchSwitchData::new(
-                    branch.id,
-                    branch_name,
-                    remote_status.latest,
-                    remote_status.latest,
-                    signature,
-                    LoreBranchLocation::Remote,
-                ),
-            })
-            .send();
-
-            branch_switch_create(
-                repository.clone(),
-                token,
-                branch.id,
-                remote_status.latest,
-                remote_status.metadata,
-                global.dry_run(),
-            )
-            .await?;
-
-            (
-                remote_status.latest,
-                remote_status.latest,
-                LoreBranchLocation::Remote,
-                signature,
-            )
-        }
-    };
+    let (branch_latest_local, branch_latest_remote, branch_location, branch_signature) =
+        branch_switch_target(
+            &repository,
+            token,
+            branch.id,
+            branch_name,
+            branch_point,
+            &options,
+        )
+        .await?;
 
     // Reject a switch that would discard an actually-staged change; dirty-only
     // tracking is carried forward by rebase_staged_anchor below. --force and
@@ -2853,7 +2931,7 @@ pub async fn branch_switch(
         if global.force() {
             let _ = crate::instance::delete_staged_anchor(&repository).await;
         } else {
-            state::rebase_staged_anchor(repository.clone(), branch_signature)
+            state::rebase_staged_anchor(repository.clone(), branch_signature, false)
                 .await
                 .forward::<RepositoryError>("Failed to rebase staged anchor")?;
         }
@@ -2904,6 +2982,272 @@ pub async fn branch_switch(
     .send();
 
     Ok(branch_latest_local)
+}
+
+/// The revision a switch to `branch_id` lands on, as `(latest local, latest remote, location,
+/// signature)`: the given signature, or the local or remote latest, creating the local branch
+/// where only the remote holds it.
+///
+/// A function of its own because its locals live across several awaits: kept in
+/// [`branch_switch`] they would take space in its future while the layers switch as well.
+async fn branch_switch_target(
+    repository: &Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    branch_id: BranchId,
+    branch_name: &str,
+    branch_point: Hash,
+    options: &BranchSwitchOptions,
+) -> Result<(Hash, Hash, LoreBranchLocation, Hash), RepositoryError> {
+    let context = execution_context();
+    let global = context.globals();
+
+    let signature = if let Some(revision) = options.signature.as_ref() {
+        let resolved =
+            revision::resolve_in_branch(repository.clone(), revision, global.search_location())
+                .await
+                .forward::<RepositoryError>("Invalid revision")?;
+        let revision = resolved.revision;
+
+        let state = state::State::deserialize(repository.clone(), revision)
+            .await
+            .forward::<RepositoryError>("Invalid revision")?;
+        if state.branch(repository.clone()).await != branch_id && revision != branch_point {
+            return Err(RepositoryError::internal(
+                "Given revision is not on the target branch",
+            ));
+        }
+
+        revision
+    } else {
+        Hash::default()
+    };
+
+    lore_debug!(
+        "Resolved signature {:?} to {}",
+        options.signature,
+        signature
+    );
+
+    let local_head = branch::load_latest(repository.clone(), branch_id)
+        .await
+        .ok();
+
+    let remote_branch = if options.local {
+        lore_debug!("Using local latest revision");
+        None
+    } else {
+        match repository.remote().await {
+            Ok(remote) => {
+                lore_debug!("Loading remote latest revision");
+                match branch::load_remote(remote, repository.id, branch_id).await {
+                    Ok(remote_head) => Some(remote_head),
+                    Err(err) if err.is_branch_not_found() => None,
+                    Err(err) => {
+                        if local_head.is_some() {
+                            lore_debug!(
+                                "Failed to load remote branch latest revision, falling back to local: {err}"
+                            );
+                            None
+                        } else {
+                            return Err(err).forward::<RepositoryError>(
+                                "Failed to load remote branch latest revision",
+                            );
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                if local_head.is_some() {
+                    lore_debug!("Remote unavailable, switching using local branch state: {err}");
+                    None
+                } else {
+                    return Err(err).forward::<RepositoryError>(
+                        "Failed to load remote branch latest revision",
+                    );
+                }
+            }
+        }
+    };
+
+    if local_head.is_none() && remote_branch.is_none() {
+        return Err(RepositoryError::from(BranchNotFound {
+            branch: branch_name.to_string(),
+        }));
+    }
+
+    if let Some(local_head) = local_head {
+        let signature_if_local = if signature.is_zero() {
+            local_head
+        } else {
+            signature
+        };
+        let (latest_local, latest_remote, location, signature) = if let Some(remote_status) =
+            remote_branch
+        {
+            let remote_head = remote_status.latest;
+            let signature_if_remote = if signature.is_zero() {
+                remote_head
+            } else {
+                signature
+            };
+            // Check if remote is ahead of local and local is not diverged
+            lore_debug!(
+                "Check if remote revision {remote_head} is ahead of local revision {local_head}"
+            );
+            if let Ok(remote_state) =
+                state::State::deserialize(repository.clone(), remote_head).await
+            {
+                if let Ok(local_state) =
+                    state::State::deserialize(repository.clone(), local_head).await
+                {
+                    if remote_state.revision_number() > local_state.revision_number() {
+                        // Check for divergence
+                        lore_debug!(
+                            "Remote revision {} is ahead of local revision {}, check for divergence",
+                            remote_state.revision_number(),
+                            local_state.revision_number()
+                        );
+                        if find::find_revision(
+                            repository.clone(),
+                            branch_id,
+                            remote_head,
+                            false,
+                            None,
+                            |state, _metadata| {
+                                if state.revision() == local_head
+                                    || state.parent_other() == local_head
+                                {
+                                    find::FindMatchResult::Match
+                                } else if state.revision_number() < local_state.revision_number() {
+                                    // Divergence, the remote branch history passed the point
+                                    // where local revision should have been found
+                                    find::FindMatchResult::Abort
+                                } else {
+                                    find::FindMatchResult::Continue
+                                }
+                            },
+                        )
+                        .await
+                        .is_ok()
+                        {
+                            lore_debug!("Branch is coherent, sync to remote LATEST");
+                            (
+                                remote_head,
+                                remote_head,
+                                LoreBranchLocation::Remote,
+                                signature_if_remote,
+                            )
+                        } else {
+                            lore_debug!("Branch is divergent, sync to local LATEST");
+                            (
+                                local_head,
+                                remote_head,
+                                LoreBranchLocation::Local,
+                                signature_if_local,
+                            )
+                        }
+                    } else if remote_state.revision() == local_state.revision() {
+                        lore_debug!("Remote and local revision are equal, treat as remote sync");
+                        (
+                            remote_head,
+                            remote_head,
+                            LoreBranchLocation::Remote,
+                            signature_if_remote,
+                        )
+                    } else {
+                        lore_debug!("Local revision is ahead, sync to local latest");
+                        (
+                            local_head,
+                            remote_head,
+                            LoreBranchLocation::Local,
+                            signature_if_local,
+                        )
+                    }
+                } else {
+                    lore_debug!(
+                        "Failed to load local latest revision state, sync to remote latest"
+                    );
+                    (
+                        remote_head,
+                        remote_head,
+                        LoreBranchLocation::Remote,
+                        signature_if_remote,
+                    )
+                }
+            } else {
+                lore_debug!("Failed to load remote latest revision state, sync to local latest");
+                (
+                    local_head,
+                    remote_head,
+                    LoreBranchLocation::Local,
+                    signature_if_local,
+                )
+            }
+        } else {
+            lore_debug!("No remote branch available, sync to local latest");
+            (
+                local_head,
+                Hash::default(),
+                LoreBranchLocation::Local,
+                signature_if_local,
+            )
+        };
+
+        event::LoreEvent::BranchSwitchBegin(LoreBranchSwitchBeginEventData {
+            branch: LoreBranchSwitchData::new(
+                branch_id,
+                branch_name,
+                latest_local,
+                latest_remote,
+                signature,
+                location,
+            ),
+        })
+        .send();
+
+        Ok((latest_local, latest_remote, location, signature))
+    } else {
+        let Some(remote_status) = remote_branch else {
+            return Err(RepositoryError::from(BranchNotFound {
+                branch: branch_name.to_string(),
+            }));
+        };
+
+        let signature = if signature.is_zero() {
+            remote_status.latest
+        } else {
+            signature
+        };
+
+        event::LoreEvent::BranchSwitchBegin(LoreBranchSwitchBeginEventData {
+            branch: LoreBranchSwitchData::new(
+                branch_id,
+                branch_name,
+                remote_status.latest,
+                remote_status.latest,
+                signature,
+                LoreBranchLocation::Remote,
+            ),
+        })
+        .send();
+
+        branch_switch_create(
+            repository.clone(),
+            token,
+            branch_id,
+            remote_status.latest,
+            remote_status.metadata,
+            global.dry_run(),
+        )
+        .await?;
+
+        Ok((
+            remote_status.latest,
+            remote_status.latest,
+            LoreBranchLocation::Remote,
+            signature,
+        ))
+    }
 }
 
 fn layer_branch_name(branch_name: &str, layer_id: RepositoryId) -> String {
@@ -3118,6 +3462,7 @@ async fn layer_branch_switch(
             };
 
             if let Err(err) = Box::pin(layer::sync(
+                layer_repository.clone(),
                 layer_repository,
                 layer_current,
                 layer_target,
@@ -3354,7 +3699,7 @@ pub fn repository_id(repository_path: impl AsRef<str>) -> Result<RepositoryId, R
         return Err(RepositoryError::internal("Invalid repository path"));
     };
 
-    let dot_path = path.join(RepositoryFormat::detect(&path).dot_dir());
+    let dot_path = get_dot_lore_path(&path)?;
     let id_path = dot_path.join(ID);
 
     Ok(read_id_from_file(id_path).internal("Repository not found")?)
@@ -3365,7 +3710,7 @@ pub fn repository_remote(repository_path: impl AsRef<str>) -> Result<String, Rep
         return Err(RepositoryError::internal("Invalid repository path"));
     };
 
-    let dot_path = path.join(RepositoryFormat::detect(&path).dot_dir());
+    let dot_path = get_dot_lore_path(&path)?;
     let config_path = dot_path.join(CONFIG);
 
     let Ok(config) = load_config(config_path) else {
@@ -3376,7 +3721,7 @@ pub fn repository_remote(repository_path: impl AsRef<str>) -> Result<String, Rep
 }
 
 pub async fn gc(repository: Arc<RepositoryContext>) -> Result<(), RepositoryError> {
-    let dot_path = repository.require_path()?.join(repository.format.dot_dir());
+    let dot_path = repository.dot_dir_path()?;
     let config_path = dot_path.join(CONFIG);
 
     let config = load_config(config_path.as_path())?;
@@ -3446,13 +3791,15 @@ pub mod test_helpers {
 
     use crate::fs::filesystem_provider::FilesystemProvider;
     use crate::instance::InstanceId;
+    use crate::repository::DOT_LORE;
+    use crate::repository::RepositoryPaths;
 
     pub fn default_repository_creation_args(
         immutable_store: std::sync::Arc<dyn lore_storage::ImmutableStore>,
         mutable_store: std::sync::Arc<dyn lore_storage::MutableStore>,
     ) -> crate::repository::RepositoryContextCreationArgs {
         crate::repository::RepositoryContextCreationArgs {
-            path: None,
+            paths: None,
             immutable_store,
             mutable_store,
             id: lore_base::types::Context::from(uuid::Uuid::now_v7()).into(),
@@ -3461,7 +3808,6 @@ pub mod test_helpers {
                 lore_base::error::NoRemote,
             )),
             filter: std::sync::Arc::default(),
-            format: crate::repository::RepositoryFormat::Lore,
             filesystem_provider: None,
         }
     }
@@ -3478,14 +3824,16 @@ pub mod test_helpers {
             >,
         ) -> Self;
         fn with_filter(self, filter: std::sync::Arc<crate::filter::Filter>) -> Self;
-        fn with_format(self, format: crate::repository::RepositoryFormat) -> Self;
         fn with_filesystem_provider(self, filesystem_provider: Arc<dyn FilesystemProvider>)
         -> Self;
     }
 
     impl RepositoryContextCreationArgsExt for crate::repository::RepositoryContextCreationArgs {
         fn with_path(mut self, path: impl AsRef<std::path::Path>) -> Self {
-            self.path = Some(path.as_ref().to_owned());
+            self.paths = Some(RepositoryPaths::new(
+                path.as_ref().to_owned(),
+                path.as_ref().join(DOT_LORE),
+            ));
             self
         }
 
@@ -3512,11 +3860,6 @@ pub mod test_helpers {
 
         fn with_filter(mut self, filter: std::sync::Arc<crate::filter::Filter>) -> Self {
             self.filter = filter;
-            self
-        }
-
-        fn with_format(mut self, format: crate::repository::RepositoryFormat) -> Self {
-            self.format = format;
             self
         }
 
@@ -3592,9 +3935,106 @@ mod remote_state_tests {
             crate::instance::InstanceId::default(),
             state,
             Arc::default(),
-            crate::repository::RepositoryFormat::Lore,
             None,
         ))
+    }
+
+    /// Nothing is cached until something resolves it, so the first reader or
+    /// writer drives the connect and a command that does neither remotely never
+    /// does.
+    #[tokio::test]
+    async fn a_fresh_context_has_no_session_pool_to_reuse() {
+        for state in [RemoteState::Offline, RemoteState::Failed(no_remote())] {
+            let context = context_with_state(state).await;
+            assert!(
+                context.cached_session_pool().is_none(),
+                "a context that has resolved nothing reported a pool"
+            );
+        }
+    }
+
+    /// Asking an offline context for a pool must not invent one, and must not
+    /// leave anything cached for the next caller to find.
+    #[tokio::test]
+    async fn an_offline_context_resolves_no_session_pool() {
+        let context = context_with_state(RemoteState::Offline).await;
+        assert!(context.session_pool("correlation").await.is_err());
+        assert!(context.cached_session_pool().is_none());
+    }
+
+    /// A pool for a context to hold, the strong reference left to the caller as the
+    /// connection's session cache holds it. The session in it is never resolved:
+    /// these tests ask which pool answered, not what it yields.
+    fn held_pool() -> Arc<lore_transport::SessionPool> {
+        let session = Arc::new(lore_transport::StorageSession::pending(|| async {
+            Err(ProtocolError::internal("a pooled session no test resolves"))
+        }));
+        Arc::new(lore_transport::SessionPool::new(vec![session]))
+    }
+
+    /// A pool once resolved is handed back without consulting the remote. This
+    /// context's connect has failed, so an answer at all is proof the pool was
+    /// reused rather than looked up again per call.
+    #[tokio::test]
+    async fn a_resolved_pool_is_reused_without_touching_the_remote() {
+        let context = context_with_state(RemoteState::Failed(disconnected())).await;
+        let pool = held_pool();
+        context.set_session_pool(&pool);
+
+        let reused = context
+            .session_pool("correlation")
+            .await
+            .expect("a context holding a pool answers from it");
+        assert!(Arc::ptr_eq(&reused, &pool));
+    }
+
+    /// The pool is held weakly, so dropping the pin — which is what
+    /// `StorageSession::invalidate` does to the connection's cache — sends the next
+    /// caller back to the remote rather than handing out sessions the server has
+    /// forgotten.
+    #[tokio::test]
+    async fn a_pool_whose_pin_is_dropped_is_not_reused() {
+        let context = context_with_state(RemoteState::Failed(disconnected())).await;
+        let pool = held_pool();
+        context.set_session_pool(&pool);
+        assert!(context.session_pool("correlation").await.is_ok());
+
+        drop(pool);
+        assert!(
+            context.session_pool("correlation").await.is_err(),
+            "an expired pool must send the caller back to the remote"
+        );
+    }
+
+    /// Only the terminal no-remote state answers yes. A failure and a connect
+    /// still in flight both have an answer a session carries, so a caller has to
+    /// build one.
+    #[tokio::test]
+    async fn only_a_context_without_a_remote_is_offline() {
+        assert!(
+            context_with_state(RemoteState::Offline).await.is_offline(),
+            "a context with no remote configured is offline"
+        );
+        for state in [
+            RemoteState::Failed(disconnected()),
+            RemoteState::Pending(ready_remote(Err(no_remote()))),
+        ] {
+            assert!(
+                !context_with_state(state).await.is_offline(),
+                "a context that has not settled on `Offline` reported itself offline"
+            );
+        }
+    }
+
+    /// The answer is taken without waiting, so a state lock held elsewhere reads
+    /// as not offline rather than blocking a caller that only wanted to skip work.
+    #[tokio::test]
+    async fn a_held_state_lock_does_not_answer_offline() {
+        let context = context_with_state(RemoteState::Offline).await;
+        let guard = context.remote.write().await;
+        assert!(!context.is_offline());
+        drop(guard);
+        assert!(context.is_offline());
     }
 
     #[tokio::test]
@@ -3780,8 +4220,7 @@ mod write_token_tests {
     /// and shares siblings to every constructed context.
     #[tokio::test]
     async fn no_store_context_with_client_token_grants_write_capability() {
-        let temp_dir =
-            std::env::temp_dir().join(format!("lore-write-token-test-{}", std::process::id()));
+        let temp_dir = lore_base::test_util::TempDir::new("lore-write-token-test-");
         let token = RepositoryWriteToken::acquire(&temp_dir).await;
         let ctx = in_memory_context().await;
         let with_token = Arc::new(
@@ -3843,5 +4282,116 @@ mod path_optional_tests {
             .require_path()
             .expect("path-bearing context should return path");
         assert_eq!(got, path.as_path());
+    }
+}
+
+#[cfg(test)]
+mod root_text_tests {
+    //! Coverage for [`require_text_root`], the one place a working copy whose path has no
+    //! text spelling is refused.
+    use super::require_text_root;
+
+    #[test]
+    fn a_root_that_is_text_is_accepted() {
+        assert!(require_text_root(std::path::Path::new("/work/repository")).is_ok());
+    }
+
+    /// A root without a text spelling is refused where the working copy is opened, so no
+    /// path built from it is ever reported in a spelling it cannot be parsed back from.
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn a_root_that_is_not_text_is_refused() {
+        use std::os::unix::ffi::OsStrExt;
+        let root = std::path::Path::new(std::ffi::OsStr::from_bytes(b"/work/\xff\xfe"));
+        assert!(
+            require_text_root(root).is_err(),
+            "a root with no text spelling must be refused"
+        );
+    }
+}
+
+#[cfg(test)]
+mod name_validation_tests {
+    //! Coverage for [`is_valid_name`], in particular the segment rules that keep
+    //! a name stable through the URL parsing in [`parse_url`].
+    use super::MAX_NAME_LEN;
+    use super::is_valid_name;
+    use super::parse_url;
+
+    #[test]
+    fn accepts_names_with_dots_inside_segments() {
+        for name in ["my-repo", "org/my-repo", "my.repo", "org/v1.2/repo_a"] {
+            assert!(is_valid_name(name), "{name} should be valid");
+        }
+    }
+
+    #[test]
+    fn rejects_dot_segments() {
+        for name in [".", "..", "./repo", "org/../other", "org/repo/..", "../.."] {
+            assert!(!is_valid_name(name), "{name} should be rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_dot_leading_segments() {
+        // Not just the traversal-like `.` and `..`: any leading dot is rejected.
+        for name in [
+            "...",
+            ".hidden",
+            ".lore",
+            "org/...",
+            "org/.git",
+            "org/.git/repo",
+        ] {
+            assert!(!is_valid_name(name), "{name} should be rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_empty_segments() {
+        for name in ["", "/", "//", "/repo", "repo/", "repo//", "org//repo"] {
+            assert!(!is_valid_name(name), "{name} should be rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_disallowed_characters_and_oversized_names() {
+        for name in ["repo name", "org\\repo", "repo!", "org/repö"] {
+            assert!(!is_valid_name(name), "{name} should be rejected");
+        }
+        assert!(is_valid_name(&"a".repeat(MAX_NAME_LEN)));
+        assert!(!is_valid_name(&"a".repeat(MAX_NAME_LEN + 1)));
+    }
+
+    #[test]
+    fn every_valid_name_survives_url_parsing() {
+        // The point of the segment rules: a valid name is returned unchanged by
+        // `parse_url`, so the repository a client asks for is the one it created.
+        for name in ["repo", "org/repo", "org/v1.2/repo_a", "org/a.b.c/d-e"] {
+            let (_remote_url, parsed) = parse_url(&format!("lores://host/{name}"), false)
+                .unwrap_or_else(|err| panic!("{name} should parse: {err}"));
+            assert_eq!(parsed, name);
+        }
+    }
+
+    #[test]
+    fn rejected_names_are_the_ones_url_parsing_rewrites() {
+        // Each of these either loses the name or resolves to a different one.
+        // Tested because the parse_url logic dictates what kind of names we can allow.
+        // If parse_url changes, the is_valid_name logic needs to be re-evaluated.
+        for (url_name, parsed_as) in [
+            (".", ""),
+            ("..", ""),
+            ("org/../other", "other"),
+            ("./repo", "repo"),
+            ("repo/", "repo"),
+            ("/repo/test//", "repo/test"),
+        ] {
+            assert!(!is_valid_name(url_name), "{url_name} should be rejected");
+            let parsed = parse_url(&format!("lores://host/{url_name}"), false)
+                .map(|(_remote_url, name)| name)
+                .unwrap_or_default();
+            assert_eq!(parsed, parsed_as, "for {url_name}");
+        }
     }
 }

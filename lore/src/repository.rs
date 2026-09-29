@@ -8,6 +8,7 @@ use lore_base::runtime::LORE_CONTEXT;
 use lore_base::runtime::runtime_flush_guarded;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
+use lore_macro::ValidateText;
 use lore_revision::global::GlobalConfig;
 use lore_revision::interface::LoreArray;
 use lore_revision::interface::LoreEventCallback;
@@ -20,6 +21,8 @@ use lore_revision::repository::LoreSharedStoreMode;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryError;
 use lore_revision::repository::SharedStoreToUseConfig;
+use lore_revision::repository::VfsConfig;
+use lore_revision::repository::VfsType;
 use lore_revision::repository::clone::CloneError;
 use lore_revision::repository::clone::CloneLayer;
 use lore_revision::repository::clone::CloneOptions;
@@ -29,6 +32,7 @@ use lore_revision::repository::create::CreateOptions;
 use lore_revision::repository::status::StatusOptions;
 use lore_revision::revision;
 use lore_revision::util;
+use lore_revision::util::config::SaveableConfig;
 use lore_revision::util::path::RelativePath;
 use serde::Deserialize;
 use serde::Serialize;
@@ -44,6 +48,36 @@ use crate::util::convert_user_paths;
 use crate::util::log_command_done;
 use crate::util::log_command_info;
 
+/// Virtual File System type for repository operations.
+///
+/// When not `None`, the `vfs` field causes the repository to create a Virtual File System
+/// as the repository directory instead of materializing files directly on disk.
+/// cbindgen:prefix-with-name
+/// cbindgen:rename-all=ScreamingSnakeCase
+#[repr(C)]
+#[derive(Clone, PartialEq, Debug, Default, Serialize, Deserialize, ValidateText)]
+#[serde(rename_all = "camelCase")]
+pub enum LoreVfsType {
+    /// Use no VFS, store all files using the regular file system
+    #[default]
+    None = 0,
+    /// Use whichever VFS is suggested based on the user's environment
+    Default = 1,
+    /// Use SWFS as a VFS
+    Swfs = 2,
+}
+
+impl LoreVfsType {
+    pub fn to_config(&self) -> VfsConfig {
+        VfsConfig {
+            vfs_type: match self {
+                LoreVfsType::None => VfsType::None,
+                LoreVfsType::Swfs | LoreVfsType::Default => VfsType::Swfs,
+            },
+        }
+    }
+}
+
 /// Arguments for cloning a remote repository to the local path.
 #[repr(C)]
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, LoreArgs)]
@@ -57,10 +91,10 @@ pub struct LoreRepositoryCloneArgs {
     pub view: LoreString,
     /// Clone without any files
     pub bare: u8,
-    /// Clone virtually using split-write filesystem
-    pub virtually: u8,
     /// Use direct file write
     pub direct_file_write: u8,
+    /// Which VFS to use, if any
+    pub vfs: LoreVfsType,
     /// (Optional) Layer module
     pub layer: LoreString,
     /// (Optional) Layer metadata key to link revisions with
@@ -150,7 +184,6 @@ async fn clone_impl(
         .forward_with::<CloneError, _>(|| format!("Invalid path: {repository_path}"))?;
     let bare = args.bare != 0;
     let ignore_existing = false;
-    let virtually = args.virtually != 0;
     let direct_file_write = args.direct_file_write != 0;
     let no_tracking = args.no_tracking != 0;
 
@@ -167,12 +200,13 @@ async fn clone_impl(
     let global_config = GlobalConfig::load()
         .await
         .forward::<CloneError>("Couldn't load global config")?;
-    let shared_store_options = SharedStoreToUseConfig::from_cli_args(
+    let shared_store_options = SharedStoreToUseConfig::from_api_args(
         &global_config,
         args.use_shared_store,
         &args.shared_store_path,
     )
     .forward_with::<CloneError, _>(|| format!("Invalid path: {}", args.shared_store_path))?;
+    let vfs_options = Some(args.vfs.to_config());
 
     let root_files: Vec<String> = args
         .root_files
@@ -190,10 +224,10 @@ async fn clone_impl(
     let options = CloneOptions {
         bare,
         ignore_existing,
-        virtually,
         direct_file_write,
         prefetch,
         shared_store_options,
+        vfs_options,
         no_tracking,
         root_files,
         dependency_tags,
@@ -352,10 +386,9 @@ async fn dump_impl(
     let revision = if args.revision.is_empty() {
         None
     } else {
-        revision::resolve(
+        revision::resolve_boxed(
             repository.clone(),
             args.revision.as_str(),
-            execution_context().globals().search_limit(),
             execution_context().globals().search_location(),
         )
         .await
@@ -372,20 +405,24 @@ async fn dump_impl(
         None
     };
 
-    lore_revision::repository::dump::dump(repository, revision, path, args.max_depth).await
+    lore_revision::repository::dump::dump_boxed(repository, revision, path, args.max_depth).await
 }
 
-/// Arguments for creating a new repository at the specified URL.
+/// Arguments for creating a new repository.
 #[repr(C)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
 #[handler(create_local)]
 pub struct LoreRepositoryCreateArgs {
-    /// URL to the repository
+    /// URL to the repository. Treated as the repository name instead when the call is
+    /// offline or local, where an empty value names it after the directory it is
+    /// created in. A URL naming no host is an error otherwise.
     pub repository_url: LoreString,
     /// Optional repository description
     pub description: LoreString,
     /// Optional repository ID, set to empty string to generate a new ID
     pub id: LoreString,
+    /// Which VFS to use, if any
+    pub vfs: LoreVfsType,
     /// Whether to use the shared store instead of a local immutable store. Zero-initialized
     /// (`LORE_SHARED_STORE_MODE_INHERIT`) follows the machine's global setting.
     pub use_shared_store: LoreSharedStoreMode,
@@ -393,7 +430,7 @@ pub struct LoreRepositoryCreateArgs {
     pub shared_store_path: LoreString,
 }
 
-/// Creates a new repository at the specified URL.
+/// Creates a new repository.
 ///
 /// # Events
 ///
@@ -463,15 +500,16 @@ async fn create_impl(args: &LoreRepositoryCreateArgs) -> Result<(), CreateError>
         } else {
             None
         },
-        shared_store_options: SharedStoreToUseConfig::from_cli_args(
+        shared_store_options: SharedStoreToUseConfig::from_api_args(
             &global_config,
             args.use_shared_store,
             &args.shared_store_path,
         )
         .forward::<CreateError>("resolving shared store config")?,
+        vfs_options: args.vfs.to_config(),
     };
 
-    lore_revision::repository::create::create(repository_url, repository_path, options).await
+    lore_revision::repository::create::create_boxed(repository_url, repository_path, options).await
 }
 
 /// Optional creator and creation-time metadata to record on a new repository.
@@ -526,19 +564,20 @@ async fn create_with_metadata_impl(
         } else {
             None
         },
-        shared_store_options: SharedStoreToUseConfig::from_cli_args(
+        shared_store_options: SharedStoreToUseConfig::from_api_args(
             &global_config,
             args.use_shared_store,
             &args.shared_store_path,
         )
         .forward::<CreateError>("resolving shared store config")?,
+        vfs_options: args.vfs.to_config(),
     };
     let metadata = Some(CreateMetadata {
         creator: metadata.creator.to_string(),
         created: metadata.created,
     });
 
-    lore_revision::repository::create::create_with_metadata(
+    lore_revision::repository::create::create_with_metadata_boxed(
         repository_url,
         repository_path,
         options,
@@ -555,31 +594,30 @@ pub struct LoreRepositoryDeleteArgs {
     pub repository_url: LoreString,
 }
 
-pub async fn delete(
+/// Deletes a remote repository. Blocks on the runtime, so it is called from outside it.
+pub fn delete(
     globals: LoreGlobalArgs,
     args: LoreRepositoryDeleteArgs,
     callback: LoreEventCallback,
 ) -> i32 {
     let execution = setup_execution(globals, callback);
 
-    LORE_CONTEXT
-        .scope(execution, async move {
-            log_command_info(&delete, &args);
+    crate::runtime().block_on(LORE_CONTEXT.scope(execution, async move {
+        log_command_info(&delete, &args);
 
-            let time_start = Instant::now();
+        let time_start = Instant::now();
 
-            let repository_url = args.repository_url.as_str();
+        let repository_url = args.repository_url.as_str();
 
-            let result = lore_revision::repository::delete::delete(
-                repository_url,
-                execution_context().globals().identity().unwrap_or_default(),
-            )
-            .await;
+        let result = lore_revision::repository::delete::delete(
+            repository_url,
+            execution_context().globals().identity().unwrap_or_default(),
+        )
+        .await;
 
-            log_command_done(&delete, time_start);
-            execution_context().dispatcher.complete_result(result).await
-        })
-        .await
+        log_command_done(&delete, time_start);
+        execution_context().dispatcher.complete_result(result).await
+    }))
 }
 
 /// Arguments for releasing cached store references for the repository path.
@@ -879,12 +917,6 @@ async fn status_local(
     args: LoreRepositoryStatusArgs,
     callback: LoreEventCallback,
 ) -> i32 {
-    // Avoid store updates during status, which is effectively read only
-    // State fragments are still prioritized in local store, so prioritize
-    // less file system writes of store files over accuracy in eviction/compaction
-    let mut globals = globals;
-    globals.no_atime = 1;
-
     if args.scan != 0 || args.check_dirty != 0 || args.reset != 0 {
         // Scan and check_dirty persist refreshed dirty flags in the staged
         // state and reset drops the staged anchor; all require write capability
@@ -939,7 +971,7 @@ async fn status_impl(
         None
     };
 
-    lore_revision::repository::status::status(repository, paths, options).await
+    lore_revision::repository::status::status_boxed(repository, paths, options).await
 }
 
 /// Arguments for verifying the integrity of the local repository state.
@@ -1015,7 +1047,7 @@ async fn verify_state_impl(
     } else {
         None
     };
-    lore_revision::repository::verify::verify(repository, path, args.heal != 0).await
+    lore_revision::repository::verify::verify_boxed(repository, path, args.heal != 0).await
 }
 
 /// Arguments for verifying a single fragment in the local store.
@@ -1063,7 +1095,7 @@ async fn verify_fragment_impl(
         context: args.context,
         heal: args.heal != 0,
     };
-    lore_revision::repository::verify::verify_fragment(repository, core_args).await
+    lore_revision::repository::verify::verify_fragment_boxed(repository, core_args).await
 }
 
 /// Arguments for querying the local immutable store by fragment address.
@@ -1163,7 +1195,7 @@ async fn metadata_get_local(
                 Some(args.key.to_string())
             };
             async move {
-                lore_revision::metadata::repository::get(
+                lore_revision::metadata::repository::get_boxed(
                     repository,
                     key.as_deref(),
                     execution_context().globals().local(),
@@ -1246,7 +1278,7 @@ async fn metadata_set_impl(
     }
     let values: Vec<&[u8]> = encoded_values.iter().map(|v| v.as_slice()).collect();
 
-    lore_revision::metadata::repository::set(repository, &keys, &values, &formats).await
+    lore_revision::metadata::repository::set_boxed(repository, &keys, &values, &formats).await
 }
 
 /// Arguments for removing metadata keys from the current repository.
@@ -1281,7 +1313,7 @@ async fn metadata_clear_local(
             let keys: Vec<String> = args.keys.as_slice().iter().map(|k| k.to_string()).collect();
             async move {
                 let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-                lore_revision::metadata::repository::clear(repository, &key_refs).await
+                lore_revision::metadata::repository::clear_boxed(repository, &key_refs).await
             }
         },
     )
@@ -1408,14 +1440,16 @@ async fn config_get_local(
             let key = args.key.to_string();
             async move {
                 let config_path = repository
-                    .require_path()?
-                    .join(repository.format.dot_dir())
+                    .dot_dir_path()?
                     .join(lore_revision::repository::CONFIG);
-                let config_str = tokio::fs::read_to_string(&config_path)
+                let config_bytes = lore_io::IoDriver::global()
+                    .read_file_bytes(&config_path)
                     .await
                     .internal("Failed to load config file")?;
+                let config_str =
+                    str::from_utf8(&config_bytes).internal("Failed to load config file")?;
                 let config: lore_revision::repository::RepositoryConfig =
-                    toml::de::from_str(&config_str).internal("Failed to load config file")?;
+                    toml::de::from_str(config_str).internal("Failed to load config file")?;
                 let value = match key.as_str() {
                     "remote_url" => config.remote_url.unwrap_or_default(),
                     "identity" => config.identity.unwrap_or_default(),

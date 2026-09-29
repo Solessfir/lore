@@ -22,6 +22,7 @@ use tracing::info;
 
 use super::record::build_repository;
 use super::repository_get::repository_load_id;
+use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
@@ -71,6 +72,7 @@ pub async fn handler(
         .scope(execution, async move {
             let (metadata, metadata_hash) = repository_load_id(repository.clone(), id, None, None)
                 .await
+                .filter_slow_down()?
                 .map_err(|_err| Status::not_found(format!("Repository {id} not found")))?;
 
             let user_id = execution_context().user_id().await;
@@ -90,16 +92,22 @@ pub async fn handler(
                 RepositoryId::default(),
             )
             .await
+            .filter_slow_down()?
             .warn_map_err(|err| {
                 Status::internal(format!("Failed to delete repository name mapping: {err}"))
             })?;
 
             repository::metadata_store_hash(repository.clone(), Hash::default())
                 .await
+                .filter_slow_down()?
                 .warn_map_err(|err| {
                     Status::internal(format!("Failed to delete repository metadata: {err}"))
                 })?;
 
+            // no filter_slow_down()? usage here: the repository record is
+            // already torn down above, so this purge is past the point of no
+            // return. A retryable status would invite a retry that only finds
+            // the repository gone, leaving these keys orphaned.
             if let Ok(mut branch_stream) = branch::list(repository.clone()).await {
                 let mut branch_list = vec![];
                 while let Some(branch) = branch_stream.next().await {
@@ -149,4 +157,110 @@ pub async fn handler(
             }))
         })
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use lore_revision::repository::RepositoryMetadata;
+    use rand::random;
+
+    use super::*;
+    use crate::auth::jwt::AuthorizationToken;
+    use crate::store::test_store_create;
+
+    struct TestInstrumentProvider;
+
+    impl InstrumentProvider for TestInstrumentProvider {
+        fn namespace(&self) -> &'static str {
+            "test"
+        }
+    }
+
+    async fn seed_repository(
+        immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+        mutable_store: Arc<dyn lore_storage::MutableStore>,
+        id: RepositoryId,
+        creator: &str,
+    ) {
+        let repository = Arc::new(RepositoryContext::new_server_context(
+            immutable_store,
+            mutable_store,
+            id,
+        ));
+        let metadata_hash = repository::metadata_store(
+            repository.clone(),
+            RepositoryMetadata {
+                name: "the-repository".to_string(),
+                creator: creator.to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("Failed to store repository metadata");
+        repository::metadata_store_hash(repository.clone(), metadata_hash)
+            .await
+            .expect("Failed to store repository metadata hash");
+        repository::store_name_to_id(repository, "the-repository", id)
+            .await
+            .expect("Failed to store repository name to id mapping");
+    }
+
+    fn delete_request(
+        id: RepositoryId,
+        token: AuthorizationToken,
+    ) -> Request<RepositoryDeleteRequest> {
+        let id_bytes: Context = id.into();
+        let mut request = Request::new(RepositoryDeleteRequest {
+            id: id_bytes.into(),
+        });
+        request.extensions_mut().insert(token);
+        request
+    }
+
+    /// The creator check compares the recorded creator against the token's
+    /// `identity_claim` value, so a deployment recording
+    /// `preferred_username` lets the same user, presenting the same claim,
+    /// delete — while the subject the provider minted alongside is not what
+    /// is compared.
+    #[tokio::test]
+    async fn the_creator_check_compares_the_identity_claim() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let id = random::<RepositoryId>();
+            seed_repository(immutable_store.clone(), mutable_store.clone(), id, "alice").await;
+
+            let by_subject = AuthorizationToken {
+                user_id: "f7d3a1c2-0000-0000-0000-000000000000".to_string(),
+                preferred_username: Some("alice".to_string()),
+                ..Default::default()
+            };
+            let status = handler(
+                delete_request(id, by_subject.clone()),
+                None,
+                immutable_store.clone(),
+                mutable_store.clone(),
+                &TestInstrumentProvider,
+            )
+            .await
+            .expect_err("the subject is not the recorded creator");
+            assert_eq!(status.code(), tonic::Code::PermissionDenied);
+
+            let by_username = AuthorizationToken {
+                identity: Some("alice".to_string()),
+                ..by_subject
+            };
+            handler(
+                delete_request(id, by_username),
+                None,
+                immutable_store,
+                mutable_store,
+                &TestInstrumentProvider,
+            )
+            .await
+            .expect("the identity claim matches the recorded creator");
+        }))
+        .await;
+    }
 }

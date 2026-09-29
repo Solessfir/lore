@@ -3,13 +3,14 @@
 #![allow(non_camel_case_types)]
 #![allow(clippy::missing_safety_doc)]
 
-use std::alloc::Layout;
 #[cfg(feature = "oodle")]
+use std::alloc::Layout;
+use std::ops::RangeInclusive;
 use std::sync::Once;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicU32;
-#[cfg(feature = "oodle")]
 use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use bytes::BytesMut;
@@ -32,14 +33,25 @@ pub enum FragmentError {
     NotSupported,
 }
 
-#[repr(u32)]
+/// cbindgen:prefix-with-name
+/// cbindgen:rename-all=ScreamingSnakeCase
+#[repr(C)]
+/// The codec a payload is compressed with before it is stored.
+///
+/// Every stored fragment records the codec it was written with, so a mode selected here decides
+/// what later writes use and never what already stored content is read back as.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
 #[serde(bound(deserialize = "'de: 'static"))]
 pub enum CompressionMode {
+    /// No mode was selected; the built-in default applies, which is Zstd.
     NotSpecified = 0,
+    /// Store payloads verbatim, compressing nothing.
     NoCompression = 1,
+    /// LZ4, which costs less to compress than Zstd and stores more bytes.
     Lz4 = 2,
+    /// Oodle, deprecated and refused: a write under this mode fails.
     Oodle = 3,
+    /// Zstandard, at the configured level.
     Zstd = 4,
 }
 
@@ -56,6 +68,124 @@ impl CompressionMode {
 }
 
 pub static COMPRESSION_MODE: AtomicU32 = AtomicU32::new(0);
+
+/// The mode `value` names, if it names one a payload can be written under.
+///
+/// Read on the value rather than through [`CompressionMode::from_u32`], which answers
+/// `NotSpecified` for anything it does not recognize: a caller that passed a typo would be told
+/// the default had been selected for it. `Oodle` answers `None` with the values no variant
+/// carries, [`compress`] refusing that mode as deprecated whether or not the `oodle` feature is
+/// compiled in, so taking it would only move the failure to the first write.
+pub fn writable_compression_mode(value: u32) -> Option<CompressionMode> {
+    const NOT_SPECIFIED: u32 = CompressionMode::NotSpecified as u32;
+    const NO_COMPRESSION: u32 = CompressionMode::NoCompression as u32;
+    const LZ4: u32 = CompressionMode::Lz4 as u32;
+    const ZSTD: u32 = CompressionMode::Zstd as u32;
+
+    match value {
+        NOT_SPECIFIED => Some(CompressionMode::NotSpecified),
+        NO_COMPRESSION => Some(CompressionMode::NoCompression),
+        LZ4 => Some(CompressionMode::Lz4),
+        ZSTD => Some(CompressionMode::Zstd),
+        _ => None,
+    }
+}
+
+/// Offers `mode` as the mode payloads are compressed under, reporting whether it was taken.
+///
+/// This is how a preference a server states is applied. A mode already selected in this process
+/// outranks it, whether that selection came from the API or from a server reached earlier, and
+/// `NotSpecified` states no preference at all.
+pub fn suggest_compression_mode(mode: CompressionMode) -> bool {
+    apply_mode_suggestion(&COMPRESSION_MODE, mode)
+}
+
+/// Selects `mode` in `selection` unless one has already been made there.
+fn apply_mode_suggestion(selection: &AtomicU32, mode: CompressionMode) -> bool {
+    if matches!(mode, CompressionMode::NotSpecified) {
+        return false;
+    }
+    selection
+        .compare_exchange(
+            CompressionMode::NotSpecified as u32,
+            mode as u32,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        )
+        .is_ok()
+}
+
+/// Selects the level each codec defaults to, no level having been chosen for it.
+pub const DEFAULT_COMPRESSION_LEVEL: i32 = -1;
+
+/// The levels zstd accepts.
+const ZSTD_LEVELS: RangeInclusive<i32> = 1..=22;
+
+/// The level zstd compresses at where nothing configures one.
+const ZSTD_DEFAULT_LEVEL: i32 = 6;
+
+/// The levels Oodle accepts.
+#[cfg(feature = "oodle")]
+const OODLE_LEVELS: RangeInclusive<i32> = 0..=9;
+
+/// The level Oodle compresses at where nothing configures one, `OodleLZ_CompressionLevel_Fast`.
+#[cfg(feature = "oodle")]
+const OODLE_DEFAULT_LEVEL: i32 = 3;
+
+/// Selects the level the codecs compress at, reporting whether the selection is the one in force.
+///
+/// Each codec fixes its level once, the workspace every compression after the first is built in
+/// being sized for it. The level is installed here rather than left for that first compression to
+/// resolve, so a payload racing this call either finds the selection or fixes the level ahead of
+/// it, with no reading of a level this call is about to replace. `false` reports that a payload
+/// fixed the level first, leaving the selection deciding nothing.
+///
+/// [`DEFAULT_COMPRESSION_LEVEL`] installs the level each codec defaults to.
+pub fn set_compression_level(level: i32) -> bool {
+    let selected = selected_level(level);
+    #[cfg(feature = "oodle")]
+    let _ = OODLE_COMPRESSION_LEVEL.set(oodle_level(selected));
+    ZSTD_COMPRESSION_LEVEL.set(zstd_level(selected)).is_ok()
+}
+
+/// The level `level` selects, [`DEFAULT_COMPRESSION_LEVEL`] selecting none.
+fn selected_level(level: i32) -> Option<i32> {
+    (level != DEFAULT_COMPRESSION_LEVEL).then_some(level)
+}
+
+/// The level zstd compresses at, given what was selected for the codecs.
+fn zstd_level(selected: Option<i32>) -> std::ffi::c_int {
+    accepted_compression_level(environment_compression_level(), selected, ZSTD_LEVELS)
+        .unwrap_or(ZSTD_DEFAULT_LEVEL) as std::ffi::c_int
+}
+
+/// The level Oodle compresses at, given what was selected for the codecs.
+#[cfg(feature = "oodle")]
+fn oodle_level(selected: Option<i32>) -> u32 {
+    accepted_compression_level(environment_compression_level(), selected, OODLE_LEVELS)
+        .unwrap_or(OODLE_DEFAULT_LEVEL) as u32
+}
+
+/// The level `LORE_COMPRESSION_LEVEL` names, whether or not a codec accepts it.
+fn environment_compression_level() -> Option<i32> {
+    std::env::var("LORE_COMPRESSION_LEVEL").ok()?.parse().ok()
+}
+
+/// Resolves the level a codec accepting `range` compresses at from the two sources that name one.
+///
+/// `environment` outranks `selected`, so an operator can pin the level of a build that selects one
+/// of its own, and is passed over where it names a level outside `range`. A selection is clamped
+/// into `range` instead: one setting serves every codec and each accepts its own, so a level meant
+/// for one is brought within the other's rather than dropped for it.
+fn accepted_compression_level(
+    environment: Option<i32>,
+    selected: Option<i32>,
+    range: RangeInclusive<i32>,
+) -> Option<i32> {
+    environment
+        .filter(|level| range.contains(level))
+        .or_else(|| selected.map(|level| level.clamp(*range.start(), *range.end())))
+}
 
 pub use lore_base::types::FRAGMENT_SIZE_THRESHOLD;
 
@@ -317,83 +447,155 @@ fn decompress_scratch_buffer_done(buffer: BytesMut) {
     }
 }
 
-// Zstd custom allocator — routes all zstd internal allocations through std::alloc (the Rust
-// global allocator) instead of system malloc, matching the Oodle allocator pattern.
-// A usize header is stored before each allocation to track the layout for dealloc.
-const ZSTD_ALLOC_HEADER: usize = size_of::<usize>().next_multiple_of(align_of::<usize>());
+// Zstd context pool, the counterpart to the Oodle scratch buffer pool above: Oodle
+// takes a scratch pointer on every call and allocates nothing, and zstd does the
+// same when the context is built inside a buffer the caller owns. The pooled item
+// is therefore the workspace, and the context lives inside it.
+//
+// A context built in a fixed workspace cannot resize; zstd fails the compression
+// rather than allocating. The workspace is sized for the worst case at the
+// configured compression level, and an oversized workspace costs a static context
+// nothing.
 
-// Safety: Allocates via std::alloc::alloc. The returned pointer is offset past the header
-// and is usize-aligned. Returns null on failure.
-unsafe extern "C" fn zstd_alloc(
-    _opaque: *mut core::ffi::c_void,
-    size: usize,
-) -> *mut core::ffi::c_void {
-    let total = ZSTD_ALLOC_HEADER + size;
-    let Ok(layout) = Layout::from_size_align(total, ZSTD_ALLOC_HEADER) else {
-        return core::ptr::null_mut();
-    };
+/// The largest input in each table of compression parameters a fragment can select.
+///
+/// zstd picks the table by how many of these an input falls under, so the largest
+/// input in a table is also the costliest, and a fragment never exceeds the last of
+/// them.
+const ZSTD_PARAMETER_TABLE_SIZES: [usize; 3] = [16 * 1024, 128 * 1024, FRAGMENT_SIZE_THRESHOLD];
 
-    let raw = unsafe { std::alloc::alloc(layout) };
-    if raw.is_null() {
-        return core::ptr::null_mut();
-    }
+/// Bytes a compression context needs at `level` for any fragment.
+///
+/// The largest requirement across the tables above, because a smaller input can
+/// select a costlier table than a larger one. Bounded by what a
+/// [`FRAGMENT_SIZE_THRESHOLD`] window needs, where sizing for the level alone would
+/// provision for an unbounded input and cost two orders of magnitude more at the
+/// higher levels.
+fn zstd_compress_workspace_size_for(level: std::ffi::c_int) -> usize {
+    ZSTD_PARAMETER_TABLE_SIZES
+        .into_iter()
+        .map(|size| zstd_compress_workspace_size_at(level, size))
+        .max()
+        .unwrap_or_default()
+}
 
+/// Bytes a compression context needs at `level` for an input of `size`.
+fn zstd_compress_workspace_size_at(level: std::ffi::c_int, size: usize) -> usize {
+    // Safety: pure calculations over a level in the range zstd accepts.
     unsafe {
-        raw.cast::<usize>().write(total);
-        raw.add(ZSTD_ALLOC_HEADER).cast()
+        let parameters = zstd_sys::ZSTD_getCParams(level, size as u64, 0);
+        zstd_sys::ZSTD_estimateCCtxSize_usingCParams(parameters)
     }
 }
 
-// Safety: Reads the header to recover the layout, then frees via std::alloc::dealloc.
-// Handles null (zstd may call free with null on error paths).
-unsafe extern "C" fn zstd_free(_opaque: *mut core::ffi::c_void, address: *mut core::ffi::c_void) {
-    if address.is_null() {
-        return;
-    }
-    unsafe {
-        let raw = address.cast::<u8>().sub(ZSTD_ALLOC_HEADER);
-        let total = raw.cast::<usize>().read();
-        let layout = Layout::from_size_align_unchecked(total, ZSTD_ALLOC_HEADER);
-        std::alloc::dealloc(raw, layout);
-    }
+/// Bytes a compression context needs at the configured compression level.
+fn zstd_compress_workspace_size() -> usize {
+    static SIZE: OnceLock<usize> = OnceLock::new();
+    *SIZE.get_or_init(|| zstd_compress_workspace_size_for(zstd_compression_level()))
 }
 
-const ZSTD_CUSTOM_MEM: zstd_sys::ZSTD_customMem = zstd_sys::ZSTD_customMem {
-    customAlloc: Some(zstd_alloc),
-    customFree: Some(zstd_free),
-    opaque: std::ptr::null_mut(),
-};
-
-// Zstd context pool. ZSTD_CCtx/DCtx retain their internal workspace buffers (~1-2 MB for
-// compression, ~130 KB for decompression) between calls. Pooling the contexts avoids repeated
-// malloc/free of these workspaces on every compress/decompress — ZSTD_compressCCtx reuses the
-// existing workspace when parameters are compatible. This is the zstd equivalent of the Oodle
-// scratch buffer pool: Oodle takes a raw scratch pointer each call, while zstd manages workspace
-// internally inside the context, so the context itself is what we pool.
-struct ZstdCCtx(*mut zstd_sys::ZSTD_CCtx);
+/// A compression context and the workspace it was built in.
+///
+/// `u64` because [`zstd_sys::ZSTD_initStaticCCtx`] requires eight-byte alignment.
+/// Dropping the workspace frees the context: a static context owns nothing outside
+/// the buffer it lives in. `context` survives a move of this struct because the
+/// buffer is heap-allocated and keeps its address.
+struct ZstdCCtx {
+    context: *mut zstd_sys::ZSTD_CCtx,
+    _workspace: Vec<u64>,
+    pooled: bool,
+}
 // Safety: ZSTD_CCtx is not accessed concurrently — the pool hands it to one thread at a time.
 unsafe impl Send for ZstdCCtx {}
 
-impl Drop for ZstdCCtx {
-    fn drop(&mut self) {
-        // Safety: self.0 is a valid ZSTD_CCtx from ZSTD_createCCtx, freed exactly once via Drop.
-        unsafe {
-            zstd_sys::ZSTD_freeCCtx(self.0);
+impl ZstdCCtx {
+    /// The absence of a context, for when its workspace cannot be allocated. Call
+    /// sites already test for a null context, so no further path is needed.
+    fn none() -> Self {
+        Self {
+            context: std::ptr::null_mut(),
+            _workspace: Vec::new(),
+            pooled: false,
         }
     }
 }
 
-struct ZstdDCtx(*mut zstd_sys::ZSTD_DCtx);
+/// A decompression context and the workspace it was built in. See [`ZstdCCtx`].
+struct ZstdDCtx {
+    context: *mut zstd_sys::ZSTD_DCtx,
+    _workspace: Vec<u64>,
+    pooled: bool,
+}
 // Safety: ZSTD_DCtx is not accessed concurrently — the pool hands it to one thread at a time.
 unsafe impl Send for ZstdDCtx {}
 
-impl Drop for ZstdDCtx {
-    fn drop(&mut self) {
-        // Safety: self.0 is a valid ZSTD_DCtx from ZSTD_createDCtx, freed exactly once via Drop.
-        unsafe {
-            zstd_sys::ZSTD_freeDCtx(self.0);
+impl ZstdDCtx {
+    /// The absence of a context. See [`ZstdCCtx::none`].
+    fn none() -> Self {
+        Self {
+            context: std::ptr::null_mut(),
+            _workspace: Vec::new(),
+            pooled: false,
         }
     }
+}
+
+/// A buffer of at least `bytes`, aligned for a static zstd context, or `None` when
+/// it cannot be allocated.
+///
+/// Left unwritten, and so the capacity carries the size while the length stays zero:
+/// zstd initialises what it uses, and zeroing the buffer would cost a pass over
+/// several megabytes for nothing. No slice is ever formed over it, so nothing in Rust
+/// reads the uninitialised memory. A memory checker watching the C side will report
+/// it as uninitialised all the same.
+///
+/// Fallible because a context is optional: a caller without one stores the fragment
+/// uncompressed, which is preferable to the process abort an infallible allocation
+/// raises on failure.
+fn zstd_workspace(bytes: usize) -> Option<Vec<u64>> {
+    let mut workspace = Vec::new();
+    workspace
+        .try_reserve_exact(bytes.div_ceil(size_of::<u64>()))
+        .ok()?;
+    Some(workspace)
+}
+
+/// Upper bound on the contexts kept for reuse.
+///
+/// The pool fills on demand: a context is built only when a caller finds the queue
+/// empty, so a process that never compresses more than eight fragments at once holds
+/// eight workspaces rather than this many. Concurrency beyond the bound builds a
+/// context per call and frees it on release, which keeps resident workspace
+/// independent of the core count at the cost of an allocation per call past it.
+const ZSTD_CTX_POOL_LIMIT: usize = 32;
+
+static ZSTD_COMPRESS_CTX_COUNT: AtomicUsize = AtomicUsize::new(0);
+static ZSTD_DECOMPRESS_CTX_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Claims one of the [`ZSTD_CTX_POOL_LIMIT`] pooled slots, reporting whether the
+/// caller's context is to be kept for reuse.
+///
+/// A claim is never released: pooled contexts live for the process, so `count` only
+/// rises, and it reaching the limit is what makes further contexts transient.
+///
+/// The pairing is by convention rather than by construction. A claimed context that
+/// is dropped without reaching its release costs its slot for the life of the
+/// process, leaving the pool one context smaller; every path between a claim and its
+/// release therefore has to reach that release.
+fn zstd_claim_pooled_slot(count: &AtomicUsize) -> bool {
+    let mut current = count.load(std::sync::atomic::Ordering::Relaxed);
+    while current < ZSTD_CTX_POOL_LIMIT {
+        match count.compare_exchange_weak(
+            current,
+            current + 1,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(actual) => current = actual,
+        }
+    }
+    false
 }
 
 static ZSTD_COMPRESS_CTX_QUEUE: OnceLock<crossbeam::queue::ArrayQueue<ZstdCCtx>> = OnceLock::new();
@@ -401,12 +603,7 @@ static ZSTD_DECOMPRESS_CTX_QUEUE: OnceLock<crossbeam::queue::ArrayQueue<ZstdDCtx
     OnceLock::new();
 
 fn zstd_compress_ctx_queue() -> &'static crossbeam::queue::ArrayQueue<ZstdCCtx> {
-    // Compression runs inline on tokio workers, so queue capacity = worker
-    // count. Push is atomic — overflow contexts from bursts fail to push and
-    // drop immediately, so the pool can't grow beyond the worker count.
-    ZSTD_COMPRESS_CTX_QUEUE.get_or_init(|| {
-        crossbeam::queue::ArrayQueue::new(lore_base::runtime::default_worker_threads())
-    })
+    ZSTD_COMPRESS_CTX_QUEUE.get_or_init(|| crossbeam::queue::ArrayQueue::new(ZSTD_CTX_POOL_LIMIT))
 }
 
 fn zstd_compress_ctx() -> ZstdCCtx {
@@ -415,22 +612,36 @@ fn zstd_compress_ctx() -> ZstdCCtx {
         return ctx;
     }
 
-    // Safety: ZSTD_createCCtx_advanced returns a valid pointer or null.
-    // Null is checked at call sites before any dereference; ZSTD_freeCCtx(null) is a no-op.
-    // Uses ZSTD_CUSTOM_MEM so all internal allocations go through std::alloc, not system malloc.
-    ZstdCCtx(unsafe { zstd_sys::ZSTD_createCCtx_advanced(ZSTD_CUSTOM_MEM) })
+    let Some(mut workspace) = zstd_workspace(zstd_compress_workspace_size()) else {
+        return ZstdCCtx::none();
+    };
+    // Safety: the buffer is at least the estimated size and `u64`-aligned as
+    // ZSTD_initStaticCCtx requires, and it outlives the context because the two are
+    // dropped together. A null return is checked at the call sites.
+    let context = unsafe {
+        zstd_sys::ZSTD_initStaticCCtx(
+            workspace.as_mut_ptr().cast::<std::ffi::c_void>(),
+            workspace.capacity() * size_of::<u64>(),
+        )
+    };
+    ZstdCCtx {
+        context,
+        _workspace: workspace,
+        pooled: !context.is_null() && zstd_claim_pooled_slot(&ZSTD_COMPRESS_CTX_COUNT),
+    }
 }
 
+/// Returns a context to the pool, or frees it when it holds no pooled slot.
+///
+/// The queue has one slot per claim, so pushing a pooled context cannot fail.
 fn zstd_compress_ctx_done(ctx: ZstdCCtx) {
-    let queue = zstd_compress_ctx_queue();
-    // Queue capacity bounds the pool. Overflow contexts drop and free themselves.
-    let _ = queue.push(ctx);
+    if ctx.pooled {
+        let _ = zstd_compress_ctx_queue().push(ctx);
+    }
 }
 
 fn zstd_decompress_ctx_queue() -> &'static crossbeam::queue::ArrayQueue<ZstdDCtx> {
-    ZSTD_DECOMPRESS_CTX_QUEUE.get_or_init(|| {
-        crossbeam::queue::ArrayQueue::new(lore_base::runtime::default_worker_threads())
-    })
+    ZSTD_DECOMPRESS_CTX_QUEUE.get_or_init(|| crossbeam::queue::ArrayQueue::new(ZSTD_CTX_POOL_LIMIT))
 }
 
 fn zstd_decompress_ctx() -> ZstdDCtx {
@@ -439,14 +650,30 @@ fn zstd_decompress_ctx() -> ZstdDCtx {
         return ctx;
     }
 
-    // Safety: ZSTD_createDCtx_advanced returns a valid pointer or null.
-    // Null is checked at call sites before any dereference; ZSTD_freeDCtx(null) is a no-op.
-    ZstdDCtx(unsafe { zstd_sys::ZSTD_createDCtx_advanced(ZSTD_CUSTOM_MEM) })
+    // Safety: as `zstd_compress_ctx`, with the size zstd states for a
+    // decompression context.
+    let Some(mut workspace) = zstd_workspace(unsafe { zstd_sys::ZSTD_estimateDCtxSize() }) else {
+        return ZstdDCtx::none();
+    };
+    let context = unsafe {
+        zstd_sys::ZSTD_initStaticDCtx(
+            workspace.as_mut_ptr().cast::<std::ffi::c_void>(),
+            workspace.capacity() * size_of::<u64>(),
+        )
+    };
+    ZstdDCtx {
+        context,
+        _workspace: workspace,
+        pooled: !context.is_null() && zstd_claim_pooled_slot(&ZSTD_DECOMPRESS_CTX_COUNT),
+    }
 }
 
+/// Returns a context to the pool, or frees it when it holds no pooled slot. See
+/// [`zstd_compress_ctx_done`].
 fn zstd_decompress_ctx_done(ctx: ZstdDCtx) {
-    let queue = zstd_decompress_ctx_queue();
-    let _ = queue.push(ctx);
+    if ctx.pooled {
+        let _ = zstd_decompress_ctx_queue().push(ctx);
+    }
 }
 
 pub fn decompress(
@@ -548,14 +775,14 @@ fn decompress_into(
         );
 
         let ctx = zstd_decompress_ctx();
-        if ctx.0.is_null() {
+        if ctx.context.is_null() {
             return Err(FragmentError::internal("failed to allocate zstd context"));
         }
-        // Safety: ctx.0 is a valid non-null ZSTD_DCtx. Output buffer has capacity >= size_content.
+        // Safety: ctx.context is a valid non-null ZSTD_DCtx. Output buffer has capacity >= size_content.
         // Input slice length is validated against size_payload at function entry.
         let decompressed_size = unsafe {
             zstd_sys::ZSTD_decompressDCtx(
-                ctx.0,
+                ctx.context,
                 decompressed.as_mut_ptr().cast::<std::ffi::c_void>(),
                 fragment.size_content as usize,
                 compressed.as_ptr().cast::<std::ffi::c_void>(),
@@ -678,14 +905,14 @@ pub fn decompress_into_slice(
         );
 
         let ctx = zstd_decompress_ctx();
-        if ctx.0.is_null() {
+        if ctx.context.is_null() {
             return Err(FragmentError::internal("failed to allocate zstd context"));
         }
-        // Safety: ctx.0 is a valid non-null ZSTD_DCtx. Output slice length is validated >= size_content.
+        // Safety: ctx.context is a valid non-null ZSTD_DCtx. Output slice length is validated >= size_content.
         // Input slice length is validated against size_payload at function entry.
         let decompressed_size = unsafe {
             zstd_sys::ZSTD_decompressDCtx(
-                ctx.0,
+                ctx.context,
                 decompressed.as_mut_ptr().cast::<std::ffi::c_void>(),
                 fragment.size_content as usize,
                 compressed.as_ptr().cast::<std::ffi::c_void>(),
@@ -717,20 +944,13 @@ pub fn decompress_into_slice(
 }
 
 #[cfg(feature = "oodle")]
-static COMPRESSION_LEVEL: OnceLock<u32> = OnceLock::new();
+static OODLE_COMPRESSION_LEVEL: OnceLock<u32> = OnceLock::new();
 
+/// The Oodle level, fixed by whichever of the first payload compressed and
+/// [`set_compression_level`] reaches it first.
 #[cfg(feature = "oodle")]
-fn compression_level() -> u32 {
-    *COMPRESSION_LEVEL.get_or_init(|| {
-        if let Ok(level) = std::env::var("LORE_COMPRESSION_LEVEL")
-            && let Ok(level) = level.parse::<u32>()
-            && level < 10
-        {
-            level
-        } else {
-            3 /* OodleLZ_CompressionLevel_Fast */
-        }
-    })
+fn oodle_compression_level() -> u32 {
+    *OODLE_COMPRESSION_LEVEL.get_or_init(|| oodle_level(None))
 }
 
 /// Returns the maximum compressed size for the given payload length and
@@ -765,6 +985,20 @@ fn compress_bound(size_payload: usize, mode: CompressionMode) -> usize {
 }
 
 pub fn compress(
+    fragment: Fragment,
+    payload: &[u8],
+    mode: CompressionMode,
+) -> Result<(Fragment, Bytes), CompressFragmentError> {
+    // put deprecated compression mode guards here
+    if matches!(mode, CompressionMode::Oodle) {
+        return Err(CompressFragmentError::from(NotSupported {
+            operation: "Oodle compression requested but this mode is being deprecated".to_string(),
+        }));
+    }
+    compress_without_deprecation_checks(fragment, payload, mode)
+}
+
+pub fn compress_without_deprecation_checks(
     fragment: Fragment,
     payload: &[u8],
     mode: CompressionMode,
@@ -836,7 +1070,7 @@ fn compress_oodle_impl(
     // Save at least 5% to be worth compressing
     let compressed_size_threshold = ((fragment.size_payload as usize) * 95) / 100;
     let compressor = 8 /* OodleLZ_Compressor_Kraken */;
-    let level = compression_level();
+    let level = oodle_compression_level();
 
     let mut scratch_buffer = compress_scratch_buffer();
 
@@ -916,17 +1150,34 @@ fn compress_lz4_impl(
 
 static ZSTD_COMPRESSION_LEVEL: OnceLock<std::ffi::c_int> = OnceLock::new();
 
+/// The zstd level, fixed by whichever of the first payload compressed and
+/// [`set_compression_level`] reaches it first.
 fn zstd_compression_level() -> std::ffi::c_int {
-    *ZSTD_COMPRESSION_LEVEL.get_or_init(|| {
-        if let Ok(level) = std::env::var("LORE_COMPRESSION_LEVEL")
-            && let Ok(level) = level.parse::<std::ffi::c_int>()
-            && (1..=22).contains(&level)
-        {
-            level
-        } else {
-            6
-        }
-    })
+    *ZSTD_COMPRESSION_LEVEL.get_or_init(|| zstd_level(None))
+}
+
+/// The name zstd gives a return code.
+fn zstd_error_name(code: usize) -> std::borrow::Cow<'static, str> {
+    // Safety: ZSTD_getErrorName returns a static nul-terminated string for any code.
+    unsafe { std::ffi::CStr::from_ptr(zstd_sys::ZSTD_getErrorName(code)) }.to_string_lossy()
+}
+
+/// What a failed zstd compression reports. The cause goes to the log, where it is
+/// stated once, rather than into the error, which every caller discards.
+const ZSTD_COMPRESS_FAILED: &str = "zstd compression failed";
+
+/// The error a failed zstd compression maps to, reported the first time one occurs.
+///
+/// Distinct from [`InefficientCompression`], which states that the content would not
+/// shrink: a context sized by [`zstd_compress_workspace_size`] cannot run out of
+/// workspace, so a failure here is a broken invariant and not a property of the
+/// content. The caller stores the fragment uncompressed either way, and discards
+/// this error, so the report is the only trace such a failure leaves. Reported once
+/// because its cause persists for every fragment that follows.
+fn zstd_compress_failure(reason: &str) -> CompressFragmentError {
+    static REPORTED: Once = Once::new();
+    REPORTED.call_once(|| lore_base::lore_warn!("zstd compression failed: {reason}"));
+    CompressFragmentError::internal(ZSTD_COMPRESS_FAILED)
 }
 
 fn compress_zstd_impl(
@@ -938,17 +1189,15 @@ fn compress_zstd_impl(
     let compressed_size_threshold = ((fragment.size_payload as usize) * 95) / 100;
 
     let ctx = zstd_compress_ctx();
-    if ctx.0.is_null() {
-        return Err(CompressFragmentError::internal(
-            "failed to allocate zstd context",
-        ));
+    if ctx.context.is_null() {
+        return Err(zstd_compress_failure("no context"));
     }
-    // Safety: ctx.0 is a valid non-null ZSTD_CCtx. Buffer capacity was sized
+    // Safety: ctx.context is a valid non-null ZSTD_CCtx. Buffer capacity was sized
     // by the caller via compress_bound(). Input payload length is validated
     // against size_payload at function entry.
     let compressed_size = unsafe {
         zstd_sys::ZSTD_compressCCtx(
-            ctx.0,
+            ctx.context,
             compressed_buffer.as_mut_ptr().cast::<std::ffi::c_void>(),
             compressed_buffer.capacity(),
             payload.as_ptr().cast::<std::ffi::c_void>(),
@@ -959,9 +1208,11 @@ fn compress_zstd_impl(
     zstd_compress_ctx_done(ctx);
 
     // Safety: Pure query on the return value, no pointer dereference.
-    if unsafe { zstd_sys::ZSTD_isError(compressed_size) } == 0
-        && compressed_size < compressed_size_threshold
-    {
+    if unsafe { zstd_sys::ZSTD_isError(compressed_size) } != 0 {
+        return Err(zstd_compress_failure(&zstd_error_name(compressed_size)));
+    }
+
+    if compressed_size < compressed_size_threshold {
         // Safety: ZSTD_compressCCtx succeeded, compressed_size bytes were written.
         unsafe {
             compressed_buffer.set_len(compressed_size);
@@ -976,5 +1227,541 @@ fn compress_zstd_impl(
         ))
     } else {
         Err(InefficientCompression.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use lore_base::types::FRAGMENT_SIZE_EXPECTED;
+
+    use super::*;
+
+    /// Compressible bytes, with enough structure that zstd beats the 5% threshold
+    /// at every size below and a shape that does not depend on the length.
+    fn payload(length: usize) -> Vec<u8> {
+        (0..length)
+            .map(|index| {
+                let word = index / 37;
+                ((word * 31 + index % 37) % 251) as u8
+            })
+            .collect()
+    }
+
+    fn raw_fragment(length: usize) -> Fragment {
+        Fragment {
+            flags: 0,
+            size_payload: length as u32,
+            size_content: length as u64,
+        }
+    }
+
+    /// Bytes with no repetition for a window to find and a flat distribution for the
+    /// entropy coder, so there is nothing for any encoder to save. splitmix64 over a
+    /// counter.
+    fn incompressible_payload(length: usize) -> Vec<u8> {
+        (0..length)
+            .map(|index| {
+                let mut value = (index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                (value ^ (value >> 31)) as u8
+            })
+            .collect()
+    }
+
+    /// Whether a payload of `length` bytes is too small for any encoder to save 5%
+    /// on, in which case refusing it is correct and there is nothing to round trip.
+    fn below_compressible_size(length: usize) -> bool {
+        length < 1024
+    }
+
+    /// Fragment lengths spanning the ranges zstd keys its compression parameters on,
+    /// both sides of every boundary in [`ZSTD_PARAMETER_TABLE_SIZES`] and both ends
+    /// of the permitted range.
+    const FRAGMENT_LENGTHS: &[usize] = &[
+        1,
+        17,
+        64,
+        FRAGMENT_COMPRESS_SIZE_LIMIT + 1,
+        1024,
+        4 * 1024,
+        16 * 1024 - 1,
+        16 * 1024,
+        16 * 1024 + 1,
+        32 * 1024,
+        FRAGMENT_SIZE_EXPECTED,
+        100 * 1024,
+        128 * 1024 - 1,
+        128 * 1024,
+        128 * 1024 + 1,
+        FRAGMENT_SIZE_THRESHOLD - 1,
+        FRAGMENT_SIZE_THRESHOLD,
+    ];
+
+    /// Every fragment size has to survive the round trip through the pooled context
+    /// that [`compress`] uses.
+    #[test]
+    fn zstd_round_trips_every_fragment_size() {
+        for &length in FRAGMENT_LENGTHS {
+            let source = payload(length);
+            let Ok((compressed_fragment, compressed)) = compress_zstd_impl(
+                raw_fragment(length),
+                source.as_slice(),
+                BytesMut::with_capacity(compress_bound(length, CompressionMode::Zstd)),
+            ) else {
+                assert!(
+                    below_compressible_size(length),
+                    "{length} bytes should have compressed"
+                );
+                continue;
+            };
+
+            assert_eq!(compressed_fragment.size_content, length as u64);
+            assert!(
+                (compressed_fragment.flags & FragmentFlags::PayloadCompressedZstd) != 0,
+                "{length} bytes was not marked as zstd"
+            );
+            assert_eq!(compressed.len(), compressed_fragment.size_payload as usize);
+
+            let (_, decompressed) = decompress(compressed_fragment, compressed.as_ref())
+                .unwrap_or_else(|err| panic!("{length} bytes failed to decompress: {err:?}"));
+            assert_eq!(
+                decompressed.as_ref(),
+                source.as_slice(),
+                "{length} bytes did not round trip"
+            );
+        }
+    }
+
+    /// Decompression is handed `Fragment::size_content` and an output buffer, and
+    /// must fill it from a context that cannot allocate either.
+    #[test]
+    fn zstd_decompresses_from_the_fragment_header_alone() {
+        let length = FRAGMENT_SIZE_EXPECTED;
+        let source = payload(length);
+        let (compressed_fragment, compressed) = compress_zstd_impl(
+            raw_fragment(length),
+            source.as_slice(),
+            BytesMut::with_capacity(compress_bound(length, CompressionMode::Zstd)),
+        )
+        .expect("compresses");
+
+        let mut into = vec![0u8; length];
+        decompress_into_slice(
+            compressed_fragment,
+            compressed.as_ref(),
+            into.as_mut_slice(),
+        )
+        .expect("decompresses");
+        assert_eq!(into, source);
+    }
+
+    /// Fragment sizes fine enough to find every size at which zstd changes its
+    /// compression parameters: a stride below the smallest interval between changes,
+    /// and each power of two with its neighbours, which is where they fall.
+    fn fragment_size_scan() -> Vec<usize> {
+        let mut sizes: Vec<usize> = (0..=18)
+            .flat_map(|power: u32| {
+                let size = 1usize << power;
+                [size - 1, size, size + 1]
+            })
+            .filter(|size| (1..=FRAGMENT_SIZE_THRESHOLD).contains(size))
+            .collect();
+
+        let mut size = 1;
+        while size <= FRAGMENT_SIZE_THRESHOLD {
+            sizes.push(size);
+            size += 64;
+        }
+        sizes.push(FRAGMENT_SIZE_THRESHOLD);
+        sizes
+    }
+
+    /// The bound has to be the largest requirement across every fragment size, not
+    /// only across [`ZSTD_PARAMETER_TABLE_SIZES`]. Those are the boundaries of zstd's
+    /// internal parameter tables, which no header states, so a release that moves them
+    /// has to fail here rather than in a silent loss of compression.
+    #[test]
+    fn the_workspace_bound_is_the_largest_over_every_fragment_size() {
+        let scan = fragment_size_scan();
+        for level in 1..=22 {
+            let (worst, at) = scan
+                .iter()
+                .map(|&size| (zstd_compress_workspace_size_at(level, size), size))
+                .max()
+                .expect("the scan is not empty");
+
+            assert_eq!(
+                zstd_compress_workspace_size_for(level),
+                worst,
+                "level {level}: {at} bytes needs {worst}, which no size in \
+                 ZSTD_PARAMETER_TABLE_SIZES accounts for"
+            );
+        }
+    }
+
+    /// The workspace has to hold a context and compress every fragment size at every
+    /// level the configuration accepts, not only the default: zstd selects its
+    /// parameters from one of several tables keyed on the size of the input, so a
+    /// smaller fragment can demand more workspace than a larger one, and an
+    /// undersized workspace fails the compression rather than growing.
+    #[test]
+    fn the_workspace_estimate_holds_at_every_level() {
+        for level in 1..=22 {
+            let bytes = zstd_compress_workspace_size_for(level);
+            let mut workspace = zstd_workspace(bytes).expect("allocates a workspace");
+            // Safety: the buffer is the estimated size and `u64`-aligned.
+            let context = unsafe {
+                zstd_sys::ZSTD_initStaticCCtx(
+                    workspace.as_mut_ptr().cast::<std::ffi::c_void>(),
+                    workspace.capacity() * size_of::<u64>(),
+                )
+            };
+            assert!(
+                !context.is_null(),
+                "level {level}: {bytes} bytes did not hold a context"
+            );
+
+            for &length in FRAGMENT_LENGTHS {
+                let source = payload(length);
+                let mut destination = vec![0u8; compress_bound(length, CompressionMode::Zstd)];
+                // Safety: the context is non-null, the destination holds the bound
+                // for `length` bytes, and the source is `length` bytes long.
+                let compressed_size = unsafe {
+                    zstd_sys::ZSTD_compressCCtx(
+                        context,
+                        destination.as_mut_ptr().cast::<std::ffi::c_void>(),
+                        destination.len(),
+                        source.as_ptr().cast::<std::ffi::c_void>(),
+                        length,
+                        level,
+                    )
+                };
+                // Safety: Pure query on the return value, no pointer dereference.
+                assert!(
+                    unsafe { zstd_sys::ZSTD_isError(compressed_size) } == 0,
+                    "level {level}, {length} bytes: {} in {bytes} bytes of workspace",
+                    zstd_error_name(compressed_size)
+                );
+            }
+        }
+    }
+
+    /// The decompression estimate has to hold a context. Unlike compression its size
+    /// depends on neither the input nor the level.
+    #[test]
+    fn the_decompress_workspace_estimate_builds_a_context() {
+        // Safety: a pure calculation with no arguments.
+        let bytes = unsafe { zstd_sys::ZSTD_estimateDCtxSize() };
+        let mut workspace = zstd_workspace(bytes).expect("allocates a workspace");
+        // Safety: the buffer is the estimated size and `u64`-aligned.
+        let context = unsafe {
+            zstd_sys::ZSTD_initStaticDCtx(
+                workspace.as_mut_ptr().cast::<std::ffi::c_void>(),
+                workspace.capacity() * size_of::<u64>(),
+            )
+        };
+        assert!(
+            !context.is_null(),
+            "{bytes} bytes did not hold a decompression context"
+        );
+    }
+
+    /// The pool stops claiming slots at its limit, which is what keeps resident
+    /// workspace bounded independently of the core count.
+    #[test]
+    fn the_pool_claims_at_most_its_limit() {
+        let count = AtomicUsize::new(0);
+        let claimed = (0..ZSTD_CTX_POOL_LIMIT + 8)
+            .filter(|_| zstd_claim_pooled_slot(&count))
+            .count();
+
+        assert_eq!(claimed, ZSTD_CTX_POOL_LIMIT);
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::Relaxed),
+            ZSTD_CTX_POOL_LIMIT
+        );
+    }
+
+    /// A context built past the pool limit is a working context; only its fate on
+    /// release differs, and releasing it must not disturb the pool.
+    #[test]
+    fn contexts_past_the_pool_limit_are_usable() {
+        let contexts: Vec<ZstdDCtx> = (0..ZSTD_CTX_POOL_LIMIT + 4)
+            .map(|_| zstd_decompress_ctx())
+            .collect();
+
+        assert!(contexts.iter().all(|ctx| !ctx.context.is_null()));
+        assert!(
+            contexts.iter().filter(|ctx| !ctx.pooled).count() >= 4,
+            "the pool kept more contexts than its limit"
+        );
+
+        for ctx in contexts {
+            zstd_decompress_ctx_done(ctx);
+        }
+
+        let ctx = zstd_decompress_ctx();
+        assert!(
+            !ctx.context.is_null(),
+            "the pool did not survive releasing transient contexts"
+        );
+        zstd_decompress_ctx_done(ctx);
+    }
+
+    /// Content that would not shrink is refused as [`InefficientCompression`], not as
+    /// a zstd failure: the two are distinct so that a context too small for its input
+    /// cannot pass for content that does not compress.
+    #[test]
+    fn zstd_refuses_content_it_cannot_shrink() {
+        let length = 16 * 1024;
+        let source = incompressible_payload(length);
+
+        let result = compress_zstd_impl(
+            raw_fragment(length),
+            source.as_slice(),
+            BytesMut::with_capacity(compress_bound(length, CompressionMode::Zstd)),
+        );
+
+        assert!(
+            matches!(
+                result,
+                Err(CompressFragmentError::InefficientCompression(_))
+            ),
+            "incompressible content was not refused as inefficient"
+        );
+    }
+
+    /// A zstd failure is an internal error rather than [`InefficientCompression`], so
+    /// that a context too small for its input cannot pass for content that does not
+    /// compress and be stored uncompressed in silence.
+    #[test]
+    fn a_zstd_failure_is_not_inefficient_compression() {
+        let source = payload(4 * 1024);
+        let mut destination = [0u8; 8];
+        let ctx = zstd_compress_ctx();
+        assert!(!ctx.context.is_null());
+
+        // Safety: the context is non-null and both buffers are valid for the lengths
+        // given. The destination is deliberately too small to hold a frame.
+        let code = unsafe {
+            zstd_sys::ZSTD_compressCCtx(
+                ctx.context,
+                destination.as_mut_ptr().cast::<std::ffi::c_void>(),
+                destination.len(),
+                source.as_ptr().cast::<std::ffi::c_void>(),
+                source.len(),
+                zstd_compression_level(),
+            )
+        };
+        zstd_compress_ctx_done(ctx);
+
+        // Safety: Pure query on the return value, no pointer dereference.
+        assert!(unsafe { zstd_sys::ZSTD_isError(code) } != 0);
+        assert!(zstd_compress_failure(&zstd_error_name(code)).is_internal());
+    }
+
+    /// New Oodle compressed fragments are refused, so no new Oodle fragments
+    /// can be generated for a local store.
+    ///
+    /// Existing Oodle fragments can be read so they can be migrated off Oodle.
+    #[cfg(feature = "oodle")]
+    mod oodle_deprecation {
+        use super::*;
+
+        #[test]
+        fn compress_refuses_oodle() {
+            let length = FRAGMENT_SIZE_EXPECTED;
+            let source = payload(length);
+
+            let error = compress(
+                raw_fragment(length),
+                source.as_slice(),
+                CompressionMode::Oodle,
+            )
+            .expect_err("Oodle is refused");
+
+            let not_supported = error
+                .as_not_supported()
+                .unwrap_or_else(|| panic!("refused as {error:?}, not as unsupported"));
+            assert!(
+                not_supported
+                    .operation
+                    .contains("this mode is being deprecated"),
+                "refused for a reason other than the deprecation: {}",
+                not_supported.operation
+            );
+        }
+
+        // Until Local Immutable Stores are migrated off Oodle, storage
+        // should still be able to read Oodle
+        #[test]
+        fn decompress_can_read_an_oodle_fragment() {
+            let length = FRAGMENT_SIZE_EXPECTED;
+            let source = payload(length);
+
+            let (compressed_fragment, compressed) = compress_without_deprecation_checks(
+                raw_fragment(length),
+                source.as_slice(),
+                CompressionMode::Oodle,
+            )
+            .expect("Oodle compresses");
+            assert_ne!(
+                compressed_fragment.flags & FragmentFlags::PayloadCompressedOodle2,
+                0,
+                "fragment was not marked as Oodle"
+            );
+
+            let (decompressed_fragment, decompressed) =
+                decompress(compressed_fragment, compressed.as_ref()).expect("Oodle decompresses");
+
+            assert_eq!(decompressed.as_ref(), source.as_slice());
+            assert_eq!(decompressed_fragment.size_content, length as u64);
+            assert_eq!(
+                decompressed_fragment.flags & FragmentFlags::PayloadCompressed,
+                0,
+                "the decompressed fragment still carries a compression flag"
+            );
+        }
+    }
+
+    /// What a mode a server states it prefers does to the mode payloads are written under.
+    mod suggestions {
+        use super::*;
+
+        /// A selection standing where a suggestion arrives, as one made through the API does.
+        fn selected(mode: CompressionMode) -> AtomicU32 {
+            AtomicU32::new(mode as u32)
+        }
+
+        #[test]
+        fn a_suggestion_is_taken_where_no_mode_is_selected() {
+            let selection = selected(CompressionMode::NotSpecified);
+
+            assert!(apply_mode_suggestion(&selection, CompressionMode::Lz4));
+            assert_eq!(
+                selection.load(Ordering::Relaxed),
+                CompressionMode::Lz4 as u32
+            );
+        }
+
+        #[test]
+        fn a_suggestion_does_not_displace_a_selected_mode() {
+            let selection = selected(CompressionMode::NoCompression);
+
+            assert!(!apply_mode_suggestion(&selection, CompressionMode::Zstd));
+            assert_eq!(
+                selection.load(Ordering::Relaxed),
+                CompressionMode::NoCompression as u32
+            );
+        }
+
+        /// `NotSpecified` states no preference, so it is not a suggestion and leaves the selection
+        /// where it is rather than reporting itself as the mode now in force.
+        #[test]
+        fn no_preference_is_not_a_suggestion() {
+            let selection = selected(CompressionMode::NotSpecified);
+
+            assert!(!apply_mode_suggestion(
+                &selection,
+                CompressionMode::NotSpecified
+            ));
+            assert_eq!(
+                selection.load(Ordering::Relaxed),
+                CompressionMode::NotSpecified as u32
+            );
+        }
+
+        #[test]
+        fn only_the_first_suggestion_decides() {
+            let selection = selected(CompressionMode::NotSpecified);
+
+            assert!(apply_mode_suggestion(&selection, CompressionMode::Lz4));
+            assert!(!apply_mode_suggestion(&selection, CompressionMode::Zstd));
+            assert_eq!(
+                selection.load(Ordering::Relaxed),
+                CompressionMode::Lz4 as u32
+            );
+        }
+
+        #[test]
+        fn every_mode_a_payload_can_be_written_under_is_named() {
+            for (value, mode) in [
+                (0, CompressionMode::NotSpecified),
+                (1, CompressionMode::NoCompression),
+                (2, CompressionMode::Lz4),
+                (4, CompressionMode::Zstd),
+            ] {
+                assert_eq!(writable_compression_mode(value), Some(mode));
+            }
+        }
+
+        /// Oodle and any number no variant carries answer `None` alike, so neither a server nor a
+        /// caller can select a mode the first write would fail on.
+        #[test]
+        fn a_mode_no_payload_can_be_written_under_is_refused() {
+            assert_eq!(writable_compression_mode(3), None);
+            assert_eq!(writable_compression_mode(5), None);
+            assert_eq!(writable_compression_mode(u32::MAX), None);
+        }
+    }
+
+    /// What each source contributes to the level a codec ends up at, over zstd's range and
+    /// Oodle's, which is the narrower of the two.
+    mod levels {
+        use super::*;
+
+        #[test]
+        fn a_level_the_environment_names_outranks_a_selection() {
+            assert_eq!(
+                accepted_compression_level(Some(3), Some(19), 1..=22),
+                Some(3)
+            );
+        }
+
+        #[test]
+        fn a_selection_decides_where_the_environment_names_nothing() {
+            assert_eq!(accepted_compression_level(None, Some(19), 1..=22), Some(19));
+        }
+
+        #[test]
+        fn a_level_outside_the_range_is_not_taken_from_the_environment() {
+            assert_eq!(
+                accepted_compression_level(Some(99), Some(19), 1..=22),
+                Some(19)
+            );
+            assert_eq!(accepted_compression_level(Some(99), None, 1..=22), None);
+        }
+
+        #[test]
+        fn a_selection_outside_the_range_is_clamped_into_it() {
+            assert_eq!(accepted_compression_level(None, Some(99), 1..=22), Some(22));
+            assert_eq!(accepted_compression_level(None, Some(0), 1..=22), Some(1));
+            assert_eq!(accepted_compression_level(None, Some(19), 0..=9), Some(9));
+        }
+
+        #[test]
+        fn nothing_configured_leaves_the_codec_at_its_default() {
+            assert_eq!(accepted_compression_level(None, None, 1..=22), None);
+        }
+
+        #[test]
+        fn the_default_level_selects_none() {
+            assert_eq!(selected_level(DEFAULT_COMPRESSION_LEVEL), None);
+        }
+
+        /// A level below every codec's range is a level, not the absence of one: it selects, and
+        /// each codec clamps it to the lowest that codec accepts.
+        #[test]
+        fn a_level_below_every_range_still_selects() {
+            let selected = selected_level(-5);
+
+            assert_eq!(selected, Some(-5));
+            assert_eq!(
+                accepted_compression_level(None, selected, ZSTD_LEVELS),
+                Some(1)
+            );
+            assert_eq!(accepted_compression_level(None, selected, 0..=9), Some(0));
+        }
     }
 }

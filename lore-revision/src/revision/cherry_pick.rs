@@ -23,6 +23,7 @@ use crate::lore::BranchId;
 use crate::lore::Hash;
 use crate::lore::RepositoryId;
 use crate::lore_info;
+use crate::metadata::MetadataInherit;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::revision;
@@ -133,9 +134,12 @@ pub struct CherryPickOptions {
     pub message: String,
     /// Disable auto commits, even if no conflicts arise.
     pub no_commit: bool,
+    /// Which of the picked revision's metadata keys to carry onto the revision
+    /// this creates. Carries nothing unless the caller names keys.
+    pub inherit_metadata: MetadataInherit,
 }
 
-pub async fn cherry_pick(
+pub(crate) async fn cherry_pick(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     revision: Hash,
@@ -211,6 +215,7 @@ pub async fn cherry_pick(
         MergeType::CherryPick,
         false,
         current_branch,
+        &options.inherit_metadata,
     )
     .await?;
 
@@ -250,10 +255,9 @@ pub async fn cherry_pick(
             link: None,
             layer_messages: std::collections::HashMap::new(),
             layer: None,
-            stats: false,
         };
 
-        Box::pin(commit::commit(repository.clone(), token, commit_options))
+        commit::commit_boxed(repository.clone(), token, commit_options)
             .await
             .forward::<MergeError>("committing cherry-pick")?
     } else {
@@ -263,11 +267,30 @@ pub async fn cherry_pick(
     Ok(signature)
 }
 
-pub async fn cherry_pick_abort(repository: Arc<RepositoryContext>) -> Result<(), MergeError> {
+/// Boxed version of [`cherry_pick`] for cross-crate use.
+pub fn cherry_pick_boxed(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    revision: Hash,
+    options: CherryPickOptions,
+) -> crate::BoxFuture<'_, Result<Hash, MergeError>> {
+    Box::pin(cherry_pick(repository, token, revision, options))
+}
+
+pub(crate) async fn cherry_pick_abort(
+    repository: Arc<RepositoryContext>,
+) -> Result<(), MergeError> {
     merge_abort(repository, MergeType::CherryPick).await
 }
 
-pub async fn cherry_pick_restart(
+/// Boxed version of [`cherry_pick_abort`] for cross-crate use.
+pub fn cherry_pick_abort_boxed(
+    repository: Arc<RepositoryContext>,
+) -> crate::BoxFuture<'static, Result<(), MergeError>> {
+    Box::pin(cherry_pick_abort(repository))
+}
+
+pub(crate) async fn cherry_pick_restart(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     paths: LoreArray<LoreString>,
@@ -317,7 +340,16 @@ pub async fn cherry_pick_restart(
     .await
 }
 
-pub async fn cherry_pick_unresolve(
+/// Boxed version of [`cherry_pick_restart`] for cross-crate use.
+pub fn cherry_pick_restart_boxed(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    paths: LoreArray<LoreString>,
+) -> crate::BoxFuture<'_, Result<(), MergeError>> {
+    Box::pin(cherry_pick_restart(repository, token, paths))
+}
+
+pub(crate) async fn cherry_pick_unresolve(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     paths: LoreArray<LoreString>,
@@ -325,7 +357,16 @@ pub async fn cherry_pick_unresolve(
     branch::merge::merge_unresolve(repository, token, paths, MergeType::CherryPick).await
 }
 
-pub async fn cherry_pick_resolve(
+/// Boxed version of [`cherry_pick_unresolve`] for cross-crate use.
+pub fn cherry_pick_unresolve_boxed(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    paths: LoreArray<LoreString>,
+) -> crate::BoxFuture<'_, Result<(), MergeError>> {
+    Box::pin(cherry_pick_unresolve(repository, token, paths))
+}
+
+pub(crate) async fn cherry_pick_resolve(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     paths: LoreArray<LoreString>,
@@ -333,25 +374,16 @@ pub async fn cherry_pick_resolve(
     branch::merge::merge_resolve(repository, token, paths, MergeType::CherryPick).await
 }
 
-pub async fn cherry_pick_resolve_mine(
+/// Boxed version of [`cherry_pick_resolve`] for cross-crate use.
+pub fn cherry_pick_resolve_boxed(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     paths: LoreArray<LoreString>,
-) -> Result<(), StageError> {
-    validate_merge_type(repository.clone(), None, MergeType::CherryPick)
-        .await
-        .forward::<StageError>("Failed to deserialize revision state")?;
-
-    Box::pin(stage::stage_from_parent_revision(
-        repository,
-        token,
-        paths,
-        stage::MergeParent::Mine,
-    ))
-    .await
+) -> crate::BoxFuture<'_, Result<(), MergeError>> {
+    Box::pin(cherry_pick_resolve(repository, token, paths))
 }
 
-pub async fn cherry_pick_resolve_theirs(
+pub(crate) async fn cherry_pick_resolve_mine(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     paths: LoreArray<LoreString>,
@@ -360,11 +392,36 @@ pub async fn cherry_pick_resolve_theirs(
         .await
         .forward::<StageError>("Failed to deserialize revision state")?;
 
-    Box::pin(stage::stage_from_parent_revision(
-        repository,
-        token,
-        paths,
-        stage::MergeParent::CherryPick,
-    ))
-    .await
+    stage::stage_from_parent_revision(repository, token, paths, stage::MergeParent::Mine).await
+}
+
+/// Boxed version of [`cherry_pick_resolve_mine`] for cross-crate use.
+pub fn cherry_pick_resolve_mine_boxed(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    paths: LoreArray<LoreString>,
+) -> crate::BoxFuture<'_, Result<(), StageError>> {
+    Box::pin(cherry_pick_resolve_mine(repository, token, paths))
+}
+
+pub(crate) async fn cherry_pick_resolve_theirs(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    paths: LoreArray<LoreString>,
+) -> Result<(), StageError> {
+    validate_merge_type(repository.clone(), None, MergeType::CherryPick)
+        .await
+        .forward::<StageError>("Failed to deserialize revision state")?;
+
+    stage::stage_from_parent_revision(repository, token, paths, stage::MergeParent::CherryPick)
+        .await
+}
+
+/// Boxed version of [`cherry_pick_resolve_theirs`] for cross-crate use.
+pub fn cherry_pick_resolve_theirs_boxed(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    paths: LoreArray<LoreString>,
+) -> crate::BoxFuture<'_, Result<(), StageError>> {
+    Box::pin(cherry_pick_resolve_theirs(repository, token, paths))
 }

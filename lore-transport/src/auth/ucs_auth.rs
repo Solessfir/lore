@@ -14,16 +14,53 @@ use lore_proto::auth::urc_auth_api_client::UrcAuthApiClient;
 use crate::error::ProtocolError;
 use crate::grpc::CorrelationInterceptor;
 use crate::traits::Authentication;
+use crate::traits::UserService;
 use crate::types::*;
 
-/// Strips the custom scheme from an auth URL and returns an HTTPS URL
-/// suitable for gRPC connection.
+/// The auth URL schemes [`UcsAuthentication`] is registered under, for
+/// authentication and the user service alike. `https` is the transition
+/// fallback. `http` serves local test auth services; The implementation only
+/// honours plaintext for loopback hosts and upgrades any other http URL to
+/// https (see [`grpc_endpoint`]).
+pub const SCHEMES: [&str; 3] = ["ucs-auth", "https", "http"];
+
+/// Whether `auth_url` is a plain-http URL naming a loopback host. Does
+/// not accept username and password in URL, but just accepts plain
+/// localhost. This is to prevent bypassing through urls like
+/// `http://localhost:pass@evil.com`.
+fn is_loopback_http_url(auth_url: &str) -> bool {
+    let Ok(url) = url::Url::parse(auth_url) else {
+        return false;
+    };
+    if url.scheme() != "http" || !url.username().is_empty() || url.password().is_some() {
+        return false;
+    }
+    match url.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
+}
+
+/// Strips the custom scheme from an auth URL and returns a URL suitable for
+/// gRPC connection.
 ///
 /// `ucs-auth://auth.example.com` -> `https://auth.example.com`
 /// `https://auth.example.com` -> `https://auth.example.com` (unchanged)
+/// `http://127.0.0.1:41339` -> `http://127.0.0.1:41339` (unchanged)
+/// `http://auth.example.com` -> `https://auth.example.com` (upgraded)
+///
+/// Plaintext `http` is honoured only for loopback hosts, where the traffic
+/// never leaves the machine — this lets a local test auth service run
+/// without a certificate. For any other host the scheme is upgraded to
+/// `https`: the auth URL arrives in the *remote server's* advertised
+/// environment config, so allowing http to an arbitrary host would let a rogue
+/// server downgrade the channel that carries login and exchange tokens.
 fn grpc_endpoint(auth_url: &str) -> String {
     match auth_url.split_once("://") {
         Some(("https", _)) => auth_url.to_string(),
+        Some(("http", _)) if is_loopback_http_url(auth_url) => auth_url.to_string(),
         Some((_, rest)) => format!("https://{rest}"),
         None => format!("https://{auth_url}"),
     }
@@ -69,10 +106,10 @@ fn set_auth_header<T>(request: &mut tonic::Request<T>, token: &str) -> Result<()
     Ok(())
 }
 
-/// Authentication implementation using UCS Auth API gRPC service.
+/// Authentication and user service over the UCS Auth API gRPC service.
 ///
-/// Registered under the `ucs-auth` scheme (and `https` during transition).
-/// All `lore_proto::auth` imports are confined to this module.
+/// Registered under [`SCHEMES`] in both registries. All `lore_proto::auth`
+/// imports are confined to this module.
 ///
 /// The `correlation_id` parameter on trait methods is not used directly --
 /// correlation IDs are injected into gRPC requests by `CorrelationInterceptor`,
@@ -230,16 +267,19 @@ impl Authentication for UcsAuthentication {
             acceptable_root_domains: Vec::new(),
         })
     }
+}
 
+#[async_trait]
+impl UserService for UcsAuthentication {
     async fn get_user_info(
         &self,
-        auth_url: &str,
+        user_url: &str,
         authz_token: &str,
         repository: RepositoryId,
         user_ids: &[String],
         _correlation_id: &str,
     ) -> Result<Vec<ResolvedUser>, ProtocolError> {
-        let mut client = connect_client(auth_url).await?;
+        let mut client = connect_client(user_url).await?;
 
         let mut request = tonic::Request::new(GetUserInfoRequest {
             resource_id: resource_id(repository),
@@ -265,13 +305,13 @@ impl Authentication for UcsAuthentication {
 
     async fn get_user_id(
         &self,
-        auth_url: &str,
+        user_url: &str,
         authz_token: &str,
         repository: RepositoryId,
         display_name: &str,
         _correlation_id: &str,
     ) -> Result<Option<ResolvedUser>, ProtocolError> {
-        let mut client = connect_client(auth_url).await?;
+        let mut client = connect_client(user_url).await?;
 
         let mut request = tonic::Request::new(GetUserIdRequest {
             resource_id: resource_id(repository),
@@ -308,6 +348,62 @@ mod tests {
         assert_eq!(
             grpc_endpoint("https://auth.example.com"),
             "https://auth.example.com"
+        );
+    }
+
+    #[test]
+    fn grpc_endpoint_http_to_loopback_is_preserved() {
+        assert_eq!(
+            grpc_endpoint("http://127.0.0.1:41339"),
+            "http://127.0.0.1:41339"
+        );
+        assert_eq!(
+            grpc_endpoint("http://localhost:41339"),
+            "http://localhost:41339"
+        );
+        // A parsed loopback IP literal counts, IPv6 included.
+        assert_eq!(grpc_endpoint("http://[::1]:41339"), "http://[::1]:41339");
+    }
+
+    /// The downgrade defence: a rogue server advertising a plaintext variant
+    /// of a real auth host must not steer login and exchange tokens onto an
+    /// unencrypted channel. Any non-loopback http URL is upgraded to https.
+    #[test]
+    fn grpc_endpoint_http_to_remote_host_is_upgraded() {
+        assert_eq!(
+            grpc_endpoint("http://auth.example.com"),
+            "https://auth.example.com"
+        );
+        assert_eq!(
+            grpc_endpoint("http://auth.example.com:8080/path"),
+            "https://auth.example.com:8080/path"
+        );
+        // A crafted host that merely starts with a local name is not local.
+        assert_eq!(
+            grpc_endpoint("http://localhost.evil.example"),
+            "https://localhost.evil.example"
+        );
+    }
+
+    /// Userinfo in the authority is the classic trick against hand-rolled
+    /// host extraction: the URL's host below is `auth.example.com`, and a
+    /// splitter taking the first `:`/`/` segment reads `localhost`. Such a
+    /// URL must never keep plaintext — and any URL carrying userinfo is
+    /// refused the loopback exemption outright.
+    #[test]
+    fn grpc_endpoint_userinfo_cannot_spoof_loopback() {
+        assert_eq!(
+            grpc_endpoint("http://localhost:password@auth.example.com"),
+            "https://localhost:password@auth.example.com"
+        );
+        assert_eq!(
+            grpc_endpoint("http://localhost@auth.example.com"),
+            "https://localhost@auth.example.com"
+        );
+        // Even a genuine loopback host gets no plaintext with userinfo present.
+        assert_eq!(
+            grpc_endpoint("http://user:password@127.0.0.1:41339"),
+            "https://user:password@127.0.0.1:41339"
         );
     }
 

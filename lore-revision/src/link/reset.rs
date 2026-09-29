@@ -5,26 +5,28 @@ use std::sync::Arc;
 use lore_error_set::prelude::*;
 
 use super::LinkError;
-use crate::error::LoreResultExt;
+use crate::fs::filesystem_provider::InstanceOperation;
+use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::link;
 use crate::link::LinkFlags;
 use crate::lore::Hash;
 use crate::node::Node;
 use crate::node::NodeBlock;
-use crate::node::NodeID;
-use crate::repository::RepositoryContext;
+use crate::state::NodeMapping;
 use crate::state::State;
 use crate::util;
-use crate::util::path::RelativePath;
 
 pub(crate) async fn reset_staged_add_link(
-    repository: Arc<RepositoryContext>,
+    at: NodeMapping,
     state_current: Arc<State>,
-    state_staged: Arc<State>,
-    link_node_id: NodeID,
     staged_link_node: Node,
-    link_path: RelativePath,
 ) -> Result<(), LinkError> {
+    let NodeMapping {
+        repository,
+        state: state_staged,
+        path: link_path,
+        node: link_node_id,
+    } = at;
     let link_id = staged_link_node.linked_node().repository;
     let absolute_path = link_path.to_absolute_path(repository.require_path()?);
 
@@ -51,9 +53,7 @@ pub(crate) async fn reset_staged_add_link(
 
     util::fs::unlink_recursive(absolute_path.as_path())
         .await
-        .emit_map_err(LinkError::internal(
-            "Failed to remove realized link directory",
-        ))?;
+        .internal("removing the realized link directory")?;
 
     if let Some(committed_node_id) = committed_directory_node {
         // Restore the committed directory: recreate the empty placeholder on
@@ -62,9 +62,7 @@ pub(crate) async fn reset_staged_add_link(
         lore_io::IoDriver::global()
             .create_dir_all(absolute_path.as_path())
             .await
-            .emit_map_err(LinkError::internal(
-                "Failed to recreate placeholder directory",
-            ))?;
+            .internal("recreating the placeholder directory")?;
 
         let block_index = NodeBlock::index(committed_node_id);
         let node_index = Node::index(committed_node_id);
@@ -104,20 +102,46 @@ pub(crate) async fn reset_staged_add_link(
     Ok(())
 }
 
+/// Restores the link registry entry a staged removal dropped and re-realizes the pinned content
+/// at the mount.
+///
+/// Realizes through `operation`, the caller's: a filesystem holds one operation at a time and
+/// unstaging opens one for the whole walk.
 pub(crate) async fn reset_staged_remove_link(
-    repository: Arc<RepositoryContext>,
+    operation: &Arc<InstanceOperationImpl>,
+    at: NodeMapping,
     state_current: Arc<State>,
-    state_staged: Arc<State>,
-    link_node_id: NodeID,
     current_link_node: Node,
-    link_path: RelativePath,
 ) -> Result<(), LinkError> {
+    let NodeMapping {
+        repository,
+        state: state_staged,
+        path: link_path,
+        node: link_node_id,
+    } = at;
     let link_id = current_link_node.linked_node().repository;
 
     let current_link_ref = state_current
         .link_find(repository.clone(), link_id, link_node_id)
         .await
         .forward::<LinkError>("Failed to find link registry entry")?;
+
+    let linked_repository = repository.to_link_context(link_id).await;
+
+    // A mount added while this removal was staged can overlap the one being
+    // restored.
+    let source_path = link::pinned_source_path(linked_repository.clone(), &current_link_node)
+        .await
+        .forward::<LinkError>("Failed resolving link source path")?;
+    link::check_source_path_overlap(
+        &state_staged,
+        repository.clone(),
+        linked_repository.clone(),
+        source_path,
+        link_node_id,
+    )
+    .await
+    .forward::<LinkError>("Failed checking link source paths")?;
 
     state_staged
         .link_add(
@@ -131,14 +155,13 @@ pub(crate) async fn reset_staged_remove_link(
         .await
         .forward::<LinkError>("Failed to restore link registry entry")?;
 
-    let absolute_path = link_path.to_absolute_path(repository.require_path()?);
-    lore_io::IoDriver::global()
-        .create_dir_all(absolute_path.as_path())
+    operation
+        .create_dir_all(&link_path)
         .await
-        .emit_map_err(LinkError::internal("Failed to recreate link directory"))?;
+        .forward::<LinkError>("Failed to recreate the link directory")?;
 
-    let linked_repository = Arc::new(repository.to_link_context(link_id).await);
-    link::realize_link_pin_change(
+    link::realize_link_pin_change_in_operation(
+        operation,
         repository.clone(),
         linked_repository,
         link_path,
@@ -151,15 +174,23 @@ pub(crate) async fn reset_staged_remove_link(
     Ok(())
 }
 
+/// Puts a link whose pin move was staged back to the pin the current revision holds, on disk and
+/// in the registry.
+///
+/// Realizes through the caller's `operation`, as [`reset_staged_remove_link`] does.
 pub(crate) async fn reset_staged_update_link(
-    repository: Arc<RepositoryContext>,
+    operation: &Arc<InstanceOperationImpl>,
+    at: NodeMapping,
     state_current: Arc<State>,
-    state_staged: Arc<State>,
-    link_node_id: NodeID,
     staged_link_node: Node,
     current_link_node: Node,
-    link_path: RelativePath,
 ) -> Result<(), LinkError> {
+    let NodeMapping {
+        repository,
+        state: state_staged,
+        path: link_path,
+        node: link_node_id,
+    } = at;
     let link_id = current_link_node.linked_node().repository;
     let staged_pin = staged_link_node.address.hash;
     let current_pin = current_link_node.address.hash;
@@ -169,8 +200,9 @@ pub(crate) async fn reset_staged_update_link(
         .await
         .forward::<LinkError>("Failed to find link registry entry")?;
 
-    let linked_repository = Arc::new(repository.to_link_context(link_id).await);
-    link::realize_link_pin_change(
+    let linked_repository = repository.to_link_context(link_id).await;
+    link::realize_link_pin_change_in_operation(
+        operation,
         repository.clone(),
         linked_repository,
         link_path,

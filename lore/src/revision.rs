@@ -857,7 +857,8 @@ async fn sync_local(
 
 /// Arguments for bisecting the revision range between two revisions.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, LoreArgs)]
+#[handler(bisect_local)]
 pub struct LoreRevisionBisectArgs {
     /// Starting (known-good) revision of the bisect range
     pub start: LoreString,
@@ -865,14 +866,52 @@ pub struct LoreRevisionBisectArgs {
     pub end: LoreString,
 }
 
-/// Bisects the revision range between two revisions. Blocks on the runtime, so it is called from
-/// outside it.
-pub fn bisect(
+/// Takes one step of a bisect between two revisions, syncing the working tree to the revision
+/// halfway between them.
+///
+/// # Events
+///
+/// ## Standard Events
+///
+/// These events are emitted by all interface functions:
+///
+/// | Event | Description |
+/// |-------|-------------|
+/// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
+/// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
+///
+/// ## Bisect Events
+///
+/// | Event | Description |
+/// |-------|-------------|
+/// | [`LoreEvent::RevisionBisect`](crate::interface::LoreEvent::RevisionBisect) | Emitted once the working tree is synced to the selected revision, with the revision numbers of the range and whether the search is done |
+///
+/// ## Sync Events
+///
+/// | Event | Description |
+/// |-------|-------------|
+/// | [`LoreEvent::RevisionSyncTarget`](crate::interface::LoreEvent::RevisionSyncTarget) | Emitted once after resolving the selected revision |
+/// | [`LoreEvent::RevisionSyncFile`](crate::interface::LoreEvent::RevisionSyncFile) | Emitted for each file deleted, modified, added, or merged during sync |
+/// | [`LoreEvent::RevisionSyncProgress`](crate::interface::LoreEvent::RevisionSyncProgress) | Emitted periodically during file realization and once at completion |
+/// | [`LoreEvent::RevisionSyncRevision`](crate::interface::LoreEvent::RevisionSyncRevision) | Emitted once at the end with the resulting revision |
+/// | [`LoreEvent::RevisionResolve`](crate::interface::LoreEvent::RevisionResolve) | Emitted when resolving a revision |
+/// | [`LoreEvent::FilterExclude`](crate::interface::LoreEvent::FilterExclude) | Emitted for each path excluded by view or ignore filters |
+pub async fn bisect(
     globals: LoreGlobalArgs,
     args: LoreRevisionBisectArgs,
     callback: LoreEventCallback,
 ) -> i32 {
-    crate::runtime().block_on(repository_call_write(
+    dispatch_call(globals, args, callback, bisect_local).await
+}
+
+async fn bisect_local(
+    globals: LoreGlobalArgs,
+    args: LoreRevisionBisectArgs,
+    callback: LoreEventCallback,
+) -> i32 {
+    repository_call_write(
         globals,
         callback,
         args,
@@ -884,7 +923,8 @@ pub fn bisect(
             };
             bisect::bisect_boxed(repository, &token, options).await
         },
-    ))
+    )
+    .await
 }
 
 /// Arguments for finding revisions by metadata or revision number.
@@ -1052,7 +1092,8 @@ async fn diff_impl(
 pub struct LoreRevisionCherryPickArgs {
     /// Revision to cherry pick
     pub revision: LoreString,
-    /// Message to use for an auto-commit if no conflicts arise
+    /// Message to use for an auto-commit if no conflicts arise; empty uses the
+    /// picked revision's message
     pub message: LoreString,
     /// Disable auto-commit even if no conflicts arise
     pub no_commit: u8,
@@ -1063,6 +1104,42 @@ pub struct LoreRevisionCherryPickArgs {
     pub inherit_metadata: LoreArray<LoreString>,
 }
 
+/// Cherry-picks a revision onto the current branch, applying its changes to the working directory.
+///
+/// # Events
+///
+/// ## Standard Events
+///
+/// These events are emitted by all interface functions:
+///
+/// | Event | Description |
+/// |-------|-------------|
+/// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
+/// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
+///
+/// ## Cherry-Pick Events
+///
+/// | Event | Description |
+/// |-------|-------------|
+/// | [`LoreEvent::CherryPickStartBegin`](crate::interface::LoreEvent::CherryPickStartBegin) | Emitted when cherry-pick begins, includes picked revision info |
+/// | [`LoreEvent::CherryPickStartEnd`](crate::interface::LoreEvent::CherryPickStartEnd) | Emitted when cherry-pick completes, includes conflict flag |
+/// | [`LoreEvent::CherryPickConflictFile`](crate::interface::LoreEvent::CherryPickConflictFile) | Emitted for each file with an unresolved cherry-pick conflict |
+/// | [`LoreEvent::RevisionSyncProgress`](crate::interface::LoreEvent::RevisionSyncProgress) | Emitted during the `apply_diff` phase |
+/// | [`LoreEvent::RevisionSyncFile`](crate::interface::LoreEvent::RevisionSyncFile) | Emitted for each file modified during cherry-pick realization |
+/// | [`LoreEvent::FileStageFile`](crate::interface::LoreEvent::FileStageFile) | Emitted for each file staged for deletion during cherry-pick |
+///
+/// ## Commit Events (when `no_commit` is false and no conflicts arise)
+///
+/// | Event | Description |
+/// |-------|-------------|
+/// | [`LoreEvent::RevisionCommitBegin`](crate::interface::LoreEvent::RevisionCommitBegin) | Emitted when auto-commit starts |
+/// | [`LoreEvent::RevisionCommitProgress`](crate::interface::LoreEvent::RevisionCommitProgress) | Emitted during auto-commit |
+/// | [`LoreEvent::RevisionCommitEnd`](crate::interface::LoreEvent::RevisionCommitEnd) | Emitted when auto-commit completes |
+/// | [`LoreEvent::RevisionCommitRevision`](crate::interface::LoreEvent::RevisionCommitRevision) | Emitted with the committed cherry-pick revision |
+/// | [`LoreEvent::Metadata`](crate::interface::LoreEvent::Metadata) | Emitted for each metadata entry of the auto-commit |
+/// | [`LoreEvent::FragmentWrite`](crate::interface::LoreEvent::FragmentWrite) | Emitted for each fragment written during auto-commit |
 pub async fn cherry_pick(
     globals: LoreGlobalArgs,
     args: LoreRevisionCherryPickArgs,
@@ -1071,7 +1148,7 @@ pub async fn cherry_pick(
     dispatch_call(globals, args, callback, cherry_pick_local).await
 }
 
-pub async fn cherry_pick_local(
+async fn cherry_pick_local(
     globals: LoreGlobalArgs,
     args: LoreRevisionCherryPickArgs,
     callback: LoreEventCallback,

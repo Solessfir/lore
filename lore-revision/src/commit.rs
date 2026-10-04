@@ -340,6 +340,7 @@ struct CommitReportStats {
     pub file_read_count: AtomicU64,
 }
 
+#[lore_macro::test_pub]
 pub(crate) struct CommitStats {
     discovery: DiscoveryStats,
     complete: CommitCompleteStats,
@@ -351,6 +352,7 @@ pub(crate) struct CommitStats {
 
 impl CommitStats {
     /// Counters for one commit, keeping what the call's statistics level reports.
+    #[lore_macro::test_pub]
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             discovery: DiscoveryStats::default(),
@@ -363,6 +365,7 @@ impl CommitStats {
 
     /// One file was read off disk and fragmented. The byte total is what a
     /// progress event reports as transferred, so it is kept whatever the level.
+    #[lore_macro::test_pub]
     fn file_read(&self, content_size: u64) {
         if self.statistics {
             self.report.file_read_count.fetch_add(1, Ordering::Relaxed);
@@ -373,6 +376,7 @@ impl CommitStats {
     }
 
     /// The per-action file counts, as an event payload.
+    #[lore_macro::test_pub]
     fn file_stats(&self) -> LoreCommitFileStatsData {
         let added = self.report.add_count.load(Ordering::Relaxed);
         let modified = self.report.modify_count.load(Ordering::Relaxed);
@@ -397,6 +401,7 @@ impl CommitStats {
     ///
     /// A file with no staged action counts as modified: it is here because its
     /// content or mode changed under it.
+    #[lore_macro::test_pub]
     fn record_file_action(&self, flags: u16, content_size: u64) {
         if !self.statistics {
             return;
@@ -539,6 +544,7 @@ pub fn commit_boxed(
 ///
 /// The working tree is written to only where a commit resolves a staged merge conflict, which
 /// removes the copies that merge left beside the file.
+#[lore_macro::test_pub]
 pub(crate) async fn commit_with_metadata(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
@@ -604,6 +610,27 @@ async fn commit_with_metadata_in_operation(
         .await;
     }
 
+    commit_staged_with_layers(
+        operation, repository, token, options, keys, values, formats, &reporting,
+    )
+    .await
+}
+
+/// Commits the staged revision, then each layer staged beside it.
+///
+/// Its own future: inline, what it holds across its awaits would be reserved in the states of
+/// [`commit_with_metadata_in_operation`] that commit a link or a layer alone.
+#[allow(clippy::too_many_arguments)]
+async fn commit_staged_with_layers(
+    operation: &Arc<InstanceOperationImpl>,
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    options: CommitOptions,
+    keys: LoreArray<LoreString>,
+    values: LoreArray<LoreString>,
+    formats: LoreArray<LoreMetadataType>,
+    reporting: &CommitReporting,
+) -> Result<Hash, CommitError> {
     let context = execution_context();
     let globals = context.globals();
     let dry_run = globals.dry_run();
@@ -1604,23 +1631,23 @@ async fn commit_staged_revision(
 
         state_staged.set_metadata_hash(metadata_hash);
 
-        let tree_staged = state_staged
+        let root_staged = state_staged
             .tree(repository.clone())
             .await
-            .forward::<CommitError>("Failed to read revision tree data")?;
-        let tree_current = state_current
+            .forward::<CommitError>("Failed to read revision tree data")?
+            .hash_root;
+        let root_current = state_current
             .tree(repository.clone())
             .await
-            .forward::<CommitError>("Failed to read revision tree data")?;
-        if !state_staged.is_merge_or_cherry_pick_or_revert()
-            && tree_staged.hash_root == tree_current.hash_root
-        {
+            .forward::<CommitError>("Failed to read revision tree data")?
+            .hash_root;
+        if !state_staged.is_merge_or_cherry_pick_or_revert() && root_staged == root_current {
             if !globals.force() {
                 lore_debug!(
                     "Staged tree {} in revision {} is identical to current tree {} in revision {}",
-                    tree_staged.hash_root,
+                    root_staged,
                     state_staged.revision(),
-                    tree_current.hash_root,
+                    root_current,
                     state_current.revision(),
                 );
                 return Err(NothingStaged.into());
@@ -2454,38 +2481,20 @@ async fn commit_execute(
     let mut commit_failure = None;
 
     while let Some(file_to_commit) = file_rx.recv().await {
-        lore_spawn!(tasks, {
-            let operation = operation.clone();
-            let repository = repository.clone();
-            let state = state.clone();
-            let delta = delta.clone();
-            let stats = stats.clone();
-            let tracker = tracker.clone();
-            let modified_times = modified_times.clone();
-            async move {
-                let block_index = NodeBlock::index(file_to_commit.node_id);
-                let node_index = Node::index(file_to_commit.node_id);
-                let block = state
-                    .block(repository.clone(), block_index)
-                    .await
-                    .forward::<CommitError>("Failed deserializing state block")?;
-                commit_file(
-                    operation,
-                    repository,
-                    state,
-                    file_to_commit.node_id,
-                    block,
-                    block_index,
-                    node_index,
-                    file_to_commit.relative_path,
-                    delta,
-                    stats,
-                    tracker,
-                    modified_times,
-                )
-                .await
-            }
-        });
+        lore_spawn!(
+            tasks,
+            commit_file(
+                operation.clone(),
+                repository.clone(),
+                state.clone(),
+                file_to_commit.node_id,
+                file_to_commit.relative_path,
+                delta.clone(),
+                stats.clone(),
+                tracker.clone(),
+                modified_times.clone(),
+            )
+        );
 
         while let Some(result) = tasks.try_join_next() {
             collect_committed_file(result, &mut commit_failure);
@@ -2538,170 +2547,177 @@ async fn info_before_fragmenting(
 
 /// Commits one file node, recording the modified time it read the file at. A view-excluded
 /// path records nothing: its content is taken from the staged node rather than disk.
-#[allow(clippy::too_many_arguments)]
-async fn commit_file(
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
+fn commit_file(
     operation: Arc<InstanceOperationImpl>,
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
     node_id: NodeID,
-    block: Arc<NodeBlock>,
-    block_index: usize,
-    node_index: usize,
     relative_path: RelativePath,
     delta: Arc<parking_lot::RwLock<BytesMut>>,
     stats: Arc<CommitStats>,
     tracker: Arc<lore_storage::write_tracker::WriteTracker>,
     modified_times: Arc<RecordedModifiedTimes>,
-) -> Result<(), CommitError> {
-    let mut node = { *block.read().node(node_index) };
-
-    debug_assert!(node.is_file());
-
-    if node.is_staged_merge_conflict() {
-        reject_unresolved_conflict(&node, relative_path.as_str())?;
-        // Check if file has conflict markers remaining
-        if infer::infer_is_conflicted(&operation.content_source(&relative_path))
+) -> impl Future<Output = Result<(), CommitError>> {
+    async move {
+        let block_index = NodeBlock::index(node_id);
+        let node_index = Node::index(node_id);
+        let block = state
+            .block(repository.clone(), block_index)
             .await
-            .internal_with(|| format!("Failed reading file {}", relative_path.as_str()))?
-        {
-            return Err(Conflict {
-                path: relative_path.as_str().to_string(),
+            .forward::<CommitError>("Failed deserializing state block")?;
+        let mut node = { *block.read().node(node_index) };
+
+        debug_assert!(node.is_file());
+
+        if node.is_staged_merge_conflict() {
+            reject_unresolved_conflict(&node, relative_path.as_str())?;
+            // Check if file has conflict markers remaining
+            if infer::infer_is_conflicted(&operation.content_source(&relative_path))
+                .await
+                .internal_with(|| format!("Failed reading file {}", relative_path.as_str()))?
+            {
+                return Err(Conflict {
+                    path: relative_path.as_str().to_string(),
+                }
+                .into());
             }
-            .into());
-        }
-        // Clean up theirs/base files
-        if !execution_context().globals().dry_run() {
-            sync::unlink_merge_artifacts(&operation, &relative_path).await;
-        }
-    }
-
-    lore_trace!(
-        "Committing file node {} {} flags 0x{:x}",
-        node_id,
-        relative_path.as_str(),
-        node.flags
-    );
-
-    // A sparse checkout has no working-tree file for a view-excluded path, so
-    // the staged content hash is the only source. Re-fragmenting would read a
-    // file that is absent or stale.
-    //
-    // This test must stay identical to the one realize gates disk writes on
-    // (`fs/realize.rs`), because that is what decided whether the file was
-    // written.
-    let (address, content_size, mode, modified_time) =
-        if repository
-            .filter
-            .excludes_tree(&relative_path, false, FilterMode::View)
-        {
-            (node.address, node.size, node.mode, None)
-        } else {
-            if node.address.context.is_zero() {
-                // TODO(mjansson): Optionally find previous identical file content and deduplicate by using same context
-                node.address.context = uuid::Uuid::now_v7().into();
-                lore_trace!(
-                    "Generate file ID for file: {} {}",
-                    relative_path.as_str(),
-                    node.address.context
-                );
+            // Clean up theirs/base files
+            if !execution_context().globals().dry_run() {
+                sync::unlink_merge_artifacts(&operation, &relative_path).await;
             }
+        }
 
-            let info = info_before_fragmenting(&operation, &relative_path).await?;
-
-            let (address, size_content) = immutable::write_from_file_with_tracker(
-                repository.clone(),
-                &operation.content_source(&relative_path),
-                node.address.context,
-                immutable::write_options_from_repository(repository.clone()),
-                Some(tracker),
-            )
-            .await
-            .forward_with::<CommitError, _>(|| {
-                format!(
-                    "Failed writing file {} to immutable store",
-                    relative_path.as_str()
-                )
-            })?;
-
-            stats.file_read(size_content);
-
-            (
-                address,
-                size_content,
-                info.mode(node.mode),
-                Some(info.mtime()),
-            )
-        };
-
-    let modified = util::fs::mode_changed(node.mode, mode)
-        || node.size != content_size
-        || node.address.hash != address.hash;
-
-    if modified
-        || node.is_staged_add()
-        || node.is_staged_move()
-        || node.is_staged_copy()
-        || node.is_staged_merge()
-    {
         lore_trace!(
-            "Committed modified file node {} {} with address {} (was {}) mode 0o{:o} (was 0o{:o}) flags {:x}",
+            "Committing file node {} {} flags 0x{:x}",
             node_id,
             relative_path.as_str(),
-            address,
-            node.address.hash,
-            mode,
-            node.mode,
             node.flags
         );
-        stats
-            .complete
-            .file_modify_count
-            .fetch_add(1, Ordering::Relaxed);
-        stats.record_file_action(node.flags, content_size);
 
-        let flags = node.flags;
-        delta_add(delta, node_id, flags);
+        // A sparse checkout has no working-tree file for a view-excluded path, so
+        // the staged content hash is the only source. Re-fragmenting would read a
+        // file that is absent or stale.
+        //
+        // This test must stay identical to the one realize gates disk writes on
+        // (`fs/realize.rs`), because that is what decided whether the file was
+        // written.
+        let (address, content_size, mode, modified_time) =
+            if repository
+                .filter
+                .excludes_tree(&relative_path, false, FilterMode::View)
+            {
+                (node.address, node.size, node.mode, None)
+            } else {
+                if node.address.context.is_zero() {
+                    // TODO(mjansson): Optionally find previous identical file content and deduplicate by using same context
+                    node.address.context = uuid::Uuid::now_v7().into();
+                    lore_trace!(
+                        "Generate file ID for file: {} {}",
+                        relative_path.as_str(),
+                        node.address.context
+                    );
+                }
 
-        let block_dirtied = {
-            let mut block_writer = block.write();
-            let node = block_writer.node(node_index);
+                let info = info_before_fragmenting(&operation, &relative_path).await?;
 
-            node.address = address;
-            node.size = content_size;
-            node.mode = mode;
-            node.child = 0;
+                let (address, size_content) = immutable::write_from_file_with_tracker(
+                    repository.clone(),
+                    &operation.content_source(&relative_path),
+                    node.address.context,
+                    immutable::write_options_from_repository(repository.clone()),
+                    Some(tracker),
+                )
+                .await
+                .forward_with::<CommitError, _>(|| {
+                    format!(
+                        "Failed writing file {} to immutable store",
+                        relative_path.as_str()
+                    )
+                })?;
 
-            node.clear_all_change_flags();
+                stats.file_read(size_content);
 
-            block_writer.mark_dirty()
-        };
-        if block_dirtied {
-            state.block_modified(block.clone(), block_index);
-            state.mark_dirty();
+                (
+                    address,
+                    size_content,
+                    info.mode(node.mode),
+                    Some(info.mtime()),
+                )
+            };
+
+        let modified = util::fs::mode_changed(node.mode, mode)
+            || node.size != content_size
+            || node.address.hash != address.hash;
+
+        if modified
+            || node.is_staged_add()
+            || node.is_staged_move()
+            || node.is_staged_copy()
+            || node.is_staged_merge()
+        {
+            lore_trace!(
+                "Committed modified file node {} {} with address {} (was {}) mode 0o{:o} (was 0o{:o}) flags {:x}",
+                node_id,
+                relative_path.as_str(),
+                address,
+                node.address.hash,
+                mode,
+                node.mode,
+                node.flags
+            );
+            stats
+                .complete
+                .file_modify_count
+                .fetch_add(1, Ordering::Relaxed);
+            stats.record_file_action(node.flags, content_size);
+
+            let flags = node.flags;
+            delta_add(delta, node_id, flags);
+
+            let block_dirtied = {
+                let mut block_writer = block.write();
+                let node = block_writer.node(node_index);
+
+                node.address = address;
+                node.size = content_size;
+                node.mode = mode;
+                node.child = 0;
+
+                node.clear_all_change_flags();
+
+                block_writer.mark_dirty()
+            };
+            if block_dirtied {
+                state.block_modified(block.clone(), block_index);
+                state.mark_dirty();
+            }
+        } else if node.is_staged() {
+            lore_trace!("Reset staged flag on node {} {}", node_id, relative_path);
+
+            let block_dirtied = {
+                let mut block_writer = block.write();
+                let node = block_writer.node(node_index);
+                node.clear_all_change_flags();
+
+                block_writer.mark_dirty()
+            };
+            if block_dirtied {
+                state.block_modified(block.clone(), block_index);
+                state.mark_dirty();
+            }
         }
-    } else if node.is_staged() {
-        lore_trace!("Reset staged flag on node {} {}", node_id, relative_path);
 
-        let block_dirtied = {
-            let mut block_writer = block.write();
-            let node = block_writer.node(node_index);
-            node.clear_all_change_flags();
-
-            block_writer.mark_dirty()
-        };
-        if block_dirtied {
-            state.block_modified(block.clone(), block_index);
-            state.mark_dirty();
+        if let Some(modified_time) = modified_time {
+            modified_times.record(&repository, &relative_path, modified_time);
         }
+
+        stats.complete.file_count.fetch_add(1, Ordering::Relaxed);
+
+        Ok(())
     }
-
-    if let Some(modified_time) = modified_time {
-        modified_times.record(&repository, &relative_path, modified_time);
-    }
-
-    stats.complete.file_count.fetch_add(1, Ordering::Relaxed);
-
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4439,256 +4455,4 @@ async fn freeze_node(
         state.mark_dirty();
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod statistics_level_tests {
-    use lore_base::runtime::LORE_CONTEXT;
-
-    use super::*;
-    use crate::interface::ExecutionContext;
-    use crate::interface::LoreGlobalArgs;
-    use crate::relay::EventDispatcher;
-
-    /// Run `body` under an execution context asking for `stats`.
-    async fn at_statistics_level<T>(stats: u32, body: impl Future<Output = T>) -> T {
-        let globals = LoreGlobalArgs {
-            stats,
-            ..Default::default()
-        };
-        let execution = Arc::new(ExecutionContext::new_client(
-            globals,
-            EventDispatcher::no_dispatch(),
-        ));
-        LORE_CONTEXT.scope(execution, body).await
-    }
-
-    /// Statistics level zero reports nothing, so it keeps nothing beyond what a
-    /// progress event reads: the content read off disk, which it reports as the
-    /// bytes transferred.
-    #[tokio::test]
-    async fn a_count_is_kept_only_where_something_reports_it() {
-        for (level, kept) in [(0, 0), (1, 1)] {
-            let files = at_statistics_level(level, async {
-                let stats = CommitStats::new();
-                stats.file_read(4096);
-                stats.record_file_action(0, 4096);
-                stats.file_stats()
-            })
-            .await;
-
-            assert_eq!(files.files, kept, "level {level}");
-            assert_eq!(files.files_read, kept, "level {level}");
-            assert_eq!(files.file_bytes, kept * 4096, "level {level}");
-            assert_eq!(files.bytes_transferred, 4096, "level {level}");
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::errors::NotALayer;
-
-    #[test]
-    fn commit_options_new_has_empty_layer_defaults() {
-        let opts = CommitOptions::new("msg".into());
-        assert!(opts.layer_messages.is_empty());
-        assert!(opts.layer.is_none());
-        assert!(opts.link_messages.is_empty());
-        assert!(opts.link.is_none());
-    }
-
-    #[test]
-    fn commit_error_carries_not_a_layer() {
-        let err: CommitError = NotALayer {
-            path: "external/lib".into(),
-        }
-        .into();
-        assert!(matches!(err, CommitError::NotALayer { .. }));
-        assert!(err.to_string().contains("external/lib"));
-    }
-}
-
-#[cfg(test)]
-// Fixtures build working-tree state directly; what these test is how the commit reads it.
-#[allow(clippy::disallowed_methods)]
-mod operation_tests {
-    use std::sync::atomic::AtomicUsize;
-
-    use async_trait::async_trait;
-    use lore_base::runtime::LORE_CONTEXT;
-    use lore_base::runtime::runtime;
-
-    use super::*;
-    use crate::fs::filesystem_provider::FilesystemProvider;
-    use crate::fs::filesystem_provider::FsError;
-    use crate::fs::filesystem_provider::tests::test_store_create;
-    use crate::fs::os::OsFilesystem;
-    use crate::repository::test_helpers::RepositoryContextCreationArgsExt;
-    use crate::repository::test_helpers::default_repository_creation_args;
-
-    /// One commit reads the working tree through the one operation it opens, whatever it
-    /// commits: a provider that freezes hands out one snapshot, and a second opened partway
-    /// would fragment some of the files against a tree the rest were never measured against.
-    ///
-    /// The count is taken from the commit alone, the staging that precedes it opening its own.
-    #[tokio::test]
-    async fn one_call_reads_the_working_tree_through_one_operation() {
-        let dir = lore_base::test_util::TempDir::new("lore-commit-test-");
-        std::fs::write(dir.path().join("one.txt"), b"one").expect("write file");
-        std::fs::write(dir.path().join("two.txt"), b"two").expect("write file");
-        let (immutable_store, mutable_store, execution) =
-            test_store_create().await.expect("Making test stores");
-        let root = dir.to_path_buf();
-
-        let begins = runtime()
-            .spawn(LORE_CONTEXT.scope(execution, async move {
-                let fixture = counting_repository(&root, immutable_store, mutable_store).await;
-                stage_working_tree(&fixture, &root).await;
-                fixture.begins.store(0, Ordering::Release);
-
-                commit_staged(&fixture).await.expect("Committing");
-
-                fixture.begins.load(Ordering::Acquire)
-            }))
-            .await
-            .expect("Test task failed");
-
-        assert_eq!(
-            1, begins,
-            "The commit opened an operation beyond the one it reads the working tree through"
-        );
-    }
-
-    /// A staged file the working tree no longer holds is reported rather than fragmented: what
-    /// a commit stores for a file it reads from the working tree, and a path holding nothing
-    /// has nothing to store.
-    #[tokio::test]
-    async fn a_staged_file_the_working_tree_no_longer_holds_is_reported() {
-        let dir = lore_base::test_util::TempDir::new("lore-commit-test-");
-        std::fs::write(dir.path().join("gone.txt"), b"content").expect("write file");
-        let (immutable_store, mutable_store, execution) =
-            test_store_create().await.expect("Making test stores");
-        let root = dir.to_path_buf();
-
-        let error = runtime()
-            .spawn(LORE_CONTEXT.scope(execution, async move {
-                let fixture = counting_repository(&root, immutable_store, mutable_store).await;
-                stage_working_tree(&fixture, &root).await;
-                std::fs::remove_file(root.join("gone.txt")).expect("remove file");
-
-                commit_staged(&fixture)
-                    .await
-                    .expect_err("A commit of a file that is gone reported a revision")
-            }))
-            .await
-            .expect("Test task failed");
-
-        assert!(
-            matches!(error, CommitError::FileNotFound { .. }),
-            "The missing file was reported as {error} rather than as the file it is"
-        );
-    }
-
-    /// An [`OsFilesystem`] that counts the operations opened on it.
-    struct CountingFilesystem {
-        inner: OsFilesystem,
-        begins: Arc<AtomicUsize>,
-    }
-
-    #[async_trait]
-    impl FilesystemProvider for CountingFilesystem {
-        async fn begin_operation(&self) -> Result<Arc<InstanceOperationImpl>, FsError> {
-            self.begins.fetch_add(1, Ordering::AcqRel);
-            FilesystemProvider::begin_operation(&self.inner).await
-        }
-    }
-
-    /// A repository over the working tree at `root`, its filesystem counting the operations
-    /// opened on it.
-    struct CountingRepository {
-        repository: Arc<RepositoryContext>,
-        token: RepositoryWriteToken,
-        begins: Arc<AtomicUsize>,
-    }
-
-    /// A repository created at `root`, anchored on a fresh default branch, over a filesystem
-    /// that counts.
-    ///
-    /// Call from inside a `LORE_CONTEXT` scope: creating a repository reads the execution
-    /// context.
-    async fn counting_repository(
-        root: &std::path::Path,
-        immutable_store: Arc<dyn lore_storage::ImmutableStore>,
-        mutable_store: Arc<dyn lore_storage::MutableStore>,
-    ) -> CountingRepository {
-        let begins = Arc::new(AtomicUsize::new(0));
-        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
-        let branch_id = BranchId::from(uuid::Uuid::now_v7());
-        let token = RepositoryWriteToken::acquire(root).await;
-        let created = crate::repository::create_local(
-            root,
-            &token,
-            repository_id,
-            branch_id,
-            branch::DEFAULT_DEFAULT_NAME.to_string(),
-            crate::repository::RepositoryConfig::default(),
-            false,
-        )
-        .await
-        .expect("Initializing the repository");
-
-        let repository = Arc::new(
-            RepositoryContext::new(
-                default_repository_creation_args(immutable_store, mutable_store)
-                    .with_path(root)
-                    .with_id(repository_id)
-                    .with_instance_id(created.instance_id)
-                    .with_filesystem_provider(Arc::new(CountingFilesystem {
-                        inner: OsFilesystem::new(root),
-                        begins: begins.clone(),
-                    })),
-            )
-            .with_write_token(token.share()),
-        );
-        crate::instance::store_current_anchor_branch(&repository, branch_id)
-            .await
-            .expect("Storing the anchor branch");
-
-        CountingRepository {
-            repository,
-            token,
-            begins,
-        }
-    }
-
-    /// Stages everything the working tree at `root` holds, scanning rather than reading dirty
-    /// flags so a fixture that wrote its files directly is staged whole.
-    async fn stage_working_tree(fixture: &CountingRepository, root: &std::path::Path) {
-        crate::file::stage::stage(
-            fixture.repository.clone(),
-            &fixture.token,
-            LoreArray::from_vec(vec![LoreString::from(&root.to_path_buf())]),
-            crate::stage::StageOptions {
-                scan: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("Staging the working tree");
-    }
-
-    /// Commits what the fixture holds staged, with no metadata beyond what a commit stamps.
-    async fn commit_staged(fixture: &CountingRepository) -> Result<Hash, CommitError> {
-        Box::pin(commit_with_metadata(
-            fixture.repository.clone(),
-            &fixture.token,
-            CommitOptions::new(String::from("test")),
-            LoreArray::from_vec(Vec::default()),
-            LoreArray::from_vec(Vec::default()),
-            LoreArray::from_vec(Vec::default()),
-        ))
-        .await
-    }
 }

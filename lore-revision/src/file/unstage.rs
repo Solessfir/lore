@@ -320,15 +320,10 @@ async fn unstage_parent(
     .await?;
 
     if !clear && !is_merge_or_cherry_pick_or_revert {
-        let has_staged = state_staged
-            .node_has_staged_children(repository.clone(), ROOT_NODE)
+        clear = !state_staged
+            .node_has_staged_or_dirty_children(repository.clone(), ROOT_NODE)
             .await
             .forward::<UnstageError>("Failed to find subnode")?;
-        let has_dirty = state_staged
-            .node_has_dirty_children(repository.clone(), ROOT_NODE)
-            .await
-            .forward::<UnstageError>("Failed to find subnode")?;
-        clear = !has_staged && !has_dirty;
     };
 
     // Even if we plan to clear, check for dirty nodes — preserve anchor if dirty remain
@@ -534,29 +529,17 @@ async fn unstage_each_path(args: UnstagePaths<'_>) -> Result<bool, UnstageError>
 
         lore_debug!("Unstage options: {:?}", options);
 
-        let mut task = {
-            let repository = repository.clone();
-            let state_current = state_current.clone();
-            let state_staged = state_staged.clone();
-            let discard = discard.clone();
-            let stats = stats.clone();
-            let link_tracker = link_tracker.clone();
-            let operation = operation.clone();
-            lore_spawn!(async move {
-                Box::pin(unstage_path(
-                    operation,
-                    repository,
-                    state_current,
-                    state_staged,
-                    relative_path,
-                    discard,
-                    options,
-                    stats,
-                    link_tracker,
-                ))
-                .await
-            })
-        };
+        let mut task = lore_spawn!(unstage_path(
+            operation.clone(),
+            repository.clone(),
+            state_current.clone(),
+            state_staged.clone(),
+            relative_path,
+            discard.clone(),
+            options,
+            stats.clone(),
+            link_tracker.clone(),
+        ));
 
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
         let result = loop {

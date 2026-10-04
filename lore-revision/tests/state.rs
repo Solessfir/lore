@@ -237,6 +237,74 @@ mod tests {
             .expect("Task failed");
     }
 
+    /// A state that rehashes its node names rewrites its blocks unchanged. `force_rehash_names`
+    /// takes the path of a state read in a format before `LowerCaseHash`.
+    #[tokio::test]
+    async fn a_state_rehashing_its_node_names_rewrites_its_blocks_unchanged() {
+        let (_immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let tempdir = generate_tempdir();
+                let path = tempdir.to_path_buf();
+                let immutable_store = LocalImmutableStore::new(
+                    None,
+                    lore_storage::local::immutable_store::ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("Failed to create store");
+                let write_token =
+                    lore_revision::repository::RepositoryWriteToken::acquire(path.as_path()).await;
+                let repository = Arc::new(
+                    RepositoryContext::new(
+                        default_repository_creation_args(
+                            immutable_store.clone(),
+                            mutable_store.clone(),
+                        )
+                        .with_path(&path),
+                    )
+                    .with_write_token(write_token.share()),
+                );
+
+                let state = State::new();
+                state
+                    .node_add(
+                        repository.clone(),
+                        ROOT_NODE,
+                        Node {
+                            name_hash: hash_string("only"),
+                            ..Default::default()
+                        },
+                        "only",
+                    )
+                    .await
+                    .expect("Failed to add the node");
+                let signature = state
+                    .serialize(repository.clone(), &write_token)
+                    .await
+                    .expect("Failed to serialize");
+
+                let rehashing = State::deserialize(repository.clone(), signature)
+                    .await
+                    .expect("Failed to deserialize");
+                rehashing.force_rehash_names();
+                rehashing.mark_dirty();
+                let rehashed = rehashing
+                    .serialize(repository, &write_token)
+                    .await
+                    .expect("Failed to serialize while rehashing");
+
+                assert_eq!(
+                    rehashed, signature,
+                    "rewriting the blocks unchanged must give the same signature"
+                );
+            }))
+            .await
+            .expect("Task failed");
+    }
+
     #[tokio::test]
     async fn collect_new_name_fragments() {
         let (_immutable_store, mutable_store, execution) =
@@ -2490,6 +2558,7 @@ mod block_single_flight {
     use lore_revision::interface::ExecutionContext;
     use lore_revision::nametable::NameTable;
     use lore_revision::node::Node;
+    use lore_revision::node::NodeBlock;
     use lore_revision::node::NodeFileMetadata;
     use lore_revision::node::NodeFileMetadataBlock;
     use lore_revision::node::ROOT_NODE;
@@ -2982,6 +3051,34 @@ mod block_single_flight {
                     "a name table lookup holds {} bytes, its read {}",
                     size_of_val(&name_table),
                     size_of_val(&name_table_read)
+                );
+            })
+            .await;
+    }
+
+    /// A node block read holds its read of the current format, and the fallback to the older
+    /// formats, which holds a read as large and the conversion, stays in a box of its own.
+    #[tokio::test]
+    async fn a_node_block_read_keeps_the_older_formats_out_of_its_future() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let (immutable_store, mutable_store, _execution) =
+                    test_store_create().await.expect("Failed to create stores");
+                let repository = Arc::new(RepositoryContext::new_null_context(
+                    immutable_store,
+                    mutable_store,
+                ));
+                let state = State::new();
+
+                let read = NodeBlock::deserialize(repository.clone(), &state, Address::default());
+                let fallback =
+                    NodeBlock::deserialize_other_version(repository, &state, Address::default());
+
+                assert!(
+                    size_of_val(&read) < size_of_val(&fallback),
+                    "a node block read holds {} bytes, the older formats' fallback {}",
+                    size_of_val(&read),
+                    size_of_val(&fallback)
                 );
             })
             .await;

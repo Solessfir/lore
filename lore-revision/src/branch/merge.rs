@@ -578,7 +578,7 @@ async fn merge_repository(
 
     // Diff over the full tree. A view-scoped diff drops the other branch's
     // out-of-view changes and leaves this branch divergent from it.
-    let diff = Box::pin(branch::diff3_collect_with_graft(
+    let diff = branch::diff3_collect_with_graft(
         full_tree_context(&repository),
         source_branch,
         revision,
@@ -590,7 +590,7 @@ async fn merge_repository(
         // The view decides which subtrees are out of view. The walk stays
         // full-tree.
         Some(repository.filter.clone()),
-    ))
+    )
     .await
     .forward::<MergeError>("running diff3 for merge")?;
 
@@ -747,13 +747,13 @@ pub async fn merge_start(
             let state_source = state::State::deserialize(repository.clone(), endpoints.source)
                 .await
                 .forward::<MergeError>("deserializing diff source state")?;
-            Box::pin(link::classify_link_pins(
+            link::classify_link_pins(
                 repository.clone(),
                 &state_staged,
                 &state_source,
                 link::LinkPinResolution::ThreeWay(state_base),
                 &[],
-            ))
+            )
             .await
             .forward::<MergeError>("comparing link pins")?;
 
@@ -1630,23 +1630,23 @@ async fn finalize_main_merge(
     let state_source = state::State::deserialize(repository.clone(), endpoints.source)
         .await
         .forward::<MergeError>("deserializing diff source state")?;
-    let planned = Box::pin(link::classify_link_pins(
+    let planned = link::classify_link_pins(
         repository.clone(),
         &state_staged,
         &state_source,
         link::LinkPinResolution::ThreeWay(state_base),
         &merged_nodes,
-    ))
+    )
     .await
     .forward::<MergeError>("comparing link pins with the merged branch")?;
 
     if !dry_run {
-        Box::pin(link::apply_link_pins(
+        link::apply_link_pins(
             repository.clone(),
             &state_staged,
             planned,
             link::LinkPinRealize::WorkingTree,
-        ))
+        )
         .await
         .forward::<MergeError>("carrying link pins from the merged branch")?;
 
@@ -2059,7 +2059,7 @@ async fn verify_changes_against_filesystem(
                 let mut change = change;
                 let no_forward_changes = matches!(merge_type, MergeType::CherryPick);
                 let no_force_hash_check = false;
-                Box::pin(crate::fs::realize::verify_filesystem(
+                crate::fs::realize::verify_filesystem(
                     &mut change,
                     repository.clone(),
                     operation,
@@ -2068,7 +2068,7 @@ async fn verify_changes_against_filesystem(
                     no_force_hash_check,
                     stats,
                     FilterMode::Full,
-                ))
+                )
                 .await
                 .forward::<MergeError>("verifying filesystem for change")?;
 
@@ -3963,78 +3963,85 @@ pub struct MergeIntoOptions {
     pub inherit_metadata: MetadataInherit,
 }
 
-async fn merge_metadata_task(
+/// Copies the file metadata `path` has in `state_source` onto `path` in `state_staged`, where
+/// both states hold it.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+fn merge_metadata_task(
     repository: Arc<RepositoryContext>,
-    change: NodeChange,
+    path: RelativePath,
     state_source: Arc<State>,
     state_staged: Arc<State>,
-) -> Result<(), MergeError> {
-    let metadata_hash;
+) -> impl Future<Output = Result<(), MergeError>> {
+    async move {
+        let metadata_hash;
 
-    if let Ok(node_link) = state_source
-        .find_node_link(repository.clone(), change.path().as_str())
-        .await
-        && node_link.is_valid()
-    {
-        let metadata_node = node::node_to_file_metadata(node_link.node);
-        let metadata_block_index = NodeFileMetadataBlock::index(metadata_node);
-        let metadata_node_index = NodeFileMetadata::index(metadata_node);
-
-        let metadata_block = state_source
-            .block_file_metadata(repository.clone(), metadata_block_index)
+        if let Ok(node_link) = state_source
+            .find_node_link(repository.clone(), path.as_str())
             .await
-            .forward::<MergeError>("deserializing metadata block")?;
+            && node_link.is_valid()
+        {
+            let metadata_node = node::node_to_file_metadata(node_link.node);
+            let metadata_block_index = NodeFileMetadataBlock::index(metadata_node);
+            let metadata_node_index = NodeFileMetadata::index(metadata_node);
 
-        let block_reader = metadata_block.read();
-        let node = block_reader.node(metadata_node_index);
+            let metadata_block = state_source
+                .block_file_metadata(repository.clone(), metadata_block_index)
+                .await
+                .forward::<MergeError>("deserializing metadata block")?;
 
-        metadata_hash = node.metadata;
-    } else {
-        lore_debug!(
-            "Merge metadata skipped due to missing 'source' node for {}",
-            change.path()
-        );
-        return Ok(());
-    }
+            let block_reader = metadata_block.read();
+            let node = block_reader.node(metadata_node_index);
 
-    if let Ok(node_link) = state_staged
-        .find_node_link(repository.clone(), change.path().as_str())
-        .await
-        && node_link.is_valid()
-    {
-        let metadata_node = node::node_to_file_metadata(node_link.node);
-        let metadata_block_index = NodeFileMetadataBlock::index(metadata_node);
-        let metadata_node_index = NodeFileMetadata::index(metadata_node);
-
-        let metadata_block = state_staged
-            .block_file_metadata(repository.clone(), metadata_block_index)
-            .await
-            .forward::<MergeError>("deserializing staged metadata block")?;
-
-        let dirtied = {
-            let mut block_writer = metadata_block.write();
-            let node = block_writer.node(metadata_node_index);
-
-            node.metadata = metadata_hash;
-
-            block_writer.mark_dirty()
-        };
-
-        if dirtied {
-            state_staged.block_file_metadata_modified(metadata_block, metadata_block_index);
-            state_staged.mark_dirty();
+            metadata_hash = node.metadata;
+        } else {
+            lore_debug!(
+                "Merge metadata skipped due to missing 'source' node for {}",
+                path
+            );
+            return Ok(());
         }
 
-        lore_trace!("Merged metadata for {}", change.path());
-    } else {
-        lore_debug!(
-            "Merge metadata skipped due to missing 'staged' node for {}",
-            change.path()
-        );
-        return Ok(());
-    }
+        if let Ok(node_link) = state_staged
+            .find_node_link(repository.clone(), path.as_str())
+            .await
+            && node_link.is_valid()
+        {
+            let metadata_node = node::node_to_file_metadata(node_link.node);
+            let metadata_block_index = NodeFileMetadataBlock::index(metadata_node);
+            let metadata_node_index = NodeFileMetadata::index(metadata_node);
 
-    Ok(())
+            let metadata_block = state_staged
+                .block_file_metadata(repository.clone(), metadata_block_index)
+                .await
+                .forward::<MergeError>("deserializing staged metadata block")?;
+
+            let dirtied = {
+                let mut block_writer = metadata_block.write();
+                let node = block_writer.node(metadata_node_index);
+
+                node.metadata = metadata_hash;
+
+                block_writer.mark_dirty()
+            };
+
+            if dirtied {
+                state_staged.block_file_metadata_modified(metadata_block, metadata_block_index);
+                state_staged.mark_dirty();
+            }
+
+            lore_trace!("Merged metadata for {}", path);
+        } else {
+            lore_debug!(
+                "Merge metadata skipped due to missing 'staged' node for {}",
+                path
+            );
+            return Ok(());
+        }
+
+        Ok(())
+    }
 }
 
 async fn merge_file_metadata(
@@ -4045,14 +4052,15 @@ async fn merge_file_metadata(
 ) -> Result<(), MergeError> {
     let mut tasks = JoinSet::new();
     for change in changes.iter() {
-        let repository = repository.clone();
-        let state_source = state_source.clone();
-        let state_staged = state_staged.clone();
-        let change = change.clone();
-
-        lore_spawn!(tasks, {
-            async move { merge_metadata_task(repository, change, state_source, state_staged).await }
-        });
+        lore_spawn!(
+            tasks,
+            merge_metadata_task(
+                repository.clone(),
+                change.path().clone(),
+                state_source.clone(),
+                state_staged.clone(),
+            )
+        );
     }
 
     let mut failure = None;
@@ -4516,14 +4524,14 @@ pub async fn merge_into(
     // branch's rows are the newer ones. The working tree stays on the current
     // branch, so nothing is realized on disk.
     if !options.ignore_links {
-        Box::pin(link::merge_link_pins(
+        link::merge_link_pins(
             repository.clone(),
             &state_staged,
             &state_current,
             link::LinkPinResolution::Incoming,
             link::LinkPinRealize::StateOnly,
             &[],
-        ))
+        )
         .await
         .forward::<MergeError>("carrying link pins into the target branch")?;
     }

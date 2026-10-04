@@ -538,12 +538,8 @@ pub async fn reset(
         .into());
     }
 
-    let reset_link_count = Box::pin(reset_staged_links_under_paths(
-        repository.clone(),
-        token,
-        &paths,
-    ))
-    .await?;
+    let reset_link_count =
+        reset_staged_links_under_paths(repository.clone(), token, &paths).await?;
 
     let (state_current, state_staged, _branch) =
         State::deserialize_current_and_staged(repository.clone())
@@ -637,16 +633,11 @@ pub async fn reset(
     // If the staged state was modified (dirty flags cleared), persist it.
     // If no staged or dirty nodes remain, delete the anchor.
     if outer_state_staged.is_dirty() {
-        let has_staged = outer_state_staged
-            .node_has_staged_children(repository.clone(), ROOT_NODE)
+        if !outer_state_staged
+            .node_has_staged_or_dirty_children(repository.clone(), ROOT_NODE)
             .await
-            .forward::<ResetError>("Failed deserializing state node block")?;
-        let has_dirty = outer_state_staged
-            .node_has_dirty_children(repository.clone(), ROOT_NODE)
-            .await
-            .forward::<ResetError>("Failed deserializing state node block")?;
-
-        if !has_staged && !has_dirty {
+            .forward::<ResetError>("Failed deserializing state node block")?
+        {
             crate::instance::delete_staged_anchor(&repository)
                 .await
                 .forward::<ResetError>("Failed deserializing state node block")?;
@@ -1187,16 +1178,67 @@ fn reset_walk_directory_recurse(
 /// Drive the directory walk for a single user-supplied path.
 ///
 /// For the repository root path this walks every child of `ROOT_NODE` through
-/// the directory-inflight bounded scheme; for any other path it resolves the
-/// path to a node and dispatches a single walk through `reset_walk_node`.
-/// Files end up on the `file_tx` channel for the consumer; directories
-/// recurse via the same scheme.
+/// the directory-inflight bounded scheme; any other path goes to
+/// [`reset_walk_named_path`]. Files end up on the `file_tx` channel for the
+/// consumer; directories recurse via the same scheme.
 ///
 /// `state_path` names the path in `state_target` and `state_staged`, `relative_path` names
 /// it on disk. The two differ only for a layer mounted somewhere other than the path it
 /// occupies in its own repository. Only the entry lookup needs `state_path`: the walk
 /// proceeds by node id from there and builds every path below it from `relative_path`.
 async fn reset_walk_path(
+    ctx: ResetContext,
+    relative_path: RelativePath,
+    state_path: RelativePath,
+) -> Result<(), ResetError> {
+    lore_debug!(
+        "Reset path: {}/{} to revision {} -> {}",
+        ctx.repository.path_for_display(),
+        relative_path.as_str(),
+        ctx.state_target.revision(),
+        ctx.state_target.revision_number()
+    );
+
+    let (relative_path, state_path) = if relative_path.is_empty() {
+        (relative_path, state_path)
+    } else {
+        let resolved = util::fs::filesystem_path(&ctx.operation, "", &relative_path, None).await;
+        match resolved {
+            // The case the filesystem reports is the case the state holds too, unless the
+            // two paths were already distinct.
+            Ok(resolved) if state_path.as_str() == relative_path.as_str() => {
+                (resolved.clone(), resolved)
+            }
+            Ok(resolved) => (resolved, state_path),
+            Err(_) => (relative_path, state_path),
+        }
+    };
+
+    if relative_path.is_empty() {
+        if ctx.options.single_node {
+            return Ok(());
+        }
+
+        lore_debug!("Resetting the repository from root");
+
+        let node = ctx
+            .state_target
+            .node(ctx.repository.clone(), ROOT_NODE)
+            .await
+            .forward::<ResetError>("Failed to find node")?;
+
+        return reset_walk_directory(ctx, relative_path, node, ROOT_NODE, FilterStates::ROOT).await;
+    }
+
+    reset_walk_named_path(ctx, relative_path, state_path).await
+}
+
+/// Resolves a path below the root to a node and walks it through `reset_walk_node`, or settles
+/// a path the target revision does not hold against the staged state and the working tree.
+///
+/// Its own future: inline, what it holds across its lookups would be reserved in the root
+/// walk's state of [`reset_walk_path`].
+async fn reset_walk_named_path(
     ctx: ResetContext,
     relative_path: RelativePath,
     state_path: RelativePath,
@@ -1210,59 +1252,6 @@ async fn reset_walk_path(
         stats,
         file_tx,
     } = ctx;
-
-    lore_debug!(
-        "Reset path: {}/{} to revision {} -> {}",
-        repository.path_for_display(),
-        relative_path.as_str(),
-        state_target.revision(),
-        state_target.revision_number()
-    );
-
-    let (relative_path, state_path) = if relative_path.is_empty() {
-        (relative_path, state_path)
-    } else {
-        let resolved = util::fs::filesystem_path(&operation, "", &relative_path, None).await;
-        match resolved {
-            // The case the filesystem reports is the case the state holds too, unless the
-            // two paths were already distinct.
-            Ok(resolved) if state_path.as_str() == relative_path.as_str() => {
-                (resolved.clone(), resolved)
-            }
-            Ok(resolved) => (resolved, state_path),
-            Err(_) => (relative_path, state_path),
-        }
-    };
-
-    if relative_path.is_empty() {
-        if options.single_node {
-            return Ok(());
-        }
-
-        lore_debug!("Resetting the repository from root");
-
-        let node = state_target
-            .node(repository.clone(), ROOT_NODE)
-            .await
-            .forward::<ResetError>("Failed to find node")?;
-
-        return reset_walk_directory(
-            ResetContext {
-                operation: operation.clone(),
-                repository,
-                state_target,
-                state_staged,
-                options,
-                stats,
-                file_tx,
-            },
-            relative_path,
-            node,
-            ROOT_NODE,
-            FilterStates::ROOT,
-        )
-        .await;
-    }
 
     let parent_states = repository.filter.parent_exclusion_states(&relative_path);
 
@@ -2063,7 +2052,7 @@ async fn reset_file_realize(
     crate::fs::realize::realize_file(
         repository.clone(),
         operation,
-        &relative_path,
+        relative_path,
         node,
         Arc::new(SyncRealizeStats::default()),
     )

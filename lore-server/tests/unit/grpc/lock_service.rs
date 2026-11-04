@@ -211,7 +211,15 @@ mod unlock {
     async fn admin_lock_checks_migrate_before_the_empty_short_circuit() {
         let lock_store = super::store::MockMockLockStore::new();
 
-        let lock_service = super::lock_service(lock_store);
+        let lock_service = super::lock_service_with(
+            lock_store,
+            Arc::new(
+                lore_server::authnz::global_grants_authorizer::GlobalGrantsAuthorizer::new(
+                    None,
+                    vec![Action::Read, Action::Write],
+                ),
+            ),
+        );
 
         let mut request = Request::new(AdminLockRequest {
             resources: vec![],
@@ -226,7 +234,7 @@ mod unlock {
         let denied = lock_service
             .admin_lock(request)
             .await
-            .expect_err("allow-all does not grant `migrate`");
+            .expect_err("read and write do not grant `migrate`");
         assert_eq!(denied.code(), tonic::Code::PermissionDenied);
     }
 
@@ -445,11 +453,11 @@ mod actions {
     }
 
     /// Without a token the authorizer decides. A token-reading tier grants
-    /// nothing, so unlock is refused. Allow-all grants `write` but neither
-    /// `owner` nor `migrate`: unlock releases the caller's own locks only,
-    /// and admin lock is denied.
+    /// nothing, so unlock is refused. Allow-all grants `write` and `migrate`
+    /// but not `owner`: unlock releases the caller's own locks only, and
+    /// admin lock is permitted.
     #[tokio::test]
-    async fn no_token_unlocks_own_locks_only_under_allow_all_and_never_admin_locks() {
+    async fn no_token_unlocks_own_locks_only_and_admin_locks_under_allow_all() {
         let repository = random::<RepositoryId>();
         let lock_service = lock_service_with(store::MockMockLockStore::new(), tier1());
         let denied = lock_service
@@ -476,8 +484,12 @@ mod actions {
             .await
             .unwrap();
 
-        let lock_service = super::lock_service(store::MockMockLockStore::new());
-        let denied = lock_service
+        let mut lock_store = store::MockMockLockStore::new();
+        lock_store
+            .expect_lock_resources()
+            .return_once(|_, _, _| Ok(vec![]));
+        let lock_service = super::lock_service(lock_store);
+        lock_service
             .admin_lock(request_with_token(
                 AdminLockRequest {
                     resources: one_resource(),
@@ -487,8 +499,7 @@ mod actions {
                 None,
             ))
             .await
-            .expect_err("admin lock without a token is denied even under allow-all");
-        assert_eq!(denied.code(), Code::PermissionDenied);
+            .expect("allow-all grants `migrate`, so admin lock is permitted without a token");
     }
 }
 

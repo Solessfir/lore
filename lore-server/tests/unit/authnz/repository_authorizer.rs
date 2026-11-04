@@ -43,6 +43,7 @@ async fn allow_all_grants_its_fixed_set_with_or_without_a_token() {
         for action in [
             Action::Read,
             Action::Write,
+            Action::Migrate,
             Action::Obliterate,
             Action::Presign,
         ] {
@@ -54,7 +55,6 @@ async fn allow_all_grants_its_fixed_set_with_or_without_a_token() {
         for action in [
             Action::Owner,
             Action::Admin,
-            Action::Migrate,
             Action::PushProtected,
         ] {
             let err = AllowAllRepositoryAuthorizer
@@ -230,7 +230,7 @@ mod sync_check {
             for (action, permitted) in [
                 (Action::Read, true),
                 (Action::Obliterate, true),
-                (Action::Migrate, false),
+                (Action::Admin, false),
             ] {
                 let verdict = AllowAllRepositoryAuthorizer
                     .check_repository_access_sync(token, repository(), action)
@@ -473,11 +473,6 @@ mod permits_helper {
         assert!(
             !allow_all
                 .permits(&extensions, repository(), Action::Owner)
-                .await
-        );
-        assert!(
-            !allow_all
-                .permits(&extensions, repository(), Action::Migrate)
                 .await
         );
 

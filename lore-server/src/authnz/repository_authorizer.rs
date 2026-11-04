@@ -59,9 +59,10 @@ impl fmt::Display for Action {
     }
 }
 
-pub const ALLOW_ALL_ACTIONS: [Action; 4] = [
+pub const ALLOW_ALL_ACTIONS: [Action; 5] = [
     Action::Read,
     Action::Write,
+    Action::Migrate,
     Action::Obliterate,
     Action::Presign,
 ];

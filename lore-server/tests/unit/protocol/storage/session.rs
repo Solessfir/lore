@@ -99,7 +99,7 @@ mod entry_permits {
         );
         assert!(
             !entry
-                .permits(&AllowAllRepositoryAuthorizer, Action::Migrate)
+                .permits(&AllowAllRepositoryAuthorizer, Action::Admin)
                 .await
         );
         assert!(!entry.permits(&PolicyOnly("migrate"), Action::Migrate).await);
